@@ -1,0 +1,46 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for cargo-dist. After editing this, regenerate the release workflow with
+# `dist init` (or `dist generate`) and commit the resulting
+# .github/workflows/release.yml — it is generated, not hand-written.
+[dist]
+# The cargo-dist version CI pins to.
+cargo-dist-version = "0.31.0"
+# CI backend.
+ci = "github"
+# Installers to generate.
+installers = ["shell", "powershell", "homebrew"]
+# Homebrew tap to publish the generated formula to (the repo must exist and the
+# release workflow needs a token that can push to it).
+tap = "lararosekelley/homebrew-tap"
+# Target platforms (Rust target-triple syntax). Linux is static musl: navi has no
+# C deps that need the system (reqwest uses rustls, rusqlite is bundled), so one
+# artifact per arch runs on any glibc/musl distro.
+targets = [
+    "aarch64-apple-darwin",
+    "aarch64-unknown-linux-musl",
+    "x86_64-apple-darwin",
+    "x86_64-unknown-linux-musl",
+    "x86_64-pc-windows-msvc",
+]
+# Where installers place the binary — a neutral location wired onto PATH by the
+# installer, so a curl|bash user doesn't need a Rust setup.
+install-path = "~/.local/bin"
+# Host releases on GitHub Releases.
+hosting = "github"
+# Pre-release gate: run the live e2e suite right after `plan`, so a failing live
+# run against GitHub/Slack blocks the release before anything is built/published.
+# Requires the NAVI_GITHUB_TOKEN / NAVI_SLACK_TOKEN repo secrets.
+plan-jobs = ["./e2e"]
+# After the release builds succeed, publish the Homebrew formula and the crates
+# to crates.io (the latter via .github/workflows/publish-crates.yml). crates.io
+# publishing needs the CARGO_REGISTRY_TOKEN repo secret.
+publish-jobs = ["homebrew", "./publish-crates"]
+# No self-updater.
+install-updater = false
+install-success-msg = "navi installed! Run `navi init` to create your config, then `navi test-slack`."
+
+# The single user-facing binary shipped in the artifacts.
+[dist.binaries]
+"*" = ["navi"]
