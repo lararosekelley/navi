@@ -1,0 +1,40 @@
+# Publishes the workspace crates to crates.io in dependency order. Invoked by the
+# dist-generated release.yml as a custom publish job, so it only runs after every
+# release build succeeded and the GitHub Release is hosted — a broken build can
+# never burn an immutable crates.io version.
+#
+# The bin (`navi-notifier`) depends on the three libs, so they must be published
+# first; cargo publish blocks until each new version is in the index before
+# returning, so the next crate resolves it. Needs the CARGO_REGISTRY_TOKEN secret.
+name: Publish to crates.io
+
+on:
+  workflow_call:
+    inputs:
+      plan:
+        required: true
+        type: string
+
+jobs:
+  publish-crates:
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      # --no-verify: the release matrix already built and validated this commit.
+      # Order matters: libs before the bin that depends on them.
+      - name: Publish crates
+        run: |
+          set -euo pipefail
+          for crate in navi-notifier-core navi-notifier-github navi-notifier-slack navi-notifier; do
+            echo "::group::publishing $crate"
+            cargo publish --no-verify -p "$crate"
+            echo "::endgroup::"
+          done
