@@ -1,0 +1,60 @@
+[package]
+name = "navi-notifier"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Focused, configurable PR-review alerts from GitHub to Slack."
+readme = "README.md"
+keywords = ["github", "slack", "notifications", "pull-request", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+default-run = "navi"
+exclude = [
+    ".github/**",
+    ".husky/**",
+    "node_modules/**",
+    "target/**",
+    "package.json",
+    "package-lock.json",
+    "commitlint.config.cjs",
+]
+
+# The user-facing binary is `navi`, even though the published crate is
+# `navi-notifier` (the short name was taken on crates.io).
+[[bin]]
+name = "navi"
+path = "src/main.rs"
+
+# Live end-to-end smoke harness. Gated so it never ships in the release binary
+# or the published crate; only the e2e workflow builds it.
+[[bin]]
+name = "navi-e2e"
+path = "src/bin/navi-e2e.rs"
+required-features = ["e2e"]
+
+[features]
+# Live end-to-end harness that talks to real GitHub + Slack (see src/bin/navi-e2e.rs).
+e2e = []
+
+[dependencies]
+navi-notifier-core.workspace = true
+navi-notifier-github.workspace = true
+navi-notifier-slack.workspace = true
+
+tokio.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+directories.workspace = true
+serde.workspace = true
+toml.workspace = true
+serde_json.workspace = true
+rusqlite.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+anyhow.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
