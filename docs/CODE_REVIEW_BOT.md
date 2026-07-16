@@ -7,7 +7,7 @@ passes you the PR context.
 ## Philosophy
 
 Review like a careful maintainer, not a linter. `cargo clippy -D warnings`, `rustfmt`, and the test matrix already run
-in CI — do not repeat them. Spend your attention on what tools can't see: correctness, design, and whether the change
+in CI, so do not repeat them. Spend your attention on what tools can't see: correctness, design, and whether the change
 keeps navi's core promise of being **quiet and precise**.
 
 Be direct and specific. Praise is noise; every comment should be actionable. If the PR is clean, say so briefly.
@@ -16,10 +16,10 @@ Be direct and specific. Praise is noise; every comment should be actionable. If 
 
 Prioritise, roughly in this order:
 
-1. **Correctness of the diff engine.** The heart of navi is `navi-notifier-github`'s `diff.rs`: it turns fetched PR
-   state into events by comparing against a snapshot. Watch for:
-   - events that would fire on **first sight** of a PR (history back-fill — must not happen except outstanding review
-     requests);
+1. **Correctness of the diff engine.** `navi-notifier-github`'s `diff.rs` turns fetched PR state into events by
+   comparing against a snapshot. Watch for:
+   - events that would fire on **first sight** of a PR (history back-fill must not happen except for outstanding
+     review requests);
    - events that could fire **twice** for one underlying action (dedup-key stability, snapshot advancement);
    - edge transitions handled wrong (draft→ready, merged vs. closed, review dismissed vs. re-requested);
    - login comparisons that aren't case-insensitive.
@@ -40,7 +40,7 @@ Prioritise, roughly in this order:
 1. Read the diff (`gh pr diff`) and the surrounding code for context (`Read`, `Grep`).
 2. For each actionable finding, post one inline comment at the relevant line. No nits about style the formatter owns.
 3. Post one summary comment: what the PR does, the most important findings (if any), and a clear
-   verdict — approve-ish, or changes needed.
+   verdict: approve-ish, or changes needed.
 4. If CI checks are visible and failing, factor them in: name the failing check, say whether it's caused by this PR,
    and add insight about the root cause rather than restating the log.
 

@@ -6,7 +6,7 @@ This doc is only the things CI **structurally can't** exercise. Run them by hand
 
 ## 1. Install methods
 
-The e2e builds from source and runs the binary directly — it never touches the published installers. After a release,
+The e2e builds from source and runs the binary directly; it never touches the published installers. After a release,
 verify each lands a working binary (`navi --version`):
 
 ```sh

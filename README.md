@@ -19,7 +19,7 @@ It will notify you when:
 - 👋 you were **@-mentioned**
 - 🟣 your PR was **merged**, or 🚫 **closed**
 
-Every alert kind is individually toggleable, filterable by repo, and mutable by author — so you keep the signal and
+Every alert kind is individually toggleable, filterable by repo, and mutable by author, so you keep the signal and
 drop the noise. It ships for **GitHub → Slack** today, but the core is provider-agnostic so GitLab, Discord, etc. are
 additive.
 
@@ -35,7 +35,7 @@ Please report bugs and feature requests in
 
 navi polls GitHub's Notifications API as a cheap trigger to learn _which_ PRs have new activity, then fetches each
 such PR's reviews and comments and **diffs** them against a stored snapshot to derive precise events. The notification
-`reason` alone can't distinguish "reply to _my_ comment" from "a dismissal" from "a re-review" — the diff can. State
+`reason` alone can't distinguish "reply to _my_ comment" from "a dismissal" from "a re-review"; the diff can. State
 lives in a local SQLite database, so delivery is idempotent (you're never pinged twice) and it never touches your
 GitHub read/unread state.
 
@@ -58,7 +58,7 @@ cargo build --release                     # ./target/release/navi
 ```
 
 Prebuilt binaries and installers (shell/PowerShell/Homebrew) are published per release once the release workflow is
-set up — see [Releasing](#releasing).
+set up (see [Releasing](#releasing)).
 
 ## Setup
 
@@ -79,7 +79,7 @@ Export it as `NAVI_GITHUB_TOKEN`.
 4. Export it as `NAVI_SLACK_TOKEN`.
 
 `dm_to = "self"` DMs whoever the token authenticates as. If that resolves to the bot rather than you, set `dm_to` to
-your Slack user id (`U…`) — find it via your Slack profile → _Copy member ID_.
+your Slack user id (`U…`); find it via your Slack profile → _Copy member ID_.
 
 ### 3. Configure
 
@@ -97,7 +97,7 @@ navi once             # one poll pass; actually delivers
 navi run              # run continuously on the configured interval
 ```
 
-Preview your filters safely with `once --dry-run` — it shows each derived event and why it was delivered or
+Preview your filters safely with `once --dry-run`; it shows each derived event and why it was delivered or
 suppressed, without sending anything or advancing state.
 
 ### As a background service
@@ -122,7 +122,7 @@ suppressed, without sending anything or advancing state.
 | `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                        |
 | `routes`             |                          | Which sources feed which notifiers.                   |
 
-It works across **all repos your token can see** — there's no repo list to maintain; narrow the firehose with
+It works across **all repos your token can see**. There's no repo list to maintain; narrow the firehose with
 `rules.repos`.
 
 ## Architecture
@@ -136,7 +136,7 @@ A Cargo workspace with a provider-agnostic core and thin provider crates:
 | `navi-notifier-slack`  | `Notifier`: Block Kit DMs via a bot token.                                                                                                             |
 | `navi-notifier`        | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                  |
 
-Adding a provider is "implement a trait, register a constructor" — no engine changes.
+Adding a provider is "implement a trait, register a constructor", with no engine changes.
 
 ## Development
 
@@ -149,8 +149,8 @@ just e2e              # live smoke test (needs NAVI_GITHUB_TOKEN + NAVI_SLACK_TO
 ```
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org) with a required scope (enforced by
-commitlint via a git hook); run `just install` once to wire the hooks. The interesting logic — the GitHub diff engine
-and the rule filter — is pure and covered by fixture tests; the HTTP wiring is covered by
+commitlint via a git hook); run `just install` once to wire the hooks. The interesting logic (the GitHub diff engine
+and the rule filter) is pure and covered by fixture tests; the HTTP wiring is covered by
 [wiremock](https://docs.rs/wiremock) integration tests under each provider crate's `tests/`.
 
 ## Releasing
@@ -160,7 +160,7 @@ Versioning is driven by [cargo-release](https://github.com/crate-ci/cargo-releas
 share one version; cargo-release keeps that version _and_ the internal cross-crate dependency requirements in lockstep
 on every bump (see [`[workspace.metadata.release]`](Cargo.toml)), so they can never drift.
 
-One-time setup — install the tooling and generate the (not-hand-written) release workflow:
+One-time setup: install the tooling and generate the (not-hand-written) release workflow:
 
 ```sh
 just install-release-tools    # cargo install cargo-release + cargo-dist (--locked)
@@ -170,14 +170,14 @@ dist init                     # reads dist-workspace.toml, writes .github/workfl
 Cutting a release (from `main`):
 
 ```sh
-just release-dry minor        # preview the bump, commit, and tag — changes nothing
+just release-dry minor        # preview the bump, commit, and tag; changes nothing
 just release minor            # bump all crates + internal deps, commit, tag v<version>, push
 ```
 
-`just release` only bumps/commits/tags/pushes — it does **not** publish. The tag push triggers the cargo-dist release
+`just release` only bumps/commits/tags/pushes; it does **not** publish. The tag push triggers the cargo-dist release
 workflow, which builds the binaries and installers, runs the [e2e workflow](.github/workflows/e2e.yml) as a
 pre-release gate, and then runs [`publish-crates.yml`](.github/workflows/publish-crates.yml) to publish all crates to
-crates.io in dependency order — so publishing only happens after the release builds pass. See
+crates.io in dependency order; publishing only happens after the release builds pass. See
 [`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md) for the manual pre-release checklist.
 
 ## License
