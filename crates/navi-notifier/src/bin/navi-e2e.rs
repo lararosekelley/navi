@@ -86,7 +86,10 @@ async fn run() -> Result<(), String> {
 }
 
 fn env(key: &str) -> Result<String, String> {
-    std::env::var(key).map_err(|_| format!("missing required env var {key}"))
+    match std::env::var(key) {
+        Ok(value) if !value.trim().is_empty() => Ok(value),
+        _ => Err(format!("missing or empty env var {key}")),
+    }
 }
 
 fn sample_event() -> Event {
