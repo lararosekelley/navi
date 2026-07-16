@@ -1,0 +1,30 @@
+# systemd user service for navi.
+#
+# Install:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/navi.service ~/.config/systemd/user/navi.service
+#   # put your tokens in ~/.config/navi/navi.env (see below)
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now navi.service
+#   journalctl --user -u navi -f      # follow logs
+#
+# ~/.config/navi/navi.env should contain (chmod 600):
+#   NAVI_GITHUB_TOKEN=ghp_xxx
+#   NAVI_SLACK_TOKEN=xoxb-xxx
+#
+# To keep navi running when you're logged out:  loginctl enable-linger $USER
+
+[Unit]
+Description=navi — focused PR-review alerts to Slack
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.cargo/bin/navi run
+EnvironmentFile=%h/.config/navi/navi.env
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=default.target

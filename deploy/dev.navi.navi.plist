@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  launchd agent for navi (macOS).
+
+  Install:
+    cp deploy/dev.navi.navi.plist ~/Library/LaunchAgents/dev.navi.navi.plist
+    # edit the token values below (or point navi at a config whose tokens are inline)
+    launchctl load ~/Library/LaunchAgents/dev.navi.navi.plist
+    launchctl start dev.navi.navi
+    tail -f ~/Library/Logs/navi.log
+
+  Note: values in this plist are world-readable. For real secrets prefer a wrapper
+  script that exports the tokens from your keychain and then execs `navi run`.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>dev.navi.navi</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/bin/navi</string>
+        <string>run</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>NAVI_GITHUB_TOKEN</key>
+        <string>ghp_replace_me</string>
+        <key>NAVI_SLACK_TOKEN</key>
+        <string>xoxb-replace-me</string>
+    </dict>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>/tmp/navi.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/navi.log</string>
+</dict>
+</plist>
