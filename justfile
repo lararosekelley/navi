@@ -53,31 +53,23 @@ lint-md:
 # Release
 # -------
 
+# Install the release tooling (one-time): cargo-release + cargo-dist.
+install-release-tools:
+    cargo install cargo-release --locked
+    cargo install cargo-dist --locked
+
 # Preview the release artifacts cargo-dist would build
 dist-plan:
     dist plan
 
-# Cut a release (main only): tag the current workspace version and push it,
-# which triggers the dist release workflow. Bump the version in the root
-# Cargo.toml [workspace.package] first, then commit, then run this.
-release:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    branch="$(git rev-parse --abbrev-ref HEAD)"
-    if [ "$branch" != "main" ]; then
-        echo "release: must be on 'main' (currently on '$branch')" >&2
-        exit 1
-    fi
-    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
-        echo "release: tracked changes are uncommitted; commit first" >&2
-        exit 1
-    fi
-    # Read the workspace version from the [workspace.package] table.
-    version="$(awk -F'"' '/^\[workspace.package\]/{p=1} p && /^[[:space:]]*version[[:space:]]*=/{print $2; exit}' Cargo.toml)"
-    if [ -z "$version" ]; then
-        echo "release: could not read version from Cargo.toml" >&2
-        exit 1
-    fi
-    git tag -a "v${version}" -m "v${version}"
-    git push --follow-tags
-    echo "tagged and pushed v${version}"
+# Preview a release without changing anything (level = patch|minor|major|<version>).
+release-dry level:
+    cargo release {{level}}
+
+# Cut a release (main only): cargo-release bumps every crate's version AND the
+# internal cross-crate dep requirements in lockstep, commits, tags v<version>,
+# and pushes. The tag triggers the cargo-dist release workflow, which builds the
+# binaries/installers and runs publish-crates.yml to publish all crates.
+# level = patch|minor|major|rc|<explicit-version>.
+release level:
+    cargo release {{level}} --execute

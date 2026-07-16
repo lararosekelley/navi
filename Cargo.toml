@@ -15,6 +15,22 @@ license = "MIT"
 repository = "https://github.com/lararosekelley/navi"
 homepage = "https://github.com/lararosekelley/navi"
 
+# cargo-release settings. All crates share one version, and cargo-release rewrites
+# the internal cross-crate dependency requirements (see [workspace.dependencies]
+# below) to match on every bump — so they can never drift. Publishing to crates.io
+# is left to CI (publish-crates.yml, on tag), so `cargo release` only bumps the
+# versions, commits, tags v<version>, and pushes.
+[workspace.metadata.release]
+shared-version = true
+consolidate-commits = true
+dependent-version = "upgrade"
+tag-name = "v{{version}}"
+pre-release-commit-message = "chore(release): release v{{version}}"
+publish = false
+push = true
+tag = true
+allow-branch = ["main"]
+
 [workspace.dependencies]
 # Internal (version required so the crates are publishable to crates.io)
 navi-notifier-core = { path = "crates/navi-notifier-core", version = "0.1.0" }

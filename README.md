@@ -155,23 +155,30 @@ and the rule filter — is pure and covered by fixture tests; the HTTP wiring is
 
 ## Releasing
 
-Releases are cut with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
-[`dist-workspace.toml`](dist-workspace.toml). The release workflow is _generated_, not hand-written:
+Versioning is driven by [cargo-release](https://github.com/crate-ci/cargo-release) and artifact building by
+[cargo-dist](https://github.com/axodotdev/cargo-dist) ([`dist-workspace.toml`](dist-workspace.toml)). All four crates
+share one version; cargo-release keeps that version _and_ the internal cross-crate dependency requirements in lockstep
+on every bump (see [`[workspace.metadata.release]`](Cargo.toml)), so they can never drift.
+
+One-time setup — install the tooling and generate the (not-hand-written) release workflow:
 
 ```sh
-# Prefer the prebuilt binary; `cargo install cargo-dist` can fail on a yanked
-# transitive dep unless you pass --locked.
-curl --proto '=https' --tlsv1.2 -LsSf \
-  https://github.com/axodotdev/cargo-dist/releases/latest/download/cargo-dist-installer.sh | sh
-# or: cargo install cargo-dist --locked
-
-dist init                 # reads dist-workspace.toml, writes .github/workflows/release.yml
-just release              # tag the current workspace version and push (triggers the release)
+just install-release-tools    # cargo install cargo-release + cargo-dist (--locked)
+dist init                     # reads dist-workspace.toml, writes .github/workflows/release.yml
 ```
 
-The live [e2e workflow](.github/workflows/e2e.yml) runs as a pre-release gate, and
-[`publish-crates.yml`](.github/workflows/publish-crates.yml) publishes the crates to crates.io in dependency order
-after the builds succeed. See [`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md) for the manual pre-release checklist.
+Cutting a release (from `main`):
+
+```sh
+just release-dry minor        # preview the bump, commit, and tag — changes nothing
+just release minor            # bump all crates + internal deps, commit, tag v<version>, push
+```
+
+`just release` only bumps/commits/tags/pushes — it does **not** publish. The tag push triggers the cargo-dist release
+workflow, which builds the binaries and installers, runs the [e2e workflow](.github/workflows/e2e.yml) as a
+pre-release gate, and then runs [`publish-crates.yml`](.github/workflows/publish-crates.yml) to publish all crates to
+crates.io in dependency order — so publishing only happens after the release builds pass. See
+[`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md) for the manual pre-release checklist.
 
 ## License
 
