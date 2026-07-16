@@ -3,7 +3,7 @@
 //! A provider crate implements [`Source`] (things that produce events) and/or
 //! [`Notifier`] (things that deliver them). The engine wires arbitrary sets of each
 //! together through the registry, so adding GitLab or Discord is "implement a trait,
-//! register a constructor" — no engine changes.
+//! register a constructor" with no engine changes.
 
 use async_trait::async_trait;
 

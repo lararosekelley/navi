@@ -1,8 +1,8 @@
 //! Configuration for the rule/filter layer.
 //!
-//! Provider auth (tokens, API bases) is deliberately *not* here — that belongs to
-//! each provider crate's own config. This module only describes how events are
-//! filtered and prioritised once normalized, which is what the engine needs.
+//! Provider auth (tokens, API bases) is not here; that belongs to each provider
+//! crate's own config. This module only describes how events are filtered and
+//! prioritised once normalized.
 
 use std::collections::BTreeSet;
 

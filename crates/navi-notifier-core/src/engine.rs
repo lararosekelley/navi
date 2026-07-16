@@ -1,9 +1,9 @@
 //! The orchestration core: poll every source, filter through the rules, route
 //! survivors to notifiers, and record delivery idempotently.
 //!
-//! The engine is deliberately transport- and provider-agnostic — it speaks only in
-//! [`Source`], [`Notifier`], [`StateStore`], and [`Event`]. The daemon layer owns
-//! scheduling; this owns a single pass ([`Engine::run_once`]).
+//! The engine is transport- and provider-agnostic; it speaks only in [`Source`],
+//! [`Notifier`], [`StateStore`], and [`Event`]. The daemon layer owns scheduling;
+//! this owns a single pass ([`Engine::run_once`]).
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ pub struct Route {
     pub notifier: String,
 }
 
-/// What happened to a single event during a run — captured for logging and
+/// What happened to a single event during a run, captured for logging and
 /// `--dry-run` reporting.
 #[derive(Debug, Clone)]
 pub enum EventOutcome {
@@ -107,8 +107,8 @@ impl Engine {
 
     /// Run a single poll→filter→deliver pass over all sources.
     ///
-    /// `dry_run` reports what *would* happen without sending, marking delivery, or
-    /// advancing provider cursors — so the user can preview their config safely.
+    /// `dry_run` reports what would happen without sending, marking delivery, or
+    /// advancing provider cursors, so the user can preview their config safely.
     pub async fn run_once(&self, ctx: FilterContext, dry_run: bool) -> RunReport {
         let mut report = RunReport::default();
 
@@ -162,7 +162,7 @@ impl Engine {
             };
         }
 
-        // 2. Dedup — never ping twice for the same underlying action.
+        // 2. Dedup: never ping twice for the same underlying action.
         match self.state.was_delivered(&event.dedup_key).await {
             Ok(true) => {
                 return EventRecord {
@@ -172,8 +172,8 @@ impl Engine {
             }
             Ok(false) => {}
             Err(err) => {
-                // Fail safe: if we can't check dedup, don't risk spamming — treat as
-                // a delivery failure so it is retried next pass.
+                // Fail safe: if we can't check dedup, treat as a delivery failure
+                // so it is retried next pass rather than risk spamming.
                 warn!(dedup_key = %event.dedup_key, %err, "dedup check failed");
                 return EventRecord {
                     event,
@@ -216,9 +216,9 @@ impl Engine {
             }
         }
 
-        // Only consider the event delivered (and advance provider cursors) if *every*
+        // Only consider the event delivered (and advance provider cursors) if every
         // routed notifier succeeded. A partial failure stays undelivered so the next
-        // pass retries — dedup guards against double-sends to notifiers that did work
+        // pass retries; dedup guards against double-sends to notifiers that did work
         // via provider-side idempotency where available.
         if errors.is_empty() {
             if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {

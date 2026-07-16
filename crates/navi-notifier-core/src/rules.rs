@@ -16,8 +16,8 @@ pub struct FilterContext {
     pub local_minutes: Option<u16>,
 }
 
-/// Why an event was dropped. Surfaced in logs / `--dry-run` output so the user can
-/// understand *why* something didn't ping them — the whole point of "configurable".
+/// Why an event was dropped. Surfaced in logs and `--dry-run` output so the user
+/// can understand why something didn't ping them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DropReason {
     EventKindDisabled,
@@ -100,10 +100,10 @@ impl RuleEngine {
             return false;
         }
         if start < end {
-            // Same-day window, e.g. 09:00–17:00.
+            // Same-day window, e.g. 09:00 to 17:00.
             now >= start && now < end
         } else {
-            // Wraps midnight, e.g. 22:00–08:00.
+            // Wraps midnight, e.g. 22:00 to 08:00.
             now >= start || now < end
         }
     }

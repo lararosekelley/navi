@@ -1,4 +1,4 @@
-//! `navi-notifier-core` — the provider-agnostic heart of navi.
+//! `navi-notifier-core`: the provider-agnostic core of navi.
 //!
 //! It defines the normalized [`model`] every provider maps into, the [`traits`]
 //! ([`Source`](traits::Source), [`Notifier`](traits::Notifier),
@@ -14,7 +14,6 @@ pub mod model;
 pub mod rules;
 pub mod traits;
 
-// Re-export the most commonly used items at the crate root for ergonomic imports.
 pub use config::RuleConfig;
 pub use engine::{Engine, EventOutcome, EventRecord, Route, RunReport};
 pub use error::{NotifyError, SourceError, StateError};
