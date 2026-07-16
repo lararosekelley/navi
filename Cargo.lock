@@ -948,7 +948,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -970,7 +970,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "serde",
@@ -983,7 +983,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-github"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -999,7 +999,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-slack"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "async-trait",
  "navi-notifier-core",
