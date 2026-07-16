@@ -3,20 +3,21 @@
 [![crates.io](https://img.shields.io/crates/v/navi-notifier?color=cc6699)](https://crates.io/crates/navi-notifier)
 [![CI](https://github.com/lararosekelley/navi/actions/workflows/ci.yml/badge.svg)](https://github.com/lararosekelley/navi/actions/workflows/ci.yml)
 
-> Focused, configurable PR-review alerts — from GitHub to Slack.
+> 🧚‍♀️ A friendly helper to guide you through the day-to-day noise of code review
 
 ---
 
-GitHub's native Slack app is noisy: it fires on everything and you can't tune it. `navi` is the opposite — a small
-daemon that DMs you a tight, high-signal stream of only the review events that matter to *you*, in the spirit of
-Graphite's alerts:
+`navi` is a free, open-source, and locally-run service for keeping you up-to-date with code review requests. It supports
+GitHub and Slack as of now, with planned support for GitLab, Discord, and email transports.
+
+It will notify you when:
 
 - 👀 a **review was requested** of you (and 🔁 **re-review** requests)
 - ✅/⚠️/💬 a **review was submitted** on your PR (approved / changes / comment)
 - ♻️ your **review was dismissed**
 - 💬 someone **replied to a comment you made** (or in a thread you're in)
 - 👋 you were **@-mentioned**
-- 💜 your PR was **merged**, or 🚫 **closed**
+- 🟣 your PR was **merged**, or 🚫 **closed**
 
 Every alert kind is individually toggleable, filterable by repo, and mutable by author — so you keep the signal and
 drop the noise. It ships for **GitHub → Slack** today, but the core is provider-agnostic so GitLab, Discord, etc. are
@@ -32,9 +33,9 @@ Please report bugs and feature requests in
 
 ## How it works
 
-navi polls GitHub's Notifications API as a cheap trigger to learn *which* PRs have new activity, then fetches each
+navi polls GitHub's Notifications API as a cheap trigger to learn _which_ PRs have new activity, then fetches each
 such PR's reviews and comments and **diffs** them against a stored snapshot to derive precise events. The notification
-`reason` alone can't distinguish "reply to *my* comment" from "a dismissal" from "a re-review" — the diff can. State
+`reason` alone can't distinguish "reply to _my_ comment" from "a dismissal" from "a re-review" — the diff can. State
 lives in a local SQLite database, so delivery is idempotent (you're never pinged twice) and it never touches your
 GitHub read/unread state.
 
@@ -66,19 +67,19 @@ set up — see [Releasing](#releasing).
 Create a Personal Access Token that can read your notifications and PRs:
 
 - **Classic PAT:** scopes `notifications` + `repo` (read access to the repos you care about).
-- **Fine-grained PAT:** read access to *Pull requests* and *Notifications* on the relevant repos.
+- **Fine-grained PAT:** read access to _Pull requests_ and _Notifications_ on the relevant repos.
 
 Export it as `NAVI_GITHUB_TOKEN`.
 
 ### 2. Slack app
 
-1. Create an app at <https://api.slack.com/apps> → *From scratch*.
+1. Create an app at <https://api.slack.com/apps> → _From scratch_.
 2. Under **OAuth & Permissions**, add bot scopes: `chat:write` and `im:write`.
 3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-…`).
 4. Export it as `NAVI_SLACK_TOKEN`.
 
 `dm_to = "self"` DMs whoever the token authenticates as. If that resolves to the bot rather than you, set `dm_to` to
-your Slack user id (`U…`) — find it via your Slack profile → *Copy member ID*.
+your Slack user id (`U…`) — find it via your Slack profile → _Copy member ID_.
 
 ### 3. Configure
 
@@ -108,18 +109,18 @@ suppressed, without sending anything or advancing state.
 
 `navi init` documents every field inline. Highlights:
 
-| Section | Key | Meaning |
-|---------|-----|---------|
-| `general` | `poll_interval_secs` | Seconds between poll passes (`run`). |
-| `general` | `utc_offset_minutes` | Your UTC offset, used only for quiet hours. |
-| `github` | `token_env` / `api_base` | Token env var; API base for GitHub Enterprise. |
-| `slack` | `dm_to` | `"self"`, a user id `U…`, a channel `C…`, or `#name`. |
-| `rules.events.*` | | Per-event-kind on/off toggles. |
-| `rules.repos` | `allow` / `deny` | `owner/name` or `owner/*` patterns; `deny` wins. |
-| `rules.mute_authors` | | Logins whose actions never notify (e.g. bots). |
-| `rules.quiet_hours` | | Suppress during a local time window. |
-| `rules.merge_close` | `author` / `reviewer` | Whose merges/closes to report. |
-| `routes` | | Which sources feed which notifiers. |
+| Section              | Key                      | Meaning                                               |
+| -------------------- | ------------------------ | ----------------------------------------------------- |
+| `general`            | `poll_interval_secs`     | Seconds between poll passes (`run`).                  |
+| `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.           |
+| `github`             | `token_env` / `api_base` | Token env var; API base for GitHub Enterprise.        |
+| `slack`              | `dm_to`                  | `"self"`, a user id `U…`, a channel `C…`, or `#name`. |
+| `rules.events.*`     |                          | Per-event-kind on/off toggles.                        |
+| `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.      |
+| `rules.mute_authors` |                          | Logins whose actions never notify (e.g. bots).        |
+| `rules.quiet_hours`  |                          | Suppress during a local time window.                  |
+| `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                        |
+| `routes`             |                          | Which sources feed which notifiers.                   |
 
 It works across **all repos your token can see** — there's no repo list to maintain; narrow the firehose with
 `rules.repos`.
@@ -128,12 +129,12 @@ It works across **all repos your token can see** — there's no repo list to mai
 
 A Cargo workspace with a provider-agnostic core and thin provider crates:
 
-| Crate | Role |
-|-------|------|
-| `navi-notifier-core` | Normalized event model, the `Source`/`Notifier`/`StateStore` traits, the rule/filter layer, and the poll→filter→deliver engine. No provider specifics. |
-| `navi-notifier-github` | `Source`: notifications polling + PR-timeline diffing. |
-| `navi-notifier-slack` | `Notifier`: Block Kit DMs via a bot token. |
-| `navi-notifier` | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI. |
+| Crate                  | Role                                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `navi-notifier-core`   | Normalized event model, the `Source`/`Notifier`/`StateStore` traits, the rule/filter layer, and the poll→filter→deliver engine. No provider specifics. |
+| `navi-notifier-github` | `Source`: notifications polling + PR-timeline diffing.                                                                                                 |
+| `navi-notifier-slack`  | `Notifier`: Block Kit DMs via a bot token.                                                                                                             |
+| `navi-notifier`        | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                  |
 
 Adding a provider is "implement a trait, register a constructor" — no engine changes.
 
@@ -155,7 +156,7 @@ and the rule filter — is pure and covered by fixture tests; the HTTP wiring is
 ## Releasing
 
 Releases are cut with [cargo-dist](https://github.com/axodotdev/cargo-dist), configured in
-[`dist-workspace.toml`](dist-workspace.toml). The release workflow is *generated*, not hand-written:
+[`dist-workspace.toml`](dist-workspace.toml). The release workflow is _generated_, not hand-written:
 
 ```sh
 # Prefer the prebuilt binary; `cargo install cargo-dist` can fail on a yanked
