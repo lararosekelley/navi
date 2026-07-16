@@ -1,0 +1,23 @@
+//! `navi-notifier-core` — the provider-agnostic heart of navi.
+//!
+//! It defines the normalized [`model`] every provider maps into, the [`traits`]
+//! ([`Source`](traits::Source), [`Notifier`](traits::Notifier),
+//! [`StateStore`](traits::StateStore)) that providers implement, the [`rules`]
+//! filter layer, and the [`engine`] that ties a poll into filtered, deduplicated
+//! delivery. It has no knowledge of GitHub, Slack, SQLite, or async transport
+//! details beyond the trait boundaries.
+
+pub mod config;
+pub mod engine;
+pub mod error;
+pub mod model;
+pub mod rules;
+pub mod traits;
+
+// Re-export the most commonly used items at the crate root for ergonomic imports.
+pub use config::RuleConfig;
+pub use engine::{Engine, EventOutcome, EventRecord, Route, RunReport};
+pub use error::{NotifyError, SourceError, StateError};
+pub use model::{Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship};
+pub use rules::{Decision, DropReason, FilterContext, RuleEngine};
+pub use traits::{Notifier, Source, StateStore};
