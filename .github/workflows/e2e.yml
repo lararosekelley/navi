@@ -1,0 +1,53 @@
+# Live end-to-end smoke test against the real GitHub + Slack APIs.
+#
+# navi keys off *your* GitHub notifications, so there's no ephemeral-repo
+# lifecycle to drive (that would need a second account acting on you). Instead
+# this proves the two things the mock tests structurally can't: that real
+# credentials authenticate and that today's live payload shapes still parse —
+# one real notifications poll, and one real Slack DM. See src/bin/navi-e2e.rs.
+#
+# Triggers:
+#   - workflow_dispatch: run by hand.
+#   - workflow_call: invoked by the dist-generated release.yml as a plan-job, so
+#     a failing live run blocks the release before anything is built or published.
+#
+# Secrets (add under repo Settings → Secrets and variables → Actions):
+#   NAVI_GITHUB_TOKEN   GitHub PAT (notifications + repo read)
+#   NAVI_SLACK_TOKEN    Slack bot token (chat:write + im:write)
+# Optional repo variable:
+#   NAVI_SLACK_DM_TO    DM target (defaults to "self")
+name: E2E
+
+on:
+  workflow_dispatch:
+  workflow_call:
+    inputs:
+      plan:
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  e2e:
+    # Never run on the pull_request event the dist release.yml also triggers on
+    # (fork PRs can't see secrets); this is a release gate + manual dispatch only.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the live e2e smoke test
+        env:
+          NAVI_GITHUB_TOKEN: ${{ secrets.NAVI_GITHUB_TOKEN }}
+          NAVI_SLACK_TOKEN: ${{ secrets.NAVI_SLACK_TOKEN }}
+          NAVI_SLACK_DM_TO: ${{ vars.NAVI_SLACK_DM_TO || 'self' }}
+        run: cargo run -p navi-notifier --features e2e --bin navi-e2e
