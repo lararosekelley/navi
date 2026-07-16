@@ -41,6 +41,11 @@ pub struct SlackNotifier {
 
 impl SlackNotifier {
     pub fn new(config: SlackNotifierConfig) -> Result<Self, NotifyError> {
+        if config.token.trim().is_empty() {
+            return Err(NotifyError::Auth(
+                "Slack token is empty; set NAVI_SLACK_TOKEN".into(),
+            ));
+        }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
