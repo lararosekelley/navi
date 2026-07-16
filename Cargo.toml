@@ -17,7 +17,7 @@ homepage = "https://github.com/lararosekelley/navi"
 
 # cargo-release settings. All crates share one version, and cargo-release rewrites
 # the internal cross-crate dependency requirements (see [workspace.dependencies]
-# below) to match on every bump — so they can never drift. Publishing to crates.io
+# below) to match on every bump, so they can never drift. Publishing to crates.io
 # is left to CI (publish-crates.yml, on tag), so `cargo release` only bumps the
 # versions, commits, tags v<version>, and pushes.
 [workspace.metadata.release]
@@ -69,7 +69,7 @@ thiserror = "1"
 time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
 
 [workspace.lints.clippy]
-# Keep the default-ish posture; deny obvious footguns.
+# Keep the default-ish posture; deny obvious mistakes.
 
 # The profile cargo-dist builds release artifacts with.
 [profile.dist]

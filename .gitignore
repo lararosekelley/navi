@@ -6,3 +6,4 @@ node_modules/
 *.sqlite3-*
 navi.env
 .env
+SCRATCHPAD.md

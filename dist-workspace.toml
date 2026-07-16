@@ -3,7 +3,7 @@ members = ["cargo:."]
 
 # Config for cargo-dist. After editing this, regenerate the release workflow with
 # `dist init` (or `dist generate`) and commit the resulting
-# .github/workflows/release.yml — it is generated, not hand-written.
+# .github/workflows/release.yml; it is generated, not hand-written.
 [dist]
 # The cargo-dist version CI pins to.
 cargo-dist-version = "0.31.0"
@@ -24,7 +24,7 @@ targets = [
     "x86_64-unknown-linux-musl",
     "x86_64-pc-windows-msvc",
 ]
-# Where installers place the binary — a neutral location wired onto PATH by the
+# Where installers place the binary: a neutral location wired onto PATH by the
 # installer, so a curl|bash user doesn't need a Rust setup.
 install-path = "~/.local/bin"
 # Host releases on GitHub Releases.
