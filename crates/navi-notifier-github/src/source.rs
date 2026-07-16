@@ -38,6 +38,11 @@ pub struct GitHubSource {
 
 impl GitHubSource {
     pub fn new(config: GitHubSourceConfig) -> Result<Self, SourceError> {
+        if config.token.trim().is_empty() {
+            return Err(SourceError::Auth(
+                "GitHub token is empty; set NAVI_GITHUB_TOKEN".into(),
+            ));
+        }
         let mut builder = Octocrab::builder().personal_token(config.token);
         if let Some(base) = config.api_base {
             builder = builder
@@ -254,23 +259,77 @@ fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     Some((owner, repo, number))
 }
 
-/// Map an octocrab error into a [`SourceError`], recognising rate limiting.
 fn map_err(err: octocrab::Error) -> SourceError {
-    let msg = err.to_string();
-    if msg.contains("rate limit") || msg.contains("403") {
-        return SourceError::RateLimited {
+    classify_github_error(&err.to_string())
+}
+
+/// Classify a GitHub error message. A 403 is only a rate limit when the message
+/// says so (an unauthenticated or over-quota call); a plain 403 is a permission
+/// problem, not something to silently retry.
+fn classify_github_error(msg: &str) -> SourceError {
+    let lower = msg.to_ascii_lowercase();
+    if lower.contains("rate limit") {
+        SourceError::RateLimited {
             retry_after_secs: 60,
-        };
+        }
+    } else if lower.contains("bad credentials")
+        || lower.contains("unauthorized")
+        || lower.contains("401")
+    {
+        SourceError::Auth(format!("invalid GitHub token: {msg}"))
+    } else if lower.contains("forbidden")
+        || lower.contains("resource not accessible")
+        || lower.contains("403")
+    {
+        SourceError::Auth(format!(
+            "GitHub returned 403 (forbidden); the token likely lacks required scopes \
+             (notifications + repo/PR read): {msg}"
+        ))
+    } else {
+        SourceError::Request(msg.to_string())
     }
-    if msg.contains("401") || msg.contains("Bad credentials") {
-        return SourceError::Auth(msg);
-    }
-    SourceError::Request(msg)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_pr_url;
+    use super::{classify_github_error, parse_pr_url};
+    use navi_notifier_core::SourceError;
+
+    #[test]
+    fn rate_limit_messages_are_rate_limited() {
+        assert!(matches!(
+            classify_github_error("API rate limit exceeded for 1.2.3.4"),
+            SourceError::RateLimited { .. }
+        ));
+        assert!(matches!(
+            classify_github_error("You have exceeded a secondary rate limit"),
+            SourceError::RateLimited { .. }
+        ));
+    }
+
+    #[test]
+    fn bad_credentials_is_auth() {
+        assert!(matches!(
+            classify_github_error("Bad credentials"),
+            SourceError::Auth(_)
+        ));
+    }
+
+    #[test]
+    fn forbidden_is_auth_not_rate_limited() {
+        match classify_github_error("Resource not accessible by personal access token") {
+            SourceError::Auth(m) => assert!(m.contains("403")),
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn other_errors_are_request() {
+        assert!(matches!(
+            classify_github_error("connection reset by peer"),
+            SourceError::Request(_)
+        ));
+    }
 
     #[test]
     fn parses_pr_url() {
