@@ -1,0 +1,61 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/navi-notifier-core",
+    "crates/navi-notifier-github",
+    "crates/navi-notifier-slack",
+    "crates/navi-notifier",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/lararosekelley/navi"
+homepage = "https://github.com/lararosekelley/navi"
+
+[workspace.dependencies]
+# Internal (version required so the crates are publishable to crates.io)
+navi-notifier-core = { path = "crates/navi-notifier-core", version = "0.1.0" }
+navi-notifier-github = { path = "crates/navi-notifier-github", version = "0.1.0" }
+navi-notifier-slack = { path = "crates/navi-notifier-slack", version = "0.1.0" }
+
+# Async runtime
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# HTTP / providers
+octocrab = "0.44"
+slack-morphism = "2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+
+# Serialization / config
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Storage
+rusqlite = { version = "0.32", features = ["bundled"] }
+
+# CLI / config discovery
+clap = { version = "4", features = ["derive"] }
+directories = "5"
+
+# Observability / errors
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"
+thiserror = "1"
+
+# Time
+time = { version = "0.3", features = ["serde", "macros", "formatting", "parsing"] }
+
+[workspace.lints.clippy]
+# Keep the default-ish posture; deny obvious footguns.
+
+# The profile cargo-dist builds release artifacts with.
+[profile.dist]
+inherits = "release"
+lto = "thin"

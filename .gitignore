@@ -1,0 +1,8 @@
+/target
+/dist
+node_modules/
+**/*.rs.bk
+*.sqlite3
+*.sqlite3-*
+navi.env
+.env
