@@ -1,0 +1,33 @@
+module.exports = {
+  extends: ["@commitlint/config-conventional"],
+  rules: {
+    "scope-empty": [2, "never"],
+    "scope-enum": [
+      2,
+      "always",
+      [
+        "core",
+        "github",
+        "slack",
+        "cli",
+        "engine",
+        "rules",
+        "config",
+        "state",
+        "notifier",
+        "source",
+        "providers",
+        "docs",
+        "help",
+        "deps",
+        "build",
+        "ci",
+        "release",
+        "tooling",
+        "tests",
+        "e2e",
+        "security",
+      ],
+    ],
+  },
+};
