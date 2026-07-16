@@ -3,7 +3,7 @@
 # navi keys off *your* GitHub notifications, so there's no ephemeral-repo
 # lifecycle to drive (that would need a second account acting on you). Instead
 # this proves the two things the mock tests structurally can't: that real
-# credentials authenticate and that today's live payload shapes still parse —
+# credentials authenticate and that today's live payload shapes still parse:
 # one real notifications poll, and one real Slack DM. See src/bin/navi-e2e.rs.
 #
 # Triggers:

@@ -1,6 +1,6 @@
 # Publishes the workspace crates to crates.io in dependency order. Invoked by the
 # dist-generated release.yml as a custom publish job, so it only runs after every
-# release build succeeded and the GitHub Release is hosted — a broken build can
+# release build succeeded and the GitHub Release is hosted; a broken build can
 # never burn an immutable crates.io version.
 #
 # The bin (`navi-notifier`) depends on the three libs, so they must be published
