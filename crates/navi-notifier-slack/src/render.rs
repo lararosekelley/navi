@@ -19,7 +19,7 @@ pub fn render(event: &Event) -> Rendered {
     let headline = headline(event, actor);
 
     // Fallback text (also what shows in the notification/push).
-    let text = format!("{} — {}: {}", strip_mrkdwn(&headline), repo_ref, pr.title);
+    let text = format!("{} · {}: {}", strip_mrkdwn(&headline), repo_ref, pr.title);
 
     let link_url = event.target_url.clone().unwrap_or_else(|| pr.url.clone());
     let mut context_bits = vec![format!("<{}|{}>", pr.url, repo_ref)];
@@ -120,7 +120,7 @@ mod tests {
         let r = render(&event(EventKind::ReviewRequested));
         assert!(r
             .text
-            .starts_with(":eyes: reviewer requested your review — acme/widgets#12:"));
+            .starts_with(":eyes: reviewer requested your review · acme/widgets#12:"));
         // section + excerpt + context.
         assert_eq!(r.blocks.len(), 3);
     }

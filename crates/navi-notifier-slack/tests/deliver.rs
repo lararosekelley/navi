@@ -99,7 +99,7 @@ async fn dm_self_resolves_channel_and_posts() {
 async fn concrete_channel_skips_conversations_open() {
     let server = MockServer::start().await;
     // No conversations.open mounted: if the code calls it, the request 404s and
-    // send() fails — which is exactly the assertion we want.
+    // send() fails, which is the assertion we want.
     mount_ok(
         &server,
         "chat.postMessage",
