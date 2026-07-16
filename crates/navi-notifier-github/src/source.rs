@@ -180,8 +180,8 @@ impl Source for GitHubSource {
             };
             let scope = format!("{owner}/{repo}#{number}");
 
-            // Skip threads whose activity we've already processed (pure optimisation —
-            // the snapshot would suppress duplicates anyway).
+            // Skip threads whose activity we've already processed. An optimisation
+            // only; the snapshot would suppress duplicates anyway.
             let seen_key = format!("thread:{scope}");
             let last_seen = state.get_cursor(SOURCE_ID, &seen_key).await?;
             if let (Some(seen), Some(updated)) = (&last_seen, &n.updated_at) {

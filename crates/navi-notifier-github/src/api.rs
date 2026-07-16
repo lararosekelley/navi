@@ -1,13 +1,12 @@
-//! Minimal typed views over the GitHub REST payloads navi consumes.
+//! Typed views over the GitHub REST payloads navi consumes.
 //!
-//! We deserialize only the fields the diff engine needs (via `#[serde(default)]`
-//! throughout, so GitHub adding/removing peripheral fields never breaks parsing).
-//! Keeping our own structs — rather than leaning on octocrab's models — means the
-//! pure [`crate::diff`] layer has no dependency on the HTTP client and is trivially
-//! testable from JSON fixtures.
+//! Deserializes only the fields the diff engine needs (via `#[serde(default)]`, so
+//! GitHub adding/removing peripheral fields never breaks parsing). Owning these
+//! structs keeps the pure [`crate::diff`] layer free of any HTTP-client dependency
+//! and testable from JSON fixtures.
 
-// These structs mirror the GitHub payloads; some fields are kept for documentation
-// and forward-compatibility even when the diff engine doesn't read them today.
+// Some fields are kept for forward-compatibility even when the diff engine doesn't
+// read them today.
 #![allow(dead_code)]
 
 use serde::Deserialize;
@@ -97,7 +96,7 @@ pub struct Review {
     pub html_url: Option<String>,
 }
 
-/// `GET /repos/{o}/{r}/pulls/{n}/comments` — inline (diff) review comments.
+/// `GET /repos/{o}/{r}/pulls/{n}/comments`: inline (diff) review comments.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewComment {
     pub id: u64,
@@ -112,7 +111,7 @@ pub struct ReviewComment {
     pub created_at: Option<String>,
 }
 
-/// `GET /repos/{o}/{r}/issues/{n}/comments` — top-level conversation comments.
+/// `GET /repos/{o}/{r}/issues/{n}/comments`: top-level conversation comments.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueComment {
     pub id: u64,
@@ -125,7 +124,7 @@ pub struct IssueComment {
     pub created_at: Option<String>,
 }
 
-/// Everything fetched for one PR in a single poll pass — the input to the diff.
+/// Everything fetched for one PR in a single poll pass; the input to the diff.
 #[derive(Debug, Clone)]
 pub struct PrData {
     pub pull_request: PullRequest,

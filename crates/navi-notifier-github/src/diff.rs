@@ -1,9 +1,8 @@
-//! The pure diff engine: `(previous snapshot, freshly fetched PR data) → events`.
+//! The pure diff engine: `(previous snapshot, freshly fetched PR data) -> events`.
 //!
-//! This is where GitHub's shape becomes navi's taxonomy, and it is deliberately free
-//! of any I/O so it can be exhaustively unit-tested from fixtures. The source layer
-//! ([`crate::source`]) does the fetching and persistence; everything *interesting*
-//! about "what changed and does it matter to me" happens here.
+//! Maps GitHub's shape onto navi's taxonomy. Free of I/O so it can be unit-tested
+//! from fixtures; the source layer ([`crate::source`]) handles fetching and
+//! persistence.
 
 use std::collections::{HashMap, HashSet};
 
@@ -28,7 +27,7 @@ pub struct DiffContext {
 
 /// Diff `data` against `old`, returning the events to deliver and the snapshot to
 /// persist. The first time a PR is seen (`!old.initialized`), only currently
-/// outstanding review requests are surfaced — history is not back-filled.
+/// outstanding review requests are surfaced; history is not back-filled.
 pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, PrSnapshot) {
     let pr = &data.pull_request;
     let viewer = &ctx.viewer_login;
@@ -66,7 +65,6 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         is_reviewer,
     };
 
-    // The new snapshot reflects everything we've now observed.
     let new_snapshot = build_snapshot(data, viewer, old);
 
     let mut events = Vec::new();
@@ -97,7 +95,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         })
     };
 
-    // --- First sighting: surface the current review ask, nothing historical. ---
+    // First sighting: surface the current review ask, never historical activity.
     if !old.initialized {
         if viewer_requested_now && !is_author {
             emit(
@@ -112,7 +110,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         return (events, new_snapshot);
     }
 
-    // --- Review request / re-review request (edge-detected). ---
+    // Review request / re-review request (edge-detected).
     if viewer_requested_now && !old.viewer_requested && !is_author {
         let (kind, disc) = if old.viewer_reviewed {
             (EventKind::ReReviewRequested, "re_review_requested")
@@ -129,7 +127,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         );
     }
 
-    // --- Reviews: submissions by others, and dismissals of your reviews. ---
+    // Reviews: submissions by others, and dismissals of your reviews.
     for review in &data.reviews {
         let reviewer_login = review
             .user
@@ -169,7 +167,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         }
     }
 
-    // --- Inline review comments: replies in threads you're part of, and mentions. ---
+    // Inline review comments: replies in threads you're part of, and mentions.
     let by_id: HashMap<u64, &ReviewComment> =
         data.review_comments.iter().map(|c| (c.id, c)).collect();
     let viewer_roots: HashSet<u64> = data
@@ -216,7 +214,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         }
     }
 
-    // --- Conversation (issue) comments: mentions, and replies where you took part. ---
+    // Conversation (issue) comments: mentions, and replies where you took part.
     let viewer_in_conversation = data
         .issue_comments
         .iter()
@@ -253,7 +251,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         }
     }
 
-    // --- Lifecycle transitions. ---
+    // Lifecycle transitions.
     if pr.merged && !old.merged {
         let sha = pr
             .merge_commit_sha
