@@ -45,20 +45,33 @@ notifications (trigger) → fetch PR timeline → diff vs snapshot → filter (r
 
 ## Install
 
-With a Rust toolchain:
+One-line install (macOS, Linux, or Git Bash on Windows):
 
 ```sh
-cargo install navi-notifier --locked     # installs a binary called `navi`
+curl https://larakelley.com/sh/navi | bash
 ```
 
-Or build from a checkout:
+Native Windows (PowerShell):
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/lararosekelley/navi/releases/latest/download/navi-notifier-installer.ps1 | iex"
+```
+
+Homebrew (macOS/Linux):
 
 ```sh
-cargo build --release                     # ./target/release/navi
+brew install lararosekelley/tap/navi-notifier
 ```
 
-Prebuilt binaries and installers (shell/PowerShell/Homebrew) are published per release once the release workflow is
-set up (see [Releasing](#releasing)).
+With a Rust toolchain, `cargo install navi-notifier --locked` builds from source, or
+`cargo binstall navi-notifier` fetches the prebuilt binary. Every install puts a `navi` binary on your PATH.
+
+The shell command runs [`install.sh`](install.sh), a wrapper around the
+[cargo-dist](https://github.com/axodotdev/cargo-dist)-generated `navi-notifier-installer.sh`; PowerShell fetches the
+matching `.ps1`. Both pull prebuilt binaries from
+[GitHub Releases](https://github.com/lararosekelley/navi/releases), so they need a published release (see
+[Releasing](#releasing)). Linux builds are static musl and run on any distro. navi runs on Linux, macOS, and Windows;
+the background-service units in [`deploy/`](deploy) are Linux (systemd) and macOS (launchd) only.
 
 ## Setup
 

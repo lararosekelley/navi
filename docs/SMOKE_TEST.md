@@ -11,7 +11,7 @@ verify each lands a working binary (`navi --version`):
 
 ```sh
 cargo install navi-notifier --locked
-brew install lararosekelley/tap/navi          # once the tap formula is published
+brew install lararosekelley/tap/navi-notifier   # once the tap formula is published
 curl --proto '=https' --tlsv1.2 -LsSf \
   https://github.com/lararosekelley/navi/releases/latest/download/navi-notifier-installer.sh | sh
 ```
