@@ -1,0 +1,73 @@
+name: Bug report
+description: Something in navi isn't working
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: A few details make a bug much faster to track down. Please redact any tokens or credentials.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what happened instead.
+      placeholder: |
+        1. ...
+        Expected: ...
+        Actual: ...
+    validations:
+      required: true
+  - type: textarea
+    id: config
+    attributes:
+      label: navi config
+      description: "Your config.toml with tokens removed (or the relevant [rules] section)."
+      render: toml
+    validations:
+      required: false
+  - type: input
+    id: version
+    attributes:
+      label: navi version
+      description: Output of `navi --version`.
+      placeholder: navi 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15 / Ubuntu 24.04 / Windows 11
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: How did you install navi?
+      options:
+        - cargo install
+        - Homebrew
+        - Prebuilt release binary / installer script
+        - Built from source
+        - Other / not sure
+    validations:
+      required: true
+  - type: dropdown
+    id: run_mode
+    attributes:
+      label: How were you running it?
+      options:
+        - navi run (daemon)
+        - navi once
+        - navi once --dry-run
+        - systemd / launchd service
+        - Not sure
+    validations:
+      required: false
+  - type: textarea
+    id: output
+    attributes:
+      label: Relevant output
+      description: Command output or logs. Re-running with `log_level = "debug"` (or RUST_LOG) includes more detail.
+      render: text
+    validations:
+      required: false
