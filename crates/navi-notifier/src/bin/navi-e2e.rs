@@ -1,11 +1,11 @@
 //! Live end-to-end smoke test against the real GitHub and Slack APIs.
 //!
-//! navi keys off *your* GitHub notifications, so a faithful "cause an event, assert
-//! the DM" loop would need a second account to act on you. Instead this proves the
-//! two things CI's mock tests structurally can't: that real credentials authenticate
-//! and that the real request/response shapes still parse. It:
-//!   1. builds the GitHub source and runs one real `poll()` (fresh state → derives
-//!      only your outstanding review requests, usually zero) — proving auth + that
+//! navi keys off *your* GitHub notifications, so a "cause an event, assert the DM"
+//! loop would need a second account to act on you. Instead this proves the two
+//! things CI's mock tests can't: that real credentials authenticate and that the
+//! real request/response shapes still parse. It:
+//!   1. builds the GitHub source and runs one real `poll()` (fresh state derives
+//!      only your outstanding review requests, usually zero), proving auth and that
 //!      the live notification/PR payloads deserialize.
 //!   2. verifies the Slack bot token and sends a real DM to the configured target.
 //!
@@ -59,7 +59,7 @@ async fn run() -> Result<(), String> {
         .await
         .map_err(|e| format!("GitHub poll failed: {e}"))?;
     println!(
-        "e2e: GitHub OK — derived {} event(s) on first poll",
+        "e2e: GitHub OK: derived {} event(s) on first poll",
         events.len()
     );
 
@@ -80,7 +80,7 @@ async fn run() -> Result<(), String> {
         .send(&sample_event())
         .await
         .map_err(|e| format!("Slack delivery failed: {e}"))?;
-    println!("e2e: Slack OK — sample DM delivered");
+    println!("e2e: Slack OK: sample DM delivered");
 
     Ok(())
 }

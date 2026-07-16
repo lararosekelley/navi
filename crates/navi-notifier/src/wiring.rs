@@ -1,4 +1,4 @@
-//! Config-driven construction of the engine's sources and notifiers — the "plugin
+//! Config-driven construction of the engine's sources and notifiers, the "plugin
 //! registry" seam. Adding a provider means adding a branch here plus its crate.
 
 use std::sync::Arc;
@@ -42,7 +42,7 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
     ))
 }
 
-/// Build just the Slack notifier — shared by the engine and `test-slack`.
+/// Build the Slack notifier, shared by the engine and `test-slack`.
 pub fn build_slack(config: &SlackConfig) -> Result<SlackNotifier> {
     let token = config.resolve_token()?;
     SlackNotifier::new(SlackNotifierConfig {

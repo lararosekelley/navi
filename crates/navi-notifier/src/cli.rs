@@ -10,8 +10,8 @@ use clap::{Parser, Subcommand};
     version,
     about = "Focused, configurable PR-review alerts from GitHub to Slack",
     long_about = "navi watches your GitHub review activity and sends you a tight, \
-                  high-signal Slack DM stream — review requests, replies to your \
-                  comments, re-review requests, dismissals, merges and closes — \
+                  high-signal Slack DM stream (review requests, replies to your \
+                  comments, re-review requests, dismissals, merges and closes) \
                   without the noise of GitHub's native Slack app."
 )]
 pub struct Cli {

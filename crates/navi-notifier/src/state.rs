@@ -3,7 +3,7 @@
 //! Three tables mirror the trait's three jobs: `snapshots` (opaque per-PR bytes for
 //! diffing), `delivered` (the dedup set), and `cursors` (poll bookkeeping like
 //! ETags). rusqlite is synchronous, so every access runs on the blocking pool via
-//! [`tokio::task::spawn_blocking`] over a shared `Arc<Mutex<Connection>>` — local
+//! [`tokio::task::spawn_blocking`] over a shared `Arc<Mutex<Connection>>`. Local
 //! SQLite calls are microsecond-scale, but this keeps them off the async reactor.
 
 use std::path::Path;

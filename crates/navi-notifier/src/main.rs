@@ -1,4 +1,4 @@
-//! `navi` — focused, configurable PR-review alerts from GitHub to Slack.
+//! `navi`: focused, configurable PR-review alerts from GitHub to Slack.
 
 mod cli;
 mod config;
@@ -39,7 +39,7 @@ async fn main() -> Result<()> {
 fn load_and_init_logging(config_path: &Path) -> Result<Config> {
     if !config_path.exists() {
         bail!(
-            "no config at {} — run `navi init` first",
+            "no config at {}; run `navi init` first",
             config_path.display()
         );
     }
@@ -160,7 +160,7 @@ fn print_report(report: &RunReport, dry_run: bool) {
         warn!(source, %err, "source error during run");
     }
     if dry_run {
-        println!("(dry run — nothing was sent and no state advanced)");
+        println!("(dry run; nothing was sent and no state advanced)");
     }
 }
 
