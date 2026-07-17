@@ -1001,6 +1001,7 @@ version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64",
  "clap",
  "directories",
  "navi-notifier-core",
@@ -1010,6 +1011,7 @@ dependencies = [
  "navi-notifier-github",
  "navi-notifier-gitlab",
  "navi-notifier-slack",
+ "reqwest",
  "rusqlite",
  "serde",
  "serde_json",
