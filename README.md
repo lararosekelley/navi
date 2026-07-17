@@ -11,8 +11,7 @@
 ---
 
 `navi` is a free, open-source, and locally-run service for keeping you up-to-date with code review requests. It
-supports GitHub, GitLab, and Gitea/Forgejo as **sources** and Slack and Discord as **destinations**, with planned
-support for an email destination.
+supports GitHub, GitLab, and Gitea/Forgejo as **sources** and Slack, Discord, and email as **destinations**.
 
 It will notify you when:
 
@@ -113,11 +112,11 @@ navi test-slack           # DMs you a sample message to confirm credentials
 GitHub (source) and Slack (destination) are on by default. The rest are opt-in: set their token and flip
 `enabled = true` in the matching config section.
 
-| Provider      | Kind        | Token env            | Notes                                                    |
-| ------------- | ----------- | -------------------- | -------------------------------------------------------- |
-| GitLab        | source      | `NAVI_GITLAB_TOKEN`  | PAT with `read_api`; set `api_base` for self-hosted.     |
-| Gitea/Forgejo | source      | `NAVI_GITEA_TOKEN`   | set `api_base` to your instance (`.../api/v1`).          |
-| Discord       | destination | `NAVI_DISCORD_TOKEN` | or set `dm_to` to a webhook URL (no token needed).       |
+| Provider      | Kind        | Token env            | Notes                                                |
+| ------------- | ----------- | -------------------- | ---------------------------------------------------- |
+| GitLab        | source      | `NAVI_GITLAB_TOKEN`  | PAT with `read_api`; set `api_base` for self-hosted. |
+| Gitea/Forgejo | source      | `NAVI_GITEA_TOKEN`   | set `api_base` to your instance (`.../api/v1`).      |
+| Discord       | destination | `NAVI_DISCORD_TOKEN` | or set `dm_to` to a webhook URL (no token needed).   |
 
 Then use `routes` to wire which sources feed which destinations (omit `routes` to send every source to every
 destination).
@@ -142,21 +141,21 @@ suppressed, without sending anything or advancing state.
 
 `navi init` documents every field inline. Highlights:
 
-| Section              | Key                      | Meaning                                               |
-| -------------------- | ------------------------ | ----------------------------------------------------- |
-| `general`            | `poll_interval_secs`     | Seconds between poll passes (`run`).                  |
-| `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.           |
-| `github`             | `token_env` / `api_base` | Source. Token env var; API base for GitHub Enterprise. |
+| Section              | Key                      | Meaning                                                               |
+| -------------------- | ------------------------ | --------------------------------------------------------------------- |
+| `general`            | `poll_interval_secs`     | Seconds between poll passes (`run`).                                  |
+| `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.                           |
+| `github`             | `token_env` / `api_base` | Source. Token env var; API base for GitHub Enterprise.                |
 | `gitlab`             | `enabled` / `token_env`  | Source, off by default. `read_api` token; `api_base` for self-hosted. |
-| `gitea`              | `enabled` / `api_base`   | Source, off by default. Gitea or Forgejo instance.    |
-| `slack`              | `dm_to`                  | Destination. `"self"`, a user id `U…`, `C…`, or `#name`. |
-| `discord`            | `enabled` / `dm_to`      | Destination, off by default. Webhook URL or user id.  |
-| `rules.events.*`     |                          | Per-event-kind on/off toggles.                        |
-| `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.      |
-| `rules.mute_authors` |                          | Logins whose actions never notify (e.g. bots).        |
-| `rules.quiet_hours`  |                          | Suppress during a local time window.                  |
-| `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                        |
-| `routes`             |                          | Which sources feed which destinations.                |
+| `gitea`              | `enabled` / `api_base`   | Source, off by default. Gitea or Forgejo instance.                    |
+| `slack`              | `dm_to`                  | Destination. `"self"`, a user id `U…`, `C…`, or `#name`.              |
+| `discord`            | `enabled` / `dm_to`      | Destination, off by default. Webhook URL or user id.                  |
+| `rules.events.*`     |                          | Per-event-kind on/off toggles.                                        |
+| `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.                      |
+| `rules.mute_authors` |                          | Logins whose actions never notify (e.g. bots).                        |
+| `rules.quiet_hours`  |                          | Suppress during a local time window.                                  |
+| `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                                        |
+| `routes`             |                          | Which sources feed which destinations.                                |
 
 It works across **all repos your token can see**. There's no repo list to maintain; narrow the firehose with
 `rules.repos`.
@@ -165,16 +164,17 @@ It works across **all repos your token can see**. There's no repo list to mainta
 
 A Cargo workspace with a provider-agnostic core and thin provider crates:
 
-| Crate                   | Role                                                                                                                                                   |
-| ----------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Crate                   | Role                                                                                                                                                      |
+| ----------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `navi-notifier-core`    | Normalized event model, the `Source`/`Destination`/`StateStore` traits, the rule/filter layer, and the poll→filter→deliver engine. No provider specifics. |
-| `navi-notifier-forge`   | Shared diff engine + model for GitHub-shaped forges (used by the github and gitea sources).                                                            |
-| `navi-notifier-github`  | Source: notifications polling + PR-timeline diffing.                                                                                                   |
-| `navi-notifier-gitlab`  | Source: review-request and mention alerts from the Todos API.                                                                                          |
-| `navi-notifier-gitea`   | Source: Gitea/Forgejo, reusing the forge diff engine.                                                                                                  |
-| `navi-notifier-slack`   | Destination: Block Kit DMs via a bot token.                                                                                                            |
-| `navi-notifier-discord` | Destination: embed DMs via a bot token, or a channel webhook.                                                                                          |
-| `navi-notifier`         | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                  |
+| `navi-notifier-forge`   | Shared diff engine + model for GitHub-shaped forges (used by the github and gitea sources).                                                               |
+| `navi-notifier-github`  | Source: notifications polling + PR-timeline diffing.                                                                                                      |
+| `navi-notifier-gitlab`  | Source: review-request and mention alerts from the Todos API.                                                                                             |
+| `navi-notifier-gitea`   | Source: Gitea/Forgejo, reusing the forge diff engine.                                                                                                     |
+| `navi-notifier-slack`   | Destination: Block Kit DMs via a bot token.                                                                                                               |
+| `navi-notifier-discord` | Destination: embed DMs via a bot token, or a channel webhook.                                                                                             |
+| `navi-notifier-email`   | Destination: SMTP delivery, one message per event, threaded per PR.                                                                                       |
+| `navi-notifier`         | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                     |
 
 Adding a provider is "implement a trait, register a constructor", with no engine changes.
 
@@ -222,4 +222,4 @@ crates.io in dependency order; publishing only happens after the release builds 
 
 ## License
 
-[MIT](LICENSE).
+[MIT License](LICENSE). Copyright (c) 2026 Lara Kelley.
