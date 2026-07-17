@@ -5,6 +5,7 @@
 mod cli;
 mod completions;
 mod config;
+mod envfile;
 mod prompt;
 mod service;
 mod setup;
@@ -12,7 +13,7 @@ mod state;
 mod upgrade;
 mod wiring;
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
@@ -29,8 +30,7 @@ use crate::cli::{Cli, Command, ServiceAction};
 use crate::config::{resolve_config_path, resolve_state_path, Config};
 use crate::state::SqliteStore;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     // Dynamic completion: when a shell's completer invokes us with COMPLETE=<shell>,
     // print candidates and exit instead of running a command.
     clap_complete::env::CompleteEnv::with_factory(Cli::command)
@@ -40,7 +40,20 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config.clone())?;
 
-    match cli.command {
+    // Load navi.env before starting the async runtime, so populating the process
+    // environment happens while we're still single-threaded (set_var is not safe
+    // to call once the runtime's worker threads are up). Only fills unset vars.
+    envfile::load_beside_config(&config_path);
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(dispatch(cli.command, config_path))
+}
+
+async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
+    match command {
         Command::Init { force } => cmd_init(&config_path, force),
         Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
         Command::Run => cmd_run(&config_path).await,
