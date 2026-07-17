@@ -1,8 +1,8 @@
 //! The orchestration core: poll every source, filter through the rules, route
-//! survivors to notifiers, and record delivery idempotently.
+//! survivors to destinations, and record delivery idempotently.
 //!
 //! The engine is transport- and provider-agnostic; it speaks only in [`Source`],
-//! [`Notifier`], [`StateStore`], and [`Event`]. The daemon layer owns scheduling;
+//! [`Destination`], [`StateStore`], and [`Event`]. The daemon layer owns scheduling;
 //! this owns a single pass ([`Engine::run_once`]).
 
 use std::sync::Arc;
@@ -12,14 +12,14 @@ use tracing::{debug, error, info, warn};
 use crate::error::SourceError;
 use crate::model::Event;
 use crate::rules::{Decision, DropReason, FilterContext, RuleEngine};
-use crate::traits::{Notifier, Source, StateStore};
+use crate::traits::{Destination, Source, StateStore};
 
-/// Connects a source to a notifier. If a run has no routes at all, the engine
-/// falls back to delivering every source's events to every notifier.
+/// Connects a source to a destination. If a run has no routes at all, the engine
+/// falls back to delivering every source's events to every destination.
 #[derive(Debug, Clone)]
 pub struct Route {
     pub source: String,
-    pub notifier: String,
+    pub destination: String,
 }
 
 /// What happened to a single event during a run, captured for logging and
@@ -66,7 +66,7 @@ impl RunReport {
 
 pub struct Engine {
     sources: Vec<Arc<dyn Source>>,
-    notifiers: Vec<Arc<dyn Notifier>>,
+    destinations: Vec<Arc<dyn Destination>>,
     routes: Vec<Route>,
     rules: RuleEngine,
     state: Arc<dyn StateStore>,
@@ -75,31 +75,31 @@ pub struct Engine {
 impl Engine {
     pub fn new(
         sources: Vec<Arc<dyn Source>>,
-        notifiers: Vec<Arc<dyn Notifier>>,
+        destinations: Vec<Arc<dyn Destination>>,
         routes: Vec<Route>,
         rules: RuleEngine,
         state: Arc<dyn StateStore>,
     ) -> Self {
         Self {
             sources,
-            notifiers,
+            destinations,
             routes,
             rules,
             state,
         }
     }
 
-    /// Notifiers that should receive events from `source_id`.
-    fn notifiers_for(&self, source_id: &str) -> Vec<Arc<dyn Notifier>> {
+    /// Destinations that should receive events from `source_id`.
+    fn destinations_for(&self, source_id: &str) -> Vec<Arc<dyn Destination>> {
         if self.routes.is_empty() {
-            return self.notifiers.clone();
+            return self.destinations.clone();
         }
-        self.notifiers
+        self.destinations
             .iter()
             .filter(|n| {
                 self.routes
                     .iter()
-                    .any(|r| r.source == source_id && r.notifier == n.id())
+                    .any(|r| r.source == source_id && r.destination == n.id())
             })
             .cloned()
             .collect()
@@ -125,7 +125,7 @@ impl Engine {
             };
 
             debug!(source = source.id(), count = events.len(), "polled events");
-            let targets = self.notifiers_for(source.id());
+            let targets = self.destinations_for(source.id());
 
             for event in events {
                 let record = self
@@ -148,7 +148,7 @@ impl Engine {
     async fn process_event(
         &self,
         source: &dyn Source,
-        targets: &[Arc<dyn Notifier>],
+        targets: &[Arc<dyn Destination>],
         event: Event,
         ctx: &FilterContext,
         dry_run: bool,
@@ -194,31 +194,31 @@ impl Engine {
         }
 
         if targets.is_empty() {
-            warn!(source = %event.source_id, "no notifier routed for source; event undeliverable");
+            warn!(source = %event.source_id, "no destination routed for source; event undeliverable");
             return EventRecord {
                 event,
                 outcome: EventOutcome::DeliveryFailed {
-                    errors: vec!["no notifier routed for this source".into()],
+                    errors: vec!["no destination routed for this source".into()],
                 },
             };
         }
 
-        // 3. Deliver to every routed notifier.
+        // 3. Deliver to every routed destination.
         let mut errors = Vec::new();
         let mut delivered_to = Vec::new();
-        for notifier in targets {
-            match notifier.send(&event).await {
-                Ok(()) => delivered_to.push(notifier.id().to_string()),
+        for destination in targets {
+            match destination.send(&event).await {
+                Ok(()) => delivered_to.push(destination.id().to_string()),
                 Err(err) => {
-                    error!(notifier = notifier.id(), %err, "delivery failed");
-                    errors.push(format!("{}: {err}", notifier.id()));
+                    error!(destination = destination.id(), %err, "delivery failed");
+                    errors.push(format!("{}: {err}", destination.id()));
                 }
             }
         }
 
         // Only consider the event delivered (and advance provider cursors) if every
-        // routed notifier succeeded. A partial failure stays undelivered so the next
-        // pass retries; dedup guards against double-sends to notifiers that did work
+        // routed destination succeeded. A partial failure stays undelivered so the next
+        // pass retries; dedup guards against double-sends to destinations that did work
         // via provider-side idempotency where available.
         if errors.is_empty() {
             if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
@@ -253,9 +253,9 @@ impl Engine {
 mod tests {
     use super::*;
     use crate::config::RuleConfig;
-    use crate::error::{NotifyError, StateError};
+    use crate::error::{DestinationError, StateError};
     use crate::model::{Actor, EventKind, PullRequest, Repo, ViewerRelationship};
-    use crate::traits::{Notifier, Source, StateStore};
+    use crate::traits::{Destination, Source, StateStore};
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
@@ -324,18 +324,18 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct MockNotifier {
+    struct MockDestination {
         sent: Mutex<Vec<String>>,
         fail: bool,
     }
     #[async_trait]
-    impl Notifier for MockNotifier {
+    impl Destination for MockDestination {
         fn id(&self) -> &str {
             "mock-notify"
         }
-        async fn send(&self, event: &Event) -> Result<(), NotifyError> {
+        async fn send(&self, event: &Event) -> Result<(), DestinationError> {
             if self.fail {
-                return Err(NotifyError::Delivery("boom".into()));
+                return Err(DestinationError::Delivery("boom".into()));
             }
             self.sent.lock().unwrap().push(event.dedup_key.clone());
             Ok(())
@@ -366,12 +366,12 @@ mod tests {
     fn engine_with(
         events: Vec<Event>,
         rules: RuleConfig,
-        notifier: Arc<MockNotifier>,
+        destination: Arc<MockDestination>,
     ) -> (Engine, Arc<MemState>) {
         let state = Arc::new(MemState::default());
         let engine = Engine::new(
             vec![Arc::new(MockSource { events })],
-            vec![notifier],
+            vec![destination],
             vec![],
             RuleEngine::new(rules),
             state.clone(),
@@ -381,17 +381,17 @@ mod tests {
 
     #[tokio::test]
     async fn delivers_then_dedupes_across_runs() {
-        let notifier = Arc::new(MockNotifier::default());
+        let destination = Arc::new(MockDestination::default());
         let (engine, _state) = engine_with(
             vec![ev(EventKind::Mentioned, "k1")],
             RuleConfig::default(),
-            notifier.clone(),
+            destination.clone(),
         );
 
         let r1 = engine.run_once(FilterContext::default(), false).await;
         assert_eq!(r1.delivered_count(), 1);
         assert_eq!(
-            notifier.sent.lock().unwrap().as_slice(),
+            destination.sent.lock().unwrap().as_slice(),
             &["k1".to_string()]
         );
 
@@ -402,18 +402,18 @@ mod tests {
             r2.records[0].outcome,
             EventOutcome::AlreadyDelivered
         ));
-        assert_eq!(notifier.sent.lock().unwrap().len(), 1);
+        assert_eq!(destination.sent.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
     async fn rules_suppress_disabled_kind() {
-        let notifier = Arc::new(MockNotifier::default());
+        let destination = Arc::new(MockDestination::default());
         let mut rules = RuleConfig::default();
         rules.events.mentioned = false;
         let (engine, _s) = engine_with(
             vec![ev(EventKind::Mentioned, "k1")],
             rules,
-            notifier.clone(),
+            destination.clone(),
         );
         let r = engine.run_once(FilterContext::default(), false).await;
         assert_eq!(r.delivered_count(), 0);
@@ -421,37 +421,37 @@ mod tests {
             r.records[0].outcome,
             EventOutcome::Suppressed(DropReason::EventKindDisabled)
         ));
-        assert!(notifier.sent.lock().unwrap().is_empty());
+        assert!(destination.sent.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
     async fn dry_run_sends_nothing_and_leaves_state() {
-        let notifier = Arc::new(MockNotifier::default());
+        let destination = Arc::new(MockDestination::default());
         let (engine, state) = engine_with(
             vec![ev(EventKind::Mentioned, "k1")],
             RuleConfig::default(),
-            notifier.clone(),
+            destination.clone(),
         );
         let r = engine.run_once(FilterContext::default(), true).await;
         assert!(matches!(
             r.records[0].outcome,
             EventOutcome::WouldDeliver { .. }
         ));
-        assert!(notifier.sent.lock().unwrap().is_empty());
+        assert!(destination.sent.lock().unwrap().is_empty());
         // Not marked delivered → a real run afterwards would still deliver.
         assert!(!state.was_delivered("k1").await.unwrap());
     }
 
     #[tokio::test]
     async fn failed_delivery_is_not_marked_delivered() {
-        let notifier = Arc::new(MockNotifier {
+        let destination = Arc::new(MockDestination {
             fail: true,
             ..Default::default()
         });
         let (engine, state) = engine_with(
             vec![ev(EventKind::Mentioned, "k1")],
             RuleConfig::default(),
-            notifier,
+            destination,
         );
         let r = engine.run_once(FilterContext::default(), false).await;
         assert!(matches!(

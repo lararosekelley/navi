@@ -19,9 +19,9 @@ pub enum SourceError {
     Other(#[from] anyhow_compat::BoxError),
 }
 
-/// Errors a [`crate::traits::Notifier`] may raise while delivering.
+/// Errors a [`crate::traits::Destination`] may raise while delivering.
 #[derive(Debug, Error)]
-pub enum NotifyError {
+pub enum DestinationError {
     #[error("authentication failed: {0}")]
     Auth(String),
     #[error("rate limited; retry after {retry_after_secs}s")]

@@ -1,4 +1,4 @@
-//! End-to-end tests for the Slack notifier against a mock Slack Web API.
+//! End-to-end tests for the Slack destination against a mock Slack Web API.
 //!
 //! Exercises the real reqwest path, the `ok:false` envelope handling, DM-channel
 //! resolution (`conversations.open`), and that the posted message carries the
@@ -7,8 +7,8 @@
 use navi_notifier_core::model::{
     Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
-use navi_notifier_core::traits::Notifier;
-use navi_notifier_slack::{SlackNotifier, SlackNotifierConfig};
+use navi_notifier_core::traits::Destination;
+use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use wiremock::matchers::{method, path};
@@ -40,13 +40,13 @@ fn sample_event() -> Event {
     }
 }
 
-fn notifier(server: &MockServer, dm_to: &str) -> SlackNotifier {
-    SlackNotifier::new(SlackNotifierConfig {
+fn destination(server: &MockServer, dm_to: &str) -> SlackDestination {
+    SlackDestination::new(SlackDestinationConfig {
         token: "xoxb-test".into(),
         dm_to: dm_to.into(),
         api_base: Some(format!("{}/api", server.uri())),
     })
-    .expect("build notifier")
+    .expect("build destination")
 }
 
 async fn mount_ok(server: &MockServer, endpoint: &str, body: Value) {
@@ -79,8 +79,8 @@ async fn dm_self_resolves_channel_and_posts() {
     )
     .await;
 
-    let notifier = notifier(&server, "self");
-    notifier.send(&sample_event()).await.expect("send");
+    let destination = destination(&server, "self");
+    destination.send(&sample_event()).await.expect("send");
 
     // Assert the posted message went to the resolved DM channel with a headline.
     let requests = server.received_requests().await.unwrap();
@@ -107,8 +107,8 @@ async fn concrete_channel_skips_conversations_open() {
     )
     .await;
 
-    let notifier = notifier(&server, "C0123456789");
-    notifier.send(&sample_event()).await.expect("send");
+    let destination = destination(&server, "C0123456789");
+    destination.send(&sample_event()).await.expect("send");
 
     let requests = server.received_requests().await.unwrap();
     assert!(
@@ -135,8 +135,8 @@ async fn verify_returns_identity() {
     )
     .await;
 
-    let notifier = notifier(&server, "self");
-    let who = notifier.verify().await.expect("verify");
+    let destination = destination(&server, "self");
+    let who = destination.verify().await.expect("verify");
     assert!(who.contains("lara"), "got {who}");
     assert!(who.contains("Higharc"), "got {who}");
 }
@@ -151,7 +151,7 @@ async fn ok_false_is_surfaced_as_error() {
     )
     .await;
 
-    let notifier = notifier(&server, "self");
-    let err = notifier.verify().await.unwrap_err();
+    let destination = destination(&server, "self");
+    let err = destination.verify().await.unwrap_err();
     assert!(format!("{err}").contains("invalid_auth"), "got {err}");
 }

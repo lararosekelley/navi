@@ -1,13 +1,13 @@
 //! The extension seams that make navi provider-agnostic.
 //!
 //! A provider crate implements [`Source`] (things that produce events) and/or
-//! [`Notifier`] (things that deliver them). The engine wires arbitrary sets of each
+//! [`Destination`] (things that deliver them). The engine wires arbitrary sets of each
 //! together through the registry, so adding GitLab or Discord is "implement a trait,
 //! register a constructor" with no engine changes.
 
 use async_trait::async_trait;
 
-use crate::error::{NotifyError, SourceError, StateError};
+use crate::error::{DestinationError, SourceError, StateError};
 use crate::model::Event;
 
 /// Durable, provider-agnostic storage the engine and sources rely on.
@@ -68,11 +68,11 @@ pub trait Source: Send + Sync {
 
 /// A delivery target for events (Slack today; Discord, email, … later).
 #[async_trait]
-pub trait Notifier: Send + Sync {
+pub trait Destination: Send + Sync {
     /// Stable identifier, e.g. `"slack"`.
     fn id(&self) -> &str;
 
     /// Deliver a single, already-filtered event. Implementations should be
     /// resilient to transient failure (retry/backoff) before returning `Err`.
-    async fn send(&self, event: &Event) -> Result<(), NotifyError>;
+    async fn send(&self, event: &Event) -> Result<(), DestinationError>;
 }

@@ -115,15 +115,15 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
 
 async fn cmd_test_slack(config_path: &Path) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let notifier = wiring::build_slack(&config.slack)?;
-    let who = notifier
+    let destination = wiring::build_slack(&config.slack)?;
+    let who = destination
         .verify()
         .await
         .context("verifying Slack credentials (auth.test)")?;
     println!("Authenticated with Slack as {who}");
 
-    use navi_notifier_core::traits::Notifier;
-    notifier
+    use navi_notifier_core::traits::Destination;
+    destination
         .send(&sample_event())
         .await
         .context("sending sample message")?;
@@ -318,10 +318,10 @@ reviewer = true
 # [rules]
 # mute_authors = ["dependabot[bot]"]
 
-# Routes wire sources to notifiers. Omit this section entirely to send every
-# source to every enabled notifier. List routes to be explicit, e.g. github+gitlab
+# Routes wire sources to destinations. Omit this section entirely to send every
+# source to every enabled destination. List routes to be explicit, e.g. github+gitlab
 # to slack, or github to discord:
 [[routes]]
 source = "github"
-notifier = "slack"
+destination = "slack"
 "#;

@@ -1,16 +1,16 @@
-//! Config-driven construction of the engine's sources and notifiers, the "plugin
+//! Config-driven construction of the engine's sources and destinations, the "plugin
 //! registry" seam. Adding a provider means adding a branch here plus its crate.
 
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use navi_notifier_core::traits::{Notifier, Source, StateStore};
+use navi_notifier_core::traits::{Destination, Source, StateStore};
 use navi_notifier_core::{Engine, RuleEngine};
-use navi_notifier_discord::{DiscordNotifier, DiscordNotifierConfig};
+use navi_notifier_discord::{DiscordDestination, DiscordDestinationConfig};
 use navi_notifier_gitea::{GiteaSource, GiteaSourceConfig};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
-use navi_notifier_slack::{SlackNotifier, SlackNotifierConfig};
+use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 
 use crate::config::{Config, SlackConfig};
 
@@ -42,40 +42,43 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
         sources.push(Arc::new(source));
     }
 
-    let mut notifiers: Vec<Arc<dyn Notifier>> = Vec::new();
+    let mut destinations: Vec<Arc<dyn Destination>> = Vec::new();
     if config.slack.enabled {
-        notifiers.push(Arc::new(build_slack(&config.slack)?));
+        destinations.push(Arc::new(build_slack(&config.slack)?));
     }
     if config.discord.enabled {
-        let notifier = DiscordNotifier::new(DiscordNotifierConfig {
+        let destination = DiscordDestination::new(DiscordDestinationConfig {
             token: config.discord.resolve_token(),
             dm_to: config.discord.dm_to.clone(),
             api_base: None,
         })
-        .context("initializing Discord notifier")?;
-        notifiers.push(Arc::new(notifier));
+        .context("initializing Discord destination")?;
+        destinations.push(Arc::new(destination));
     }
 
     anyhow::ensure!(!sources.is_empty(), "no sources enabled in config");
-    anyhow::ensure!(!notifiers.is_empty(), "no notifiers enabled in config");
+    anyhow::ensure!(
+        !destinations.is_empty(),
+        "no destinations enabled in config"
+    );
 
     let rules = RuleEngine::new(config.rules.clone());
     Ok(Engine::new(
         sources,
-        notifiers,
+        destinations,
         config.engine_routes(),
         rules,
         state,
     ))
 }
 
-/// Build the Slack notifier, shared by the engine and `test-slack`.
-pub fn build_slack(config: &SlackConfig) -> Result<SlackNotifier> {
+/// Build the Slack destination, shared by the engine and `test-slack`.
+pub fn build_slack(config: &SlackConfig) -> Result<SlackDestination> {
     let token = config.resolve_token()?;
-    SlackNotifier::new(SlackNotifierConfig {
+    SlackDestination::new(SlackDestinationConfig {
         token,
         dm_to: config.dm_to.clone(),
         api_base: None,
     })
-    .context("initializing Slack notifier")
+    .context("initializing Slack destination")
 }

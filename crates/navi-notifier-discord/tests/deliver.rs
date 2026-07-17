@@ -1,10 +1,10 @@
-//! Discord notifier tests against a mock Discord API.
+//! Discord destination tests against a mock Discord API.
 
 use navi_notifier_core::model::{
     Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
-use navi_notifier_core::traits::Notifier;
-use navi_notifier_discord::{DiscordNotifier, DiscordNotifierConfig};
+use navi_notifier_core::traits::Destination;
+use navi_notifier_discord::{DiscordDestination, DiscordDestinationConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use wiremock::matchers::{method, path};
@@ -42,13 +42,13 @@ async fn webhook_mode_posts_embed() {
         .mount(&server)
         .await;
 
-    let notifier = DiscordNotifier::new(DiscordNotifierConfig {
+    let destination = DiscordDestination::new(DiscordDestinationConfig {
         token: None,
         dm_to: format!("{}/webhooks/1/abc", server.uri()),
         api_base: None,
     })
     .expect("build");
-    notifier.send(&sample_event()).await.expect("send");
+    destination.send(&sample_event()).await.expect("send");
 
     let reqs = server.received_requests().await.unwrap();
     let post = reqs
@@ -77,13 +77,13 @@ async fn dm_mode_opens_channel_then_posts() {
         .mount(&server)
         .await;
 
-    let notifier = DiscordNotifier::new(DiscordNotifierConfig {
+    let destination = DiscordDestination::new(DiscordDestinationConfig {
         token: Some("bot-token".into()),
         dm_to: "123456789".into(),
         api_base: Some(server.uri()),
     })
     .expect("build");
-    notifier.send(&sample_event()).await.expect("send");
+    destination.send(&sample_event()).await.expect("send");
 
     let reqs = server.received_requests().await.unwrap();
     assert!(reqs.iter().any(|r| r.url.path() == "/channels/D1/messages"));
@@ -91,7 +91,7 @@ async fn dm_mode_opens_channel_then_posts() {
 
 #[test]
 fn dm_mode_requires_token() {
-    let result = DiscordNotifier::new(DiscordNotifierConfig {
+    let result = DiscordDestination::new(DiscordDestinationConfig {
         token: None,
         dm_to: "123456789".into(),
         api_base: None,

@@ -22,7 +22,7 @@ pub struct Config {
     pub slack: SlackConfig,
     pub discord: DiscordConfig,
     pub rules: RuleConfig,
-    /// Source→notifier wiring. Empty means "every source to every notifier".
+    /// Source→destination wiring. Empty means "every source to every destination".
     pub routes: Vec<RouteConfig>,
 }
 
@@ -143,7 +143,7 @@ impl Default for SlackConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct DiscordConfig {
-    /// Whether the Discord notifier is active. Off by default; opt in.
+    /// Whether the Discord destination is active. Off by default; opt in.
     pub enabled: bool,
     /// Bot token env var (needed only for user-DM mode, not webhook mode).
     pub token_env: String,
@@ -166,7 +166,9 @@ impl Default for DiscordConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub source: String,
-    pub notifier: String,
+    /// `alias` keeps configs that used the older `notifier` key working.
+    #[serde(alias = "notifier")]
+    pub destination: String,
 }
 
 impl GitHubConfig {
@@ -235,7 +237,7 @@ impl Config {
             .iter()
             .map(|r| navi_notifier_core::Route {
                 source: r.source.clone(),
-                notifier: r.notifier.clone(),
+                destination: r.destination.clone(),
             })
             .collect()
     }

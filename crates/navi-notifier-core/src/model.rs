@@ -1,7 +1,7 @@
 //! Provider-agnostic domain model.
 //!
 //! Every source (GitHub today; GitLab, etc. later) normalizes its native payloads
-//! into these types so that the engine, rule layer, and notifiers never need to
+//! into these types so that the engine, rule layer, and destinations never need to
 //! know which provider an event came from.
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,7 @@ pub struct Actor {
     pub login: String,
     /// Human display name when the provider supplies one.
     pub display_name: Option<String>,
-    /// Avatar URL, used for richer notifier rendering.
+    /// Avatar URL, used for richer destination rendering.
     pub avatar_url: Option<String>,
 }
 
@@ -78,7 +78,7 @@ pub enum ReviewState {
 }
 
 /// The kind of thing that happened. This is the taxonomy the rule layer filters on
-/// and the notifier renders. Discriminant-only variants keep matching cheap; payload
+/// and the destination renders. Discriminant-only variants keep matching cheap; payload
 /// detail lives on [`Event`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

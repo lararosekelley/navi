@@ -24,10 +24,10 @@ use async_trait::async_trait;
 use navi_notifier_core::model::{
     Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
-use navi_notifier_core::traits::{Notifier, Source, StateStore};
+use navi_notifier_core::traits::{Destination, Source, StateStore};
 use navi_notifier_core::StateError;
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
-use navi_notifier_slack::{SlackNotifier, SlackNotifierConfig};
+use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 use time::OffsetDateTime;
 
 #[tokio::main]
@@ -65,18 +65,18 @@ async fn run() -> Result<(), String> {
 
     // 2. Slack: verify credentials and deliver a real DM.
     println!("e2e: verifying Slack + sending a DM to {dm_to}…");
-    let notifier = SlackNotifier::new(SlackNotifierConfig {
+    let destination = SlackDestination::new(SlackDestinationConfig {
         token: slack_token,
         dm_to,
         api_base: None,
     })
-    .map_err(|e| format!("building Slack notifier: {e}"))?;
-    let who = notifier
+    .map_err(|e| format!("building Slack destination: {e}"))?;
+    let who = destination
         .verify()
         .await
         .map_err(|e| format!("Slack auth.test failed: {e}"))?;
     println!("e2e: Slack authenticated as {who}");
-    notifier
+    destination
         .send(&sample_event())
         .await
         .map_err(|e| format!("Slack delivery failed: {e}"))?;

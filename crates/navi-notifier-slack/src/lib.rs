@@ -1,4 +1,4 @@
-//! Slack notifier for navi.
+//! Slack destination for navi.
 //!
 //! Delivers each event as a Block Kit DM via a bot token (`chat.postMessage`). The
 //! target channel is resolved once: a `U…` user id (or the token's own identity via
@@ -10,8 +10,8 @@ mod render;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use navi_notifier_core::traits::Notifier;
-use navi_notifier_core::{Event, NotifyError};
+use navi_notifier_core::traits::Destination;
+use navi_notifier_core::{DestinationError, Event};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
@@ -22,7 +22,7 @@ pub use render::{render, Rendered};
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
 const MAX_ATTEMPTS: u32 = 3;
 
-pub struct SlackNotifierConfig {
+pub struct SlackDestinationConfig {
     pub token: String,
     /// `"self"`, a user id (`U…`), a channel id (`C…`), or `#channel-name`.
     pub dm_to: String,
@@ -31,7 +31,7 @@ pub struct SlackNotifierConfig {
     pub api_base: Option<String>,
 }
 
-pub struct SlackNotifier {
+pub struct SlackDestination {
     client: reqwest::Client,
     token: String,
     dm_to: String,
@@ -39,17 +39,17 @@ pub struct SlackNotifier {
     channel: OnceCell<String>,
 }
 
-impl SlackNotifier {
-    pub fn new(config: SlackNotifierConfig) -> Result<Self, NotifyError> {
+impl SlackDestination {
+    pub fn new(config: SlackDestinationConfig) -> Result<Self, DestinationError> {
         if config.token.trim().is_empty() {
-            return Err(NotifyError::Auth(
+            return Err(DestinationError::Auth(
                 "Slack token is empty; set NAVI_SLACK_TOKEN".into(),
             ));
         }
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(30))
             .build()
-            .map_err(|e| NotifyError::Delivery(format!("building HTTP client: {e}")))?;
+            .map_err(|e| DestinationError::Delivery(format!("building HTTP client: {e}")))?;
         Ok(Self {
             client,
             token: config.token,
@@ -62,7 +62,7 @@ impl SlackNotifier {
     }
 
     /// Verify credentials and return the authenticated identity string (for `test-slack`).
-    pub async fn verify(&self) -> Result<String, NotifyError> {
+    pub async fn verify(&self) -> Result<String, DestinationError> {
         let resp: AuthTest = self.call("auth.test", &json!({})).await?;
         Ok(format!(
             "{} (team {})",
@@ -72,7 +72,7 @@ impl SlackNotifier {
     }
 
     /// Resolve (once) the channel id to post into.
-    async fn target(&self) -> Result<&str, NotifyError> {
+    async fn target(&self) -> Result<&str, DestinationError> {
         self.channel
             .get_or_try_init(|| async {
                 // A concrete channel id or name is used verbatim.
@@ -81,8 +81,9 @@ impl SlackNotifier {
                 }
                 let user_id = if self.dm_to == "self" {
                     let auth: AuthTest = self.call("auth.test", &json!({})).await?;
-                    auth.user_id
-                        .ok_or_else(|| NotifyError::Auth("auth.test returned no user id".into()))?
+                    auth.user_id.ok_or_else(|| {
+                        DestinationError::Auth("auth.test returned no user id".into())
+                    })?
                 } else {
                     self.dm_to.clone()
                 };
@@ -90,7 +91,7 @@ impl SlackNotifier {
                     .call("conversations.open", &json!({ "users": user_id }))
                     .await?;
                 opened.channel.map(|c| c.id).ok_or_else(|| {
-                    NotifyError::Delivery("conversations.open returned no channel".into())
+                    DestinationError::Delivery("conversations.open returned no channel".into())
                 })
             })
             .await
@@ -102,7 +103,7 @@ impl SlackNotifier {
         &self,
         method: &str,
         body: &Value,
-    ) -> Result<T, NotifyError> {
+    ) -> Result<T, DestinationError> {
         let url = format!("{}/{method}", self.api_base);
         let resp = self
             .client
@@ -111,7 +112,7 @@ impl SlackNotifier {
             .json(body)
             .send()
             .await
-            .map_err(|e| NotifyError::Delivery(format!("{method}: {e}")))?;
+            .map_err(|e| DestinationError::Delivery(format!("{method}: {e}")))?;
 
         if resp.status().as_u16() == 429 {
             let retry_after = resp
@@ -120,7 +121,7 @@ impl SlackNotifier {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(30);
-            return Err(NotifyError::RateLimited {
+            return Err(DestinationError::RateLimited {
                 retry_after_secs: retry_after,
             });
         }
@@ -128,11 +129,11 @@ impl SlackNotifier {
         let value: Value = resp
             .json()
             .await
-            .map_err(|e| NotifyError::Delivery(format!("{method}: decoding response: {e}")))?;
+            .map_err(|e| DestinationError::Delivery(format!("{method}: decoding response: {e}")))?;
 
         if value.get("ok").and_then(Value::as_bool) == Some(true) {
             serde_json::from_value(value)
-                .map_err(|e| NotifyError::Delivery(format!("{method}: unexpected shape: {e}")))
+                .map_err(|e| DestinationError::Delivery(format!("{method}: unexpected shape: {e}")))
         } else {
             let err = value
                 .get("error")
@@ -145,12 +146,12 @@ impl SlackNotifier {
 }
 
 #[async_trait]
-impl Notifier for SlackNotifier {
+impl Destination for SlackDestination {
     fn id(&self) -> &str {
         "slack"
     }
 
-    async fn send(&self, event: &Event) -> Result<(), NotifyError> {
+    async fn send(&self, event: &Event) -> Result<(), DestinationError> {
         let channel = self.target().await?.to_string();
         let rendered = render(event);
         let body = json!({
@@ -169,11 +170,13 @@ impl Notifier for SlackNotifier {
                     debug!(dedup_key = %event.dedup_key, channel, "delivered to slack");
                     return Ok(());
                 }
-                Err(NotifyError::RateLimited { retry_after_secs }) if attempt < MAX_ATTEMPTS => {
+                Err(DestinationError::RateLimited { retry_after_secs })
+                    if attempt < MAX_ATTEMPTS =>
+                {
                     warn!(retry_after_secs, attempt, "slack rate limited; backing off");
                     tokio::time::sleep(Duration::from_secs(retry_after_secs)).await;
                 }
-                Err(NotifyError::Delivery(_)) if attempt < MAX_ATTEMPTS => {
+                Err(DestinationError::Delivery(_)) if attempt < MAX_ATTEMPTS => {
                     let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
                     tokio::time::sleep(backoff).await;
                 }
@@ -183,15 +186,15 @@ impl Notifier for SlackNotifier {
     }
 }
 
-fn classify_slack_error(err: &str) -> NotifyError {
+fn classify_slack_error(err: &str) -> DestinationError {
     match err {
         "invalid_auth" | "not_authed" | "account_inactive" | "token_revoked" => {
-            NotifyError::Auth(err.to_string())
+            DestinationError::Auth(err.to_string())
         }
-        "ratelimited" | "rate_limited" => NotifyError::RateLimited {
+        "ratelimited" | "rate_limited" => DestinationError::RateLimited {
             retry_after_secs: 30,
         },
-        other => NotifyError::Delivery(other.to_string()),
+        other => DestinationError::Delivery(other.to_string()),
     }
 }
 
