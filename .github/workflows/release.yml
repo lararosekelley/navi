@@ -220,10 +220,15 @@ jobs:
   host:
     needs:
       - plan
+      - custom-e2e
       - build-local-artifacts
       - build-global-artifacts
-    # Only run if we're "publishing", and only if plan, local and global didn't fail (skipped is fine)
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # HAND-PATCHED (allow-dirty = ["ci"] in dist-workspace.toml keeps dist from
+    # clobbering this): require the custom-e2e gate to succeed. dist only gates the
+    # build jobs on plan-jobs, not host/announce, and host otherwise treats skipped
+    # builds as fine, so a failed e2e would skip the builds but still run host with
+    # no artifacts. Requiring custom-e2e == success blocks the whole release.
+    if: ${{ always() && needs.plan.result == 'success' && needs.custom-e2e.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
