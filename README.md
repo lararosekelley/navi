@@ -8,7 +8,7 @@
 ---
 
 `navi` is a free, open-source, and locally-run service for keeping you up-to-date with code review requests. It supports
-GitHub and Slack as of now, with planned support for GitLab, Discord, and email transports.
+GitHub and GitLab as sources and Slack and Discord as notifiers, with planned support for Gitea/Forgejo and email.
 
 It will notify you when:
 
@@ -146,7 +146,9 @@ A Cargo workspace with a provider-agnostic core and thin provider crates:
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `navi-notifier-core`   | Normalized event model, the `Source`/`Notifier`/`StateStore` traits, the rule/filter layer, and the poll→filter→deliver engine. No provider specifics. |
 | `navi-notifier-github` | `Source`: notifications polling + PR-timeline diffing.                                                                                                 |
+| `navi-notifier-gitlab` | `Source`: review-request and mention alerts from the Todos API.                                                                                        |
 | `navi-notifier-slack`  | `Notifier`: Block Kit DMs via a bot token.                                                                                                             |
+| `navi-notifier-discord`| `Notifier`: embed DMs via a bot token, or a channel webhook.                                                                                           |
 | `navi-notifier`        | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                  |
 
 Adding a provider is "implement a trait, register a constructor", with no engine changes.
