@@ -8,6 +8,7 @@ members = [
     "crates/navi-notifier-gitlab",
     "crates/navi-notifier-slack",
     "crates/navi-notifier-discord",
+    "crates/navi-notifier-email",
     "crates/navi-notifier",
 ]
 
@@ -44,6 +45,7 @@ navi-notifier-gitea = { path = "crates/navi-notifier-gitea", version = "0.1.2" }
 navi-notifier-gitlab = { path = "crates/navi-notifier-gitlab", version = "0.1.2" }
 navi-notifier-slack = { path = "crates/navi-notifier-slack", version = "0.1.2" }
 navi-notifier-discord = { path = "crates/navi-notifier-discord", version = "0.1.2" }
+navi-notifier-email = { path = "crates/navi-notifier-email", version = "0.1.2" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }

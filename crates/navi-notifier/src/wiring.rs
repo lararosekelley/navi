@@ -3,10 +3,12 @@
 
 use std::sync::Arc;
 
+use anyhow::bail;
 use anyhow::{Context, Result};
 use navi_notifier_core::traits::{Destination, Source, StateStore};
 use navi_notifier_core::{Engine, RuleEngine};
 use navi_notifier_discord::{DiscordDestination, DiscordDestinationConfig};
+use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use navi_notifier_gitea::{GiteaSource, GiteaSourceConfig};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
@@ -53,6 +55,25 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
             api_base: None,
         })
         .context("initializing Discord destination")?;
+        destinations.push(Arc::new(destination));
+    }
+    if config.email.enabled {
+        let tls = match config.email.tls.as_str() {
+            "none" => EmailTls::None,
+            "starttls" => EmailTls::StartTls,
+            "implicit" => EmailTls::Implicit,
+            other => bail!("unknown email tls mode `{other}` (use none|starttls|implicit)"),
+        };
+        let destination = EmailDestination::new(EmailDestinationConfig {
+            smtp_host: config.email.smtp_host.clone(),
+            smtp_port: config.email.smtp_port,
+            tls,
+            username: config.email.username.clone(),
+            password: config.email.resolve_password(),
+            from: config.email.from.clone(),
+            to: config.email.to.clone(),
+        })
+        .context("initializing email destination")?;
         destinations.push(Arc::new(destination));
     }
 

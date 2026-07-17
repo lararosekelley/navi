@@ -1,0 +1,24 @@
+[package]
+name = "navi-notifier-email"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Email destination for navi: SMTP delivery with per-PR threading."
+
+[dependencies]
+navi-notifier-core.workspace = true
+async-trait.workspace = true
+lettre = { version = "0.11", default-features = false, features = [
+    "builder",
+    "smtp-transport",
+    "tokio1",
+    "tokio1-rustls-tls",
+] }
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+time.workspace = true

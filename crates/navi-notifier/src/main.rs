@@ -287,6 +287,18 @@ token_env = "NAVI_DISCORD_TOKEN"
 # dm_to = "https://discord.com/api/webhooks/..."   # webhook, or a user id like "123456789012345678"
 dm_to = ""
 
+[email]
+# Off by default. Sends one message per event, threaded per PR.
+enabled = false
+smtp_host = "smtp.example.com"
+smtp_port = 587
+# "none" (local sink like Mailpit), "starttls" (587), or "implicit" (465).
+tls = "starttls"
+# username = "navi@example.com"
+password_env = "NAVI_EMAIL_PASSWORD"
+from = "navi <navi@example.com>"
+to = "you <you@example.com>"
+
 [rules.events]
 # Toggle individual alert kinds. Everything below defaults on except ready_for_review.
 review_requested = true

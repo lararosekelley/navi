@@ -45,6 +45,7 @@ navi-notifier-gitea.workspace = true
 navi-notifier-gitlab.workspace = true
 navi-notifier-slack.workspace = true
 navi-notifier-discord.workspace = true
+navi-notifier-email.workspace = true
 
 tokio.workspace = true
 async-trait.workspace = true

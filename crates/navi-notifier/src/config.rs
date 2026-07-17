@@ -21,6 +21,7 @@ pub struct Config {
     pub gitea: GiteaConfig,
     pub slack: SlackConfig,
     pub discord: DiscordConfig,
+    pub email: EmailConfig,
     pub rules: RuleConfig,
     /// Source→destination wiring. Empty means "every source to every destination".
     pub routes: Vec<RouteConfig>,
@@ -160,6 +161,53 @@ impl Default for DiscordConfig {
             token: None,
             dm_to: String::new(),
         }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct EmailConfig {
+    /// Whether the email destination is active. Off by default; opt in.
+    pub enabled: bool,
+    pub smtp_host: String,
+    pub smtp_port: u16,
+    /// `"none"` (local sink), `"starttls"`, or `"implicit"`.
+    pub tls: String,
+    pub username: Option<String>,
+    /// Env var holding the SMTP password.
+    pub password_env: String,
+    pub password: Option<String>,
+    /// Sender, e.g. `navi <navi@example.com>`.
+    pub from: String,
+    /// Recipient, e.g. `you <you@example.com>`.
+    pub to: String,
+}
+
+impl Default for EmailConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            smtp_host: String::new(),
+            smtp_port: 587,
+            tls: "starttls".into(),
+            username: None,
+            password_env: "NAVI_EMAIL_PASSWORD".into(),
+            password: None,
+            from: String::new(),
+            to: String::new(),
+        }
+    }
+}
+
+impl EmailConfig {
+    /// SMTP password from the inline value or env var.
+    pub fn resolve_password(&self) -> Option<String> {
+        if let Some(p) = self.password.as_deref().filter(|p| !p.is_empty()) {
+            return Some(p.to_string());
+        }
+        std::env::var(&self.password_env)
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 }
 
