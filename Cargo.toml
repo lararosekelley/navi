@@ -2,7 +2,9 @@
 resolver = "2"
 members = [
     "crates/navi-notifier-core",
+    "crates/navi-notifier-forge",
     "crates/navi-notifier-github",
+    "crates/navi-notifier-gitea",
     "crates/navi-notifier-gitlab",
     "crates/navi-notifier-slack",
     "crates/navi-notifier-discord",
@@ -36,7 +38,9 @@ allow-branch = ["main"]
 [workspace.dependencies]
 # Internal (version required so the crates are publishable to crates.io)
 navi-notifier-core = { path = "crates/navi-notifier-core", version = "0.1.1" }
+navi-notifier-forge = { path = "crates/navi-notifier-forge", version = "0.1.1" }
 navi-notifier-github = { path = "crates/navi-notifier-github", version = "0.1.1" }
+navi-notifier-gitea = { path = "crates/navi-notifier-gitea", version = "0.1.1" }
 navi-notifier-gitlab = { path = "crates/navi-notifier-gitlab", version = "0.1.1" }
 navi-notifier-slack = { path = "crates/navi-notifier-slack", version = "0.1.1" }
 navi-notifier-discord = { path = "crates/navi-notifier-discord", version = "0.1.1" }

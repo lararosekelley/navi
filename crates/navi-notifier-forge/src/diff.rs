@@ -1,7 +1,7 @@
 //! The pure diff engine: `(previous snapshot, freshly fetched PR data) -> events`.
 //!
 //! Maps GitHub's shape onto navi's taxonomy. Free of I/O so it can be unit-tested
-//! from fixtures; the source layer ([`crate::source`]) handles fetching and
+//! from fixtures; the source layer  handles fetching and
 //! persistence.
 
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,7 @@ use navi_notifier_core::model::{
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
-use crate::api::{PrData, ReviewComment, User};
+use crate::model::{PrData, ReviewComment, User};
 use crate::snapshot::PrSnapshot;
 
 /// Ambient inputs for a diff that don't come from the PR payload.

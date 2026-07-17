@@ -1,11 +1,13 @@
 //! The GitHub [`Source`]: turns notifications into fetches, fetches into diffs,
 //! and diffs into normalized events. All GitHub-specific I/O lives here; the
-//! decision logic lives in the pure [`crate::diff`] module.
+//! decision logic lives in the pure `navi-notifier-forge` diff engine.
 
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::SourceError;
+use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
+use navi_notifier_forge::{diff, DiffContext, PrSnapshot};
 use octocrab::Octocrab;
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
@@ -13,9 +15,7 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-use crate::api::{IssueComment, Notification, PrData, PullRequest, Review, ReviewComment, User};
-use crate::diff::{diff, DiffContext};
-use crate::snapshot::PrSnapshot;
+use crate::notification::Notification;
 
 const SOURCE_ID: &str = "github";
 /// Safety cap on pagination per endpoint so a pathological PR can't stall a poll.

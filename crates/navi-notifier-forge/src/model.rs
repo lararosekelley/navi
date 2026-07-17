@@ -1,9 +1,9 @@
-//! Typed views over the GitHub REST payloads navi consumes.
+//! Shared input model for forge-style sources (GitHub, Gitea, ...).
 //!
-//! Deserializes only the fields the diff engine needs (via `#[serde(default)]`, so
-//! GitHub adding/removing peripheral fields never breaks parsing). Owning these
-//! structs keeps the pure [`crate::diff`] layer free of any HTTP-client dependency
-//! and testable from JSON fixtures.
+//! These are the structs the pure [`crate::diff`] engine consumes. Each source
+//! deserializes or maps its provider's payloads into these, so one diff engine
+//! serves every GitHub-shaped forge. Fields use GitHub's names and values (e.g.
+//! review state `CHANGES_REQUESTED`); a non-GitHub source normalizes to them.
 
 // Some fields are kept for forward-compatibility even when the diff engine doesn't
 // read them today.
@@ -20,39 +20,7 @@ pub struct User {
     pub html_url: Option<String>,
 }
 
-/// One entry from `GET /notifications`.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Notification {
-    /// Thread id (string).
-    pub id: String,
-    pub reason: String,
-    #[serde(default)]
-    pub updated_at: Option<String>,
-    pub subject: NotificationSubject,
-    pub repository: NotificationRepo,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct NotificationSubject {
-    #[serde(default)]
-    pub title: String,
-    /// API URL of the subject, e.g. `.../repos/o/r/pulls/12`. Absent for some kinds.
-    #[serde(default)]
-    pub url: Option<String>,
-    /// `"PullRequest"`, `"Issue"`, `"Commit"`, …
-    #[serde(rename = "type", default)]
-    pub kind: String,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct NotificationRepo {
-    pub name: String,
-    pub owner: User,
-    #[serde(default)]
-    pub html_url: Option<String>,
-}
-
-/// `GET /repos/{o}/{r}/pulls/{n}`.
+/// A pull/merge request.
 #[derive(Debug, Clone, Deserialize)]
 pub struct PullRequest {
     pub number: u64,
@@ -82,7 +50,7 @@ pub struct PullRequest {
     pub requested_reviewers: Vec<User>,
 }
 
-/// `GET /repos/{o}/{r}/pulls/{n}/reviews`.
+/// A submitted review.
 #[derive(Debug, Clone, Deserialize)]
 pub struct Review {
     pub id: u64,
@@ -96,7 +64,7 @@ pub struct Review {
     pub html_url: Option<String>,
 }
 
-/// `GET /repos/{o}/{r}/pulls/{n}/comments`: inline (diff) review comments.
+/// An inline (diff) review comment.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ReviewComment {
     pub id: u64,
@@ -111,7 +79,7 @@ pub struct ReviewComment {
     pub created_at: Option<String>,
 }
 
-/// `GET /repos/{o}/{r}/issues/{n}/comments`: top-level conversation comments.
+/// A top-level conversation comment.
 #[derive(Debug, Clone, Deserialize)]
 pub struct IssueComment {
     pub id: u64,

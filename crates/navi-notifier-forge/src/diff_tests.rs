@@ -3,7 +3,7 @@
 // first sight, and idempotence once the snapshot is persisted.
 
 use super::*;
-use crate::api::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
+use crate::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
 use navi_notifier_core::model::{EventKind, ReviewState};
 
 const VIEWER: &str = "me";

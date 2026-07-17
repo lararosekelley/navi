@@ -9,6 +9,7 @@ description = "GitHub source for navi: notifications polling + PR timeline diffi
 
 [dependencies]
 navi-notifier-core.workspace = true
+navi-notifier-forge.workspace = true
 async-trait.workspace = true
 octocrab.workspace = true
 serde.workspace = true
