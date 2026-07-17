@@ -25,7 +25,7 @@ Prioritise, roughly in this order:
    - login comparisons that aren't case-insensitive.
 2. **Noise.** Any change that makes navi ping more often by default is suspect. New event kinds should default off if
    high-volume; filters should fail closed, not open.
-3. **Idempotent delivery + state.** In the engine, an event must only be marked delivered after every routed notifier
+3. **Idempotent delivery + state.** In the engine, an event must only be marked delivered after every routed destination
    succeeds. Look for ordering bugs between `mark_delivered`, the source `commit` hook, and snapshot writes.
 4. **Provider abstraction.** Provider-specific logic belongs in `navi-notifier-github` / `navi-notifier-slack`, never
    in `navi-notifier-core`. Flag leaks of GitHub/Slack concepts into the core traits or engine.
