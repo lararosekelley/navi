@@ -6,7 +6,9 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use navi_notifier_core::traits::{Notifier, Source, StateStore};
 use navi_notifier_core::{Engine, RuleEngine};
+use navi_notifier_discord::{DiscordNotifier, DiscordNotifierConfig};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
+use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use navi_notifier_slack::{SlackNotifier, SlackNotifierConfig};
 
 use crate::config::{Config, SlackConfig};
@@ -15,18 +17,34 @@ use crate::config::{Config, SlackConfig};
 pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engine> {
     let mut sources: Vec<Arc<dyn Source>> = Vec::new();
     if config.github.enabled {
-        let token = config.github.resolve_token()?;
         let source = GitHubSource::new(GitHubSourceConfig {
-            token,
+            token: config.github.resolve_token()?,
             api_base: config.github.api_base.clone(),
         })
         .context("initializing GitHub source")?;
+        sources.push(Arc::new(source));
+    }
+    if config.gitlab.enabled {
+        let source = GitLabSource::new(GitLabSourceConfig {
+            token: config.gitlab.resolve_token()?,
+            api_base: config.gitlab.api_base.clone(),
+        })
+        .context("initializing GitLab source")?;
         sources.push(Arc::new(source));
     }
 
     let mut notifiers: Vec<Arc<dyn Notifier>> = Vec::new();
     if config.slack.enabled {
         notifiers.push(Arc::new(build_slack(&config.slack)?));
+    }
+    if config.discord.enabled {
+        let notifier = DiscordNotifier::new(DiscordNotifierConfig {
+            token: config.discord.resolve_token(),
+            dm_to: config.discord.dm_to.clone(),
+            api_base: None,
+        })
+        .context("initializing Discord notifier")?;
+        notifiers.push(Arc::new(notifier));
     }
 
     anyhow::ensure!(!sources.is_empty(), "no sources enabled in config");

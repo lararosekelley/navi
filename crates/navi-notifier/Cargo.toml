@@ -41,7 +41,9 @@ e2e = []
 [dependencies]
 navi-notifier-core.workspace = true
 navi-notifier-github.workspace = true
+navi-notifier-gitlab.workspace = true
 navi-notifier-slack.workspace = true
+navi-notifier-discord.workspace = true
 
 tokio.workspace = true
 async-trait.workspace = true

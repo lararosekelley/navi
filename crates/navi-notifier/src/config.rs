@@ -17,7 +17,9 @@ use serde::{Deserialize, Serialize};
 pub struct Config {
     pub general: General,
     pub github: GitHubConfig,
+    pub gitlab: GitLabConfig,
     pub slack: SlackConfig,
+    pub discord: DiscordConfig,
     pub rules: RuleConfig,
     /// Source→notifier wiring. Empty means "every source to every notifier".
     pub routes: Vec<RouteConfig>,
@@ -72,6 +74,28 @@ impl Default for GitHubConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GitLabConfig {
+    /// Whether the GitLab source is active. Off by default; opt in.
+    pub enabled: bool,
+    pub token_env: String,
+    pub token: Option<String>,
+    /// API base, e.g. `https://gitlab.example.com/api/v4` for self-hosted.
+    pub api_base: Option<String>,
+}
+
+impl Default for GitLabConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_env: "NAVI_GITLAB_TOKEN".into(),
+            token: None,
+            api_base: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SlackConfig {
     pub enabled: bool,
     /// Name of the environment variable holding the Slack bot token (`xoxb-…`).
@@ -94,6 +118,29 @@ impl Default for SlackConfig {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DiscordConfig {
+    /// Whether the Discord notifier is active. Off by default; opt in.
+    pub enabled: bool,
+    /// Bot token env var (needed only for user-DM mode, not webhook mode).
+    pub token_env: String,
+    pub token: Option<String>,
+    /// A webhook URL (`https://discord.com/api/webhooks/...`) or a user id to DM.
+    pub dm_to: String,
+}
+
+impl Default for DiscordConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_env: "NAVI_DISCORD_TOKEN".into(),
+            token: None,
+            dm_to: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RouteConfig {
     pub source: String,
     pub notifier: String,
@@ -106,9 +153,27 @@ impl GitHubConfig {
     }
 }
 
+impl GitLabConfig {
+    pub fn resolve_token(&self) -> Result<String> {
+        resolve_secret("gitlab", self.token.as_deref(), &self.token_env)
+    }
+}
+
 impl SlackConfig {
     pub fn resolve_token(&self) -> Result<String> {
         resolve_secret("slack", self.token.as_deref(), &self.token_env)
+    }
+}
+
+impl DiscordConfig {
+    /// Optional token from the inline value or env var. `None` in webhook mode.
+    pub fn resolve_token(&self) -> Option<String> {
+        if let Some(t) = self.token.as_deref().filter(|t| !t.is_empty()) {
+            return Some(t.to_string());
+        }
+        std::env::var(&self.token_env)
+            .ok()
+            .filter(|v| !v.is_empty())
     }
 }
 

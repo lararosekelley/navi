@@ -259,12 +259,27 @@ enabled = true
 token_env = "NAVI_GITHUB_TOKEN"
 # For GitHub Enterprise Server, set api_base = "https://ghe.example.com/api/v3"
 
+[gitlab]
+# Off by default. Enable to get review-request and mention alerts from GitLab.
+enabled = false
+# Env var holding a GitLab PAT with `read_api` scope.
+token_env = "NAVI_GITLAB_TOKEN"
+# For self-hosted, set api_base = "https://gitlab.example.com/api/v4"
+
 [slack]
 enabled = true
 # Env var holding a Slack bot token (xoxb-...). Needs chat:write + im:write.
 token_env = "NAVI_SLACK_TOKEN"
 # "self" DMs whoever the token authenticates as; or set a Slack user id like "U0123".
 dm_to = "self"
+
+[discord]
+# Off by default. dm_to is either a webhook URL (simplest, no token) or a user id.
+enabled = false
+# Env var holding a bot token (needed only for user-DM mode, not webhooks).
+token_env = "NAVI_DISCORD_TOKEN"
+# dm_to = "https://discord.com/api/webhooks/..."   # webhook, or a user id like "123456789012345678"
+dm_to = ""
 
 [rules.events]
 # Toggle individual alert kinds. Everything below defaults on except ready_for_review.
@@ -297,6 +312,9 @@ reviewer = true
 # [rules]
 # mute_authors = ["dependabot[bot]"]
 
+# Routes wire sources to notifiers. Omit this section entirely to send every
+# source to every enabled notifier. List routes to be explicit, e.g. github+gitlab
+# to slack, or github to discord:
 [[routes]]
 source = "github"
 notifier = "slack"
