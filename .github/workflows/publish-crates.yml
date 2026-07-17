@@ -33,7 +33,16 @@ jobs:
       - name: Publish crates
         run: |
           set -euo pipefail
-          for crate in navi-notifier-core navi-notifier-github navi-notifier-slack navi-notifier; do
+          for crate in \
+            navi-notifier-core \
+            navi-notifier-forge \
+            navi-notifier-github \
+            navi-notifier-gitlab \
+            navi-notifier-gitea \
+            navi-notifier-slack \
+            navi-notifier-discord \
+            navi-notifier-email \
+            navi-notifier; do
             echo "::group::publishing $crate"
             cargo publish --no-verify -p "$crate"
             echo "::endgroup::"
