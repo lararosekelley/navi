@@ -149,8 +149,9 @@ The service is generated from your actual binary and config paths and runs on lo
 - **Windows:** a Task Scheduler logon task named `Navi`, run hidden (no console window).
 
 A background service does not inherit your shell environment, so tokens reach it separately. On Linux and macOS,
-`install` writes a `navi.env` file next to your config (chmod 600) that the service sources; put your tokens there and
-restart it. On Windows, the task inherits user-scope variables, so set them once with `setx NAVI_GITHUB_TOKEN ...`.
+`install` writes a `navi.env` file next to your config (chmod 600); put your tokens there. navi loads `navi.env`
+automatically at startup (foreground or service), and an already-set shell variable still wins over the file. On
+Windows, the task inherits user-scope variables, so set them once with `setx NAVI_GITHUB_TOKEN ...`.
 
 The hand-written templates in [`deploy/`](deploy) remain for reference or manual setup.
 
