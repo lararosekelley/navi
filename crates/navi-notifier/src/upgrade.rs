@@ -37,20 +37,23 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
     Some(base.join("navi"))
 }
 
-pub fn upgrade(head: bool, _force: bool, yes: bool) -> Result<()> {
+pub fn upgrade(head: bool, _force: bool, no_restart: bool) -> Result<()> {
     if head {
-        return upgrade_to_head(yes);
+        // --head cargo-installs to ~/.cargo/bin, a different path than the service
+        // runs, so a restart wouldn't pick it up; leave the service alone.
+        return upgrade_to_head();
     }
     println!("upgrading navi to the latest release");
     run_installer(None)?;
     println!("upgraded (re-open your shell if the version looks stale)");
+    crate::service::restart_after_upgrade(!no_restart)?;
     Ok(())
 }
 
-fn upgrade_to_head(yes: bool) -> Result<()> {
+fn upgrade_to_head() -> Result<()> {
     println!("--head builds and installs the latest unreleased commit from {REPO_URL}");
     println!("HEAD is a pre-release snapshot: it may be broken or untested");
-    if !yes && !confirm("continue? [y/N] ")? {
+    if !confirm("continue? [y/N] ")? {
         println!("upgrade cancelled");
         return Ok(());
     }
@@ -68,7 +71,7 @@ fn upgrade_to_head(yes: bool) -> Result<()> {
 /// Step back to an earlier release. Riskier than upgrading (an older binary may
 /// not understand state a newer one wrote), so it confirms first and never goes
 /// below [`MIN_DOWNGRADE_VERSION`].
-pub fn downgrade(to: Option<String>, yes: bool) -> Result<()> {
+pub fn downgrade(to: Option<String>, yes: bool, no_restart: bool) -> Result<()> {
     let installed = env!("CARGO_PKG_VERSION");
     let installed_version = parse_version(installed)
         .with_context(|| format!("could not parse the installed version {installed}"))?;
@@ -102,6 +105,7 @@ pub fn downgrade(to: Option<String>, yes: bool) -> Result<()> {
     }
     run_installer(Some(&target))?;
     println!("downgraded to {target}; to move forward again, run: navi upgrade");
+    crate::service::restart_after_upgrade(!no_restart)?;
     Ok(())
 }
 

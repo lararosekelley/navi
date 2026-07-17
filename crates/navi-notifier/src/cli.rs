@@ -86,6 +86,9 @@ pub enum Command {
         /// Build and install the latest unreleased commit (needs a Rust toolchain).
         #[arg(long)]
         head: bool,
+        /// Don't restart the background service afterwards. (--head never restarts.)
+        #[arg(long, conflicts_with = "head")]
+        no_restart: bool,
     },
 
     /// Step back to an earlier release.
@@ -96,6 +99,9 @@ pub enum Command {
         /// Skip the confirmation prompt.
         #[arg(long, short = 'y')]
         yes: bool,
+        /// Don't restart the background service afterwards.
+        #[arg(long)]
+        no_restart: bool,
     },
 }
 

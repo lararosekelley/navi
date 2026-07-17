@@ -66,8 +66,16 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             ServiceAction::Status => service::status(),
         },
         Command::Uninstall { dry_run, yes } => setup::uninstall(dry_run, yes),
-        Command::Upgrade { force, head } => upgrade::upgrade(head, force, false),
-        Command::Downgrade { to, yes } => upgrade::downgrade(to, yes),
+        Command::Upgrade {
+            force,
+            head,
+            no_restart,
+        } => upgrade::upgrade(head, force, no_restart),
+        Command::Downgrade {
+            to,
+            yes,
+            no_restart,
+        } => upgrade::downgrade(to, yes, no_restart),
     }
 }
 

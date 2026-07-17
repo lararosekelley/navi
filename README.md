@@ -168,8 +168,10 @@ navi uninstall             # reverse setup + the installer (completions, man pag
 ```
 
 `upgrade`/`downgrade` re-run the release installer, so they apply to copies installed via the shell/PowerShell
-installer or Homebrew; a `cargo install` copy should update through cargo. A once-a-day check prints a one-line nudge
-when a newer release exists (silence it with `NAVI_NO_UPDATE_CHECK=1`).
+installer or Homebrew; a `cargo install` copy should update through cargo. They also restart the background service
+onto the new binary (pass `--no-restart` to skip), since a running daemon otherwise stays on the old build until it's
+restarted. A once-a-day check prints a one-line nudge when a newer release exists (silence it with
+`NAVI_NO_UPDATE_CHECK=1`).
 
 ## Configuration
 
