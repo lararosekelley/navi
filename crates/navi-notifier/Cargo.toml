@@ -56,6 +56,8 @@ navi-notifier-email.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 clap.workspace = true
+clap_complete = { version = "4", features = ["unstable-dynamic"] }
+clap_mangen = "0.2"
 directories.workspace = true
 serde.workspace = true
 toml.workspace = true

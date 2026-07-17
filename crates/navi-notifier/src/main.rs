@@ -1,15 +1,19 @@
 //! `navi`: focused, configurable PR-review alerts from GitHub to Slack.
 
 mod cli;
+mod completions;
 mod config;
+mod prompt;
+mod setup;
 mod state;
+mod upgrade;
 mod wiring;
 
 use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use navi_notifier_core::model::{
     Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
@@ -24,6 +28,12 @@ use crate::state::SqliteStore;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Dynamic completion: when a shell's completer invokes us with COMPLETE=<shell>,
+    // print candidates and exit instead of running a command.
+    clap_complete::env::CompleteEnv::with_factory(Cli::command)
+        .var(completions::COMPLETE_VAR)
+        .complete();
+
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config.clone())?;
 
@@ -32,6 +42,11 @@ async fn main() -> Result<()> {
         Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
         Command::Run => cmd_run(&config_path).await,
         Command::TestSlack => cmd_test_slack(&config_path).await,
+        Command::Completions { shell } => completions::print(shell),
+        Command::Setup { yes, refresh } => setup::setup(yes, refresh),
+        Command::Uninstall { dry_run, yes } => setup::uninstall(dry_run, yes),
+        Command::Upgrade { force, head } => upgrade::upgrade(head, force, false),
+        Command::Downgrade { to, yes } => upgrade::downgrade(to, yes),
     }
 }
 
@@ -88,6 +103,7 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
         interval_secs = interval.as_secs(),
         "navi daemon started; polling for review activity"
     );
+    upgrade::maybe_hint_update();
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
