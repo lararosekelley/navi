@@ -34,9 +34,15 @@ name = "navi-e2e"
 path = "src/bin/navi-e2e.rs"
 required-features = ["e2e"]
 
+# Hermetic Gitea -> Mailpit e2e (Dockerized, no external accounts).
+[[bin]]
+name = "navi-e2e-gitea"
+path = "src/bin/navi-e2e-gitea.rs"
+required-features = ["e2e"]
+
 [features]
-# Live end-to-end harness that talks to real GitHub + Slack (see src/bin/navi-e2e.rs).
-e2e = []
+# End-to-end harnesses. Pulls the HTTP helpers they need to drive the providers.
+e2e = ["dep:reqwest", "dep:base64"]
 
 [dependencies]
 navi-notifier-core.workspace = true
@@ -59,6 +65,10 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 time.workspace = true
+
+# e2e-only HTTP helpers for driving providers / asserting delivery.
+reqwest = { workspace = true, optional = true }
+base64 = { version = "0.22", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
