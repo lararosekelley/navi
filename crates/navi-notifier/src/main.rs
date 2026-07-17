@@ -266,6 +266,12 @@ enabled = false
 token_env = "NAVI_GITLAB_TOKEN"
 # For self-hosted, set api_base = "https://gitlab.example.com/api/v4"
 
+[gitea]
+# Off by default. Works with Gitea and Forgejo.
+enabled = false
+token_env = "NAVI_GITEA_TOKEN"
+# For your instance, set api_base = "https://gitea.example.com/api/v1"
+
 [slack]
 enabled = true
 # Env var holding a Slack bot token (xoxb-...). Needs chat:write + im:write.

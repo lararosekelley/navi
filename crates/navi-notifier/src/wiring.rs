@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use navi_notifier_core::traits::{Notifier, Source, StateStore};
 use navi_notifier_core::{Engine, RuleEngine};
 use navi_notifier_discord::{DiscordNotifier, DiscordNotifierConfig};
+use navi_notifier_gitea::{GiteaSource, GiteaSourceConfig};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use navi_notifier_slack::{SlackNotifier, SlackNotifierConfig};
@@ -30,6 +31,14 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
             api_base: config.gitlab.api_base.clone(),
         })
         .context("initializing GitLab source")?;
+        sources.push(Arc::new(source));
+    }
+    if config.gitea.enabled {
+        let source = GiteaSource::new(GiteaSourceConfig {
+            token: config.gitea.resolve_token()?,
+            api_base: config.gitea.api_base.clone(),
+        })
+        .context("initializing Gitea source")?;
         sources.push(Arc::new(source));
     }
 

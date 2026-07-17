@@ -18,6 +18,7 @@ pub struct Config {
     pub general: General,
     pub github: GitHubConfig,
     pub gitlab: GitLabConfig,
+    pub gitea: GiteaConfig,
     pub slack: SlackConfig,
     pub discord: DiscordConfig,
     pub rules: RuleConfig,
@@ -96,6 +97,28 @@ impl Default for GitLabConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
+pub struct GiteaConfig {
+    /// Whether the Gitea/Forgejo source is active. Off by default; opt in.
+    pub enabled: bool,
+    pub token_env: String,
+    pub token: Option<String>,
+    /// API base, e.g. `https://gitea.example.com/api/v1` (Gitea or Forgejo).
+    pub api_base: Option<String>,
+}
+
+impl Default for GiteaConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            token_env: "NAVI_GITEA_TOKEN".into(),
+            token: None,
+            api_base: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SlackConfig {
     pub enabled: bool,
     /// Name of the environment variable holding the Slack bot token (`xoxb-…`).
@@ -156,6 +179,12 @@ impl GitHubConfig {
 impl GitLabConfig {
     pub fn resolve_token(&self) -> Result<String> {
         resolve_secret("gitlab", self.token.as_deref(), &self.token_env)
+    }
+}
+
+impl GiteaConfig {
+    pub fn resolve_token(&self) -> Result<String> {
+        resolve_secret("gitea", self.token.as_deref(), &self.token_env)
     }
 }
 
