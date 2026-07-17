@@ -8,7 +8,7 @@ use clap::{Parser, Subcommand};
 #[command(
     name = "navi",
     version,
-    about = "Focused, configurable PR-review alerts",
+    about = "A friendly helper to guide you through the day-to-day noise of code review",
     long_about = "navi watches your review activity across GitHub, GitLab, and \
                   Gitea and sends you a tight, high-signal stream to Slack, Discord, \
                   or email (review requests, replies to your comments, re-review \
