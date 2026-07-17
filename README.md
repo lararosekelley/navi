@@ -137,6 +137,20 @@ suppressed, without sending anything or advancing state.
 - **Linux (systemd):** see [`deploy/navi.service`](deploy/navi.service).
 - **macOS (launchd):** see [`deploy/dev.navi.navi.plist`](deploy/dev.navi.navi.plist).
 
+### Shell completions and upgrades
+
+```sh
+navi setup                 # install the man page + wire completions into your shell rc (idempotent)
+navi completions zsh       # or print the script yourself for bash/zsh/fish/powershell
+navi upgrade               # update an installer-managed copy to the latest release
+navi downgrade --to 0.1.4  # step back to an earlier release (or bare `downgrade` for the previous one)
+navi uninstall             # reverse setup + the installer (completions, man page, config); reports how to remove the binary
+```
+
+`upgrade`/`downgrade` re-run the release installer, so they apply to copies installed via the shell/PowerShell
+installer or Homebrew; a `cargo install` copy should update through cargo. A once-a-day check prints a one-line nudge
+when a newer release exists (silence it with `NAVI_NO_UPDATE_CHECK=1`).
+
 ## Configuration
 
 `navi init` documents every field inline. Highlights:
