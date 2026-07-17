@@ -36,6 +36,9 @@ use crate::notification::Notification;
 const SOURCE_ID: &str = "github";
 /// Safety cap on pagination per endpoint so a pathological PR can't stall a poll.
 const MAX_PAGES: u8 = 10;
+/// Notifications page deeper than per-PR sub-resources: a single poll after a long
+/// gap (or the very first, before a `since` cursor exists) can span many pages.
+const NOTIF_MAX_PAGES: u8 = 30;
 /// Overlap window when advancing the `since` cursor, to tolerate clock skew.
 const SINCE_OVERLAP: Duration = Duration::minutes(5);
 
@@ -119,7 +122,7 @@ impl GitHubSource {
         }
 
         let mut out = Vec::new();
-        for page in 1..=MAX_PAGES {
+        for page in 1..=NOTIF_MAX_PAGES {
             let params = Params {
                 all: true,
                 per_page: 100,
@@ -131,10 +134,20 @@ impl GitHubSource {
                 .get("/notifications", Some(&params))
                 .await
                 .map_err(map_err)?;
-            let n = batch.len();
+            let full = batch.len() == 100;
             out.extend(batch);
-            if n < 100 {
-                break;
+            if !full {
+                return Ok(out);
+            }
+            // Last page still full at the cap: more remain that we won't fetch
+            // this pass. Surface it rather than dropping silently.
+            if page == NOTIF_MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap_pages = NOTIF_MAX_PAGES,
+                    "notifications truncated at the page cap; some may be missed this poll \
+                     (a shorter poll interval keeps each batch smaller)"
+                );
             }
         }
         Ok(out)
@@ -163,10 +176,15 @@ impl GitHubSource {
                 )
                 .await
                 .map_err(map_err)?;
-            let n = batch.len();
+            let full = batch.len() == 100;
             out.extend(batch);
-            if n < 100 {
-                break;
+            if !full {
+                return Ok(out);
+            }
+            // Last page still full at the cap: a PR with a huge review/comment
+            // history is truncated. Rare, but surface it rather than drop silently.
+            if page == MAX_PAGES {
+                warn!(%path, fetched = out.len(), "list truncated at the page cap");
             }
         }
         Ok(out)
