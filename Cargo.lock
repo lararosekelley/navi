@@ -956,6 +956,7 @@ dependencies = [
  "directories",
  "navi-notifier-core",
  "navi-notifier-discord",
+ "navi-notifier-gitea",
  "navi-notifier-github",
  "navi-notifier-gitlab",
  "navi-notifier-slack",
@@ -999,12 +1000,38 @@ dependencies = [
 ]
 
 [[package]]
+name = "navi-notifier-forge"
+version = "0.1.1"
+dependencies = [
+ "navi-notifier-core",
+ "serde",
+ "time",
+]
+
+[[package]]
+name = "navi-notifier-gitea"
+version = "0.1.1"
+dependencies = [
+ "async-trait",
+ "navi-notifier-core",
+ "navi-notifier-forge",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "time",
+ "tokio",
+ "tracing",
+ "wiremock",
+]
+
+[[package]]
 name = "navi-notifier-github"
 version = "0.1.1"
 dependencies = [
  "anyhow",
  "async-trait",
  "navi-notifier-core",
+ "navi-notifier-forge",
  "octocrab",
  "serde",
  "serde_json",
