@@ -61,6 +61,10 @@ pub struct GitHubConfig {
     pub token: Option<String>,
     /// API base, override for GitHub Enterprise Server.
     pub api_base: Option<String>,
+    /// Also poll your involved open PRs directly (via search), not just the
+    /// notifications inbox. Catches reviews on your own PRs and activity in muted
+    /// repos, which GitHub often doesn't surface as notifications.
+    pub track_prs: bool,
 }
 
 impl Default for GitHubConfig {
@@ -69,6 +73,7 @@ impl Default for GitHubConfig {
             enabled: true,
             token_env: "NAVI_GITHUB_TOKEN".into(),
             token: None,
+            track_prs: true,
             api_base: None,
         }
     }

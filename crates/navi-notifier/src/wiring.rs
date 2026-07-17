@@ -23,6 +23,7 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
         let source = GitHubSource::new(GitHubSourceConfig {
             token: config.github.resolve_token()?,
             api_base: config.github.api_base.clone(),
+            track_prs: config.github.track_prs,
         })
         .context("initializing GitHub source")?;
         sources.push(Arc::new(source));

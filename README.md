@@ -41,8 +41,10 @@ Redact any tokens before pasting output.
 `navi` normalizes activity from each **source** into one common set of events, filters them by your rules, and routes
 them to your **destinations**. For GitHub and Gitea it polls the notifications API as a trigger, then **diffs** each
 PR's reviews and comments against a stored snapshot to derive precise events, so it can tell "reply to _my_ comment"
-from "a dismissal" from "a re-review"; for GitLab it reads the Todos feed. State lives in a local SQLite database, so
-delivery is idempotent (you're never pinged twice) and it never touches your read/unread state on the source.
+from "a dismissal" from "a re-review"; for GitLab it reads the Todos feed. GitHub additionally polls your involved open
+PRs directly (`track_prs`, on by default), so reviews on your own PRs and activity in muted repos still reach you even
+when GitHub doesn't create a notification. State lives in a local SQLite database, so delivery is idempotent (you're
+never pinged twice) and it never touches your read/unread state on the source.
 
 ```text
 source activity → normalized events → filter (rules) → route → destination
