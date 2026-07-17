@@ -13,6 +13,7 @@ module.exports = {
         "gitea",
         "slack",
         "discord",
+        "email",
         "source",
         "destination",
         "notifier",
