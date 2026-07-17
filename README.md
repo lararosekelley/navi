@@ -142,6 +142,7 @@ suppressed, without sending anything or advancing state.
 navi service install     # generate + enable a login service for your OS
 navi service status      # is it installed and running?
 navi service uninstall   # stop and remove it
+navi logs -f             # tail the service's logs (journald on Linux, a log file on macOS/Windows)
 ```
 
 The service is generated from your actual binary and config paths and runs on login:
