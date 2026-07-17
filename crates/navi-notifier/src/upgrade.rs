@@ -17,9 +17,11 @@ use crate::prompt::confirm;
 /// Source repo for release discovery and the installer artifacts.
 const REPO: &str = "lararosekelley/navi";
 const REPO_URL: &str = "https://github.com/lararosekelley/navi";
-/// The first release that shipped `downgrade`, and the floor it can reach.
-/// MUST equal the version this command first ships in.
-const MIN_DOWNGRADE_VERSION: &str = "0.1.4";
+/// The first release that shipped `downgrade`, and the floor it can reach: going
+/// below would strand the user on a binary with no `downgrade`. v0.1.4 shipped
+/// without these commands, so the first release with them is 0.1.5. Bump this if
+/// they first land in a different version.
+const MIN_DOWNGRADE_VERSION: &str = "0.1.5";
 
 /// Stamp next to the receipt; one release check per day. Opt out with
 /// `NAVI_NO_UPDATE_CHECK=1`.
