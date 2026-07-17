@@ -62,6 +62,12 @@ pub enum Command {
         refresh: bool,
     },
 
+    /// Install, remove, or check the background service (systemd/launchd/Task Scheduler).
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Reverse `setup` and the installer: completions, man page, config/receipt.
     Uninstall {
         /// Show what would be removed without removing anything.
@@ -91,4 +97,24 @@ pub enum Command {
         #[arg(long, short = 'y')]
         yes: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Generate and enable a service that runs `navi run` on login.
+    Install {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Stop and remove the background service.
+    Uninstall {
+        /// Skip the confirmation prompt.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
+    /// Show whether the background service is installed and running.
+    Status,
 }

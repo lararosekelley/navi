@@ -75,8 +75,8 @@ The shell command runs [`install.sh`](install.sh), a wrapper around the
 [cargo-dist](https://github.com/axodotdev/cargo-dist)-generated `navi-notifier-installer.sh`; PowerShell fetches the
 matching `.ps1`. Both pull prebuilt binaries from
 [GitHub Releases](https://github.com/lararosekelley/navi/releases), so they need a published release (see
-[Releasing](#releasing)). Linux builds are static musl and run on any distro. `navi` runs on Linux, macOS, and Windows;
-the background-service units in [`deploy/`](deploy) are Linux (systemd) and macOS (launchd) only.
+[Releasing](#releasing)). Linux builds are static musl and run on any distro. `navi` runs on Linux, macOS, and Windows,
+and `navi service install` can register a background service on all three (systemd, launchd, Task Scheduler).
 
 ## Setup
 
@@ -134,8 +134,25 @@ suppressed, without sending anything or advancing state.
 
 ### As a background service
 
-- **Linux (systemd):** see [`deploy/navi.service`](deploy/navi.service).
-- **macOS (launchd):** see [`deploy/dev.navi.navi.plist`](deploy/dev.navi.navi.plist).
+`navi init` offers to set this up for you; you can also do it any time:
+
+```sh
+navi service install     # generate + enable a login service for your OS
+navi service status      # is it installed and running?
+navi service uninstall   # stop and remove it
+```
+
+The service is generated from your actual binary and config paths and runs on login:
+
+- **Linux:** a systemd user unit at `~/.config/systemd/user/navi.service`.
+- **macOS:** a launchd agent at `~/Library/LaunchAgents/dev.navi.navi.plist`.
+- **Windows:** a Task Scheduler logon task named `Navi`, run hidden (no console window).
+
+A background service does not inherit your shell environment, so tokens reach it separately. On Linux and macOS,
+`install` writes a `navi.env` file next to your config (chmod 600) that the service sources; put your tokens there and
+restart it. On Windows, the task inherits user-scope variables, so set them once with `setx NAVI_GITHUB_TOKEN ...`.
+
+The hand-written templates in [`deploy/`](deploy) remain for reference or manual setup.
 
 ### Shell completions and upgrades
 

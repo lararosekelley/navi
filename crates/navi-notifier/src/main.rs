@@ -6,6 +6,7 @@ mod cli;
 mod completions;
 mod config;
 mod prompt;
+mod service;
 mod setup;
 mod state;
 mod upgrade;
@@ -24,7 +25,7 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, ServiceAction};
 use crate::config::{resolve_config_path, resolve_state_path, Config};
 use crate::state::SqliteStore;
 
@@ -46,6 +47,11 @@ async fn main() -> Result<()> {
         Command::TestSlack => cmd_test_slack(&config_path).await,
         Command::Completions { shell } => completions::print(shell),
         Command::Setup { yes, refresh } => setup::setup(yes, refresh),
+        Command::Service { action } => match action {
+            ServiceAction::Install { yes } => service::install(&config_path, yes),
+            ServiceAction::Uninstall { yes } => service::uninstall(yes),
+            ServiceAction::Status => service::status(),
+        },
         Command::Uninstall { dry_run, yes } => setup::uninstall(dry_run, yes),
         Command::Upgrade { force, head } => upgrade::upgrade(head, force, false),
         Command::Downgrade { to, yes } => upgrade::downgrade(to, yes),
@@ -249,7 +255,11 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     std::fs::write(path, starter_config())
         .with_context(|| format!("writing config to {}", path.display()))?;
     println!("Wrote starter config to {}", path.display());
-    println!("Next: set NAVI_GITHUB_TOKEN and NAVI_SLACK_TOKEN, then run `navi test-slack`.");
+    println!(
+        "Next: set your source and destination tokens (e.g. NAVI_GITHUB_TOKEN, NAVI_SLACK_TOKEN)."
+    );
+    println!("Then verify with `navi test-slack`, or run once with `navi once --dry-run`.");
+    service::offer_after_init(path)?;
     Ok(())
 }
 
