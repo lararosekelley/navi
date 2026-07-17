@@ -6,8 +6,7 @@ use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct GiteaUser {
-    /// Gitea uses `username`; `login` is the alias other forges use.
-    #[serde(alias = "username")]
+    /// Gitea user objects always carry `login` (and a duplicate `username`).
     pub login: String,
     #[serde(default)]
     pub avatar_url: Option<String>,
