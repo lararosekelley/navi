@@ -15,6 +15,21 @@ use time::OffsetDateTime;
 use crate::model::{PrData, ReviewComment, User};
 use crate::snapshot::PrSnapshot;
 
+/// On first sight of a PR, how far back before the triggering notification's
+/// update time still counts as "what just happened" - tolerates a burst of
+/// activity and small clock differences between a review and its notification.
+pub const FIRST_SIGHT_LEEWAY: time::Duration = time::Duration::minutes(10);
+
+/// The first-sight watermark for a notification: activity from its `updated_at`
+/// (RFC3339) back through [`FIRST_SIGHT_LEEWAY`] counts as "what just happened".
+/// `None` when the timestamp is missing or unparseable, which falls back to
+/// surfacing only outstanding review asks.
+pub fn first_sight_watermark(updated_at: Option<&str>) -> Option<OffsetDateTime> {
+    updated_at
+        .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+        .map(|t| t - FIRST_SIGHT_LEEWAY)
+}
+
 /// Ambient inputs for a diff that don't come from the PR payload.
 pub struct DiffContext {
     pub source_id: String,
@@ -23,11 +38,18 @@ pub struct DiffContext {
     pub repo: Repo,
     /// Fallback timestamp when the provider omits one.
     pub now: OffsetDateTime,
+    /// On a PR's first sighting, activity at/after this instant is surfaced (it is
+    /// what the triggering notification points at); older history is not
+    /// back-filled. `None` surfaces only outstanding review asks and suppresses
+    /// everything else on first sight (reviews, comments, mentions) - the old
+    /// behaviour, for sources that can't supply a watermark.
+    pub first_sight_since: Option<OffsetDateTime>,
 }
 
 /// Diff `data` against `old`, returning the events to deliver and the snapshot to
-/// persist. The first time a PR is seen (`!old.initialized`), only currently
-/// outstanding review requests are surfaced; history is not back-filled.
+/// persist. The first time a PR is seen (`!old.initialized`), outstanding review
+/// requests plus activity at/after `ctx.first_sight_since` are surfaced; older
+/// history is not back-filled.
 pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, PrSnapshot) {
     let pr = &data.pull_request;
     let viewer = &ctx.viewer_login;
@@ -94,21 +116,6 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
             &author_login
         })
     };
-
-    // First sighting: surface the current review ask, never historical activity.
-    if !old.initialized {
-        if viewer_requested_now && !is_author {
-            emit(
-                EventKind::ReviewRequested,
-                author_actor(),
-                parse_ts(pr.updated_at.as_deref(), ctx.now),
-                Some(pr.html_url.clone()),
-                None,
-                format!("review_requested:{}", ts_key(pr.updated_at.as_deref())),
-            );
-        }
-        return (events, new_snapshot);
-    }
 
     // Review request / re-review request (edge-detected).
     if viewer_requested_now && !old.viewer_requested && !is_author {
@@ -288,6 +295,25 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
             None,
             format!("ready:{}", ts_key(pr.updated_at.as_deref())),
         );
+    }
+
+    // First sighting: `old` was empty, so every check above fired as if brand new.
+    // Keep the currently-outstanding review ask (so a fresh start still shows what
+    // is waiting on you), but otherwise surface only what happened at/after the
+    // watermark - the triggering notification's moment - instead of back-filling
+    // the PR's entire history.
+    if !old.initialized {
+        events.retain(|e| {
+            // ReReviewRequested is unreachable on first sight (it needs a prior
+            // review in `old`); kept here so the "review ask always survives" rule
+            // reads completely.
+            matches!(
+                e.kind,
+                EventKind::ReviewRequested | EventKind::ReReviewRequested
+            ) || ctx
+                .first_sight_since
+                .is_some_and(|since| e.occurred_at >= since)
+        });
     }
 
     (events, new_snapshot)

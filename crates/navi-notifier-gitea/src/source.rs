@@ -7,7 +7,7 @@ use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::SourceError;
 use navi_notifier_forge::model::PrData;
-use navi_notifier_forge::{diff, DiffContext, PrSnapshot};
+use navi_notifier_forge::{diff, first_sight_watermark, DiffContext, PrSnapshot};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
@@ -196,6 +196,7 @@ impl Source for GiteaSource {
                     url: n.repository.html_url.clone(),
                 },
                 now: poll_start,
+                first_sight_since: first_sight_watermark(n.updated_at.as_deref()),
             };
             let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
 
