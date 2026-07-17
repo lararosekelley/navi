@@ -1,0 +1,23 @@
+[package]
+name = "navi-notifier-discord"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "Discord notifier for navi: embed DMs via a bot token, or a channel webhook."
+
+[dependencies]
+navi-notifier-core.workspace = true
+async-trait.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio = { workspace = true }
+time.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = "0.6"
