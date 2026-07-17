@@ -23,6 +23,7 @@ fn ctx() -> DiffContext {
         viewer_login: VIEWER.into(),
         repo: Repo::new("acme", "widgets"),
         now: OffsetDateTime::UNIX_EPOCH,
+        first_sight_since: None,
     }
 }
 
@@ -71,6 +72,13 @@ fn review(id: u64, login: &str, state: &str) -> Review {
     }
 }
 
+fn review_at(id: u64, login: &str, state: &str, at: &str) -> Review {
+    Review {
+        submitted_at: Some(at.into()),
+        ..review(id, login, state)
+    }
+}
+
 fn rcomment(id: u64, login: &str, body: &str, in_reply_to: Option<u64>) -> ReviewComment {
     ReviewComment {
         id,
@@ -89,6 +97,13 @@ fn icomment(id: u64, login: &str, body: &str) -> IssueComment {
         body: body.into(),
         html_url: Some(format!("https://gh.test/ic/{id}")),
         created_at: Some("2024-01-02T03:04:05Z".into()),
+    }
+}
+
+fn icomment_at(id: u64, login: &str, body: &str, at: &str) -> IssueComment {
+    IssueComment {
+        created_at: Some(at.into()),
+        ..icomment(id, login, body)
     }
 }
 
@@ -111,13 +126,65 @@ fn first_sighting_does_not_backfill_history() {
     let mut d = data(base_pr());
     d.reviews = vec![review(1, "someoneelse", "APPROVED")];
     d.issue_comments = vec![icomment(9, "someoneelse", "hey @me look")];
-    // Fresh (uninitialized) snapshot: no review request outstanding → zero events.
+    // Fresh (uninitialized) snapshot, no watermark: nothing outstanding → zero events.
     let (events, snap) = diff(&ctx(), &d, &PrSnapshot::default());
     assert!(events.is_empty(), "unexpected: {:?}", kinds(&events));
     assert!(snap.initialized);
     // The history is recorded so it won't fire on the next poll either.
     assert!(snap.seen_reviews.contains_key(&1));
     assert!(snap.seen_issue_comments.contains(&9));
+}
+
+#[test]
+fn first_sighting_surfaces_the_triggering_review() {
+    // The #34 case: you authored the PR (so GitHub never notified you when you
+    // opened it), a review just landed, and this is the first time navi sees the
+    // PR. The review that triggered the notification must be surfaced; an older
+    // review on the same PR must not be back-filled.
+    let mut pr = base_pr();
+    pr.user = Some(user(VIEWER));
+    let mut d = data(pr);
+    d.reviews = vec![
+        review_at(1, "reviewer", "APPROVED", "2024-01-01T00:00:00Z"),
+        review_at(2, "reviewer", "CHANGES_REQUESTED", "2024-01-02T03:04:05Z"),
+    ];
+    let cx = DiffContext {
+        // Watermark from the triggering notification's update time.
+        first_sight_since: first_sight_watermark(Some("2024-01-02T03:04:05Z")),
+        ..ctx()
+    };
+    let (events, snap) = diff(&cx, &d, &PrSnapshot::default());
+    assert_eq!(
+        kinds(&events),
+        vec![&EventKind::ReviewSubmitted {
+            state: ReviewState::ChangesRequested
+        }]
+    );
+    assert!(snap.initialized);
+}
+
+#[test]
+fn first_sighting_surfaces_a_recent_comment_not_old_ones() {
+    // First sight triggered by a reply on a PR you authored: the recent comment
+    // must surface; an older one on the same PR must not be back-filled.
+    let mut pr = base_pr();
+    pr.user = Some(user(VIEWER));
+    let mut d = data(pr);
+    d.issue_comments = vec![
+        icomment_at(1, "someoneelse", "old note", "2024-01-01T00:00:00Z"),
+        icomment_at(2, "someoneelse", "just replied", "2024-01-02T03:04:05Z"),
+    ];
+    let cx = DiffContext {
+        first_sight_since: first_sight_watermark(Some("2024-01-02T03:04:05Z")),
+        ..ctx()
+    };
+    let (events, _) = diff(&cx, &d, &PrSnapshot::default());
+    assert_eq!(
+        kinds(&events),
+        vec![&EventKind::CommentReply {
+            on_your_comment: false
+        }]
+    );
 }
 
 #[test]
