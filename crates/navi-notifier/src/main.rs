@@ -299,6 +299,10 @@ enabled = true
 # Env var holding a GitHub PAT with `notifications` + `repo` (read) scope.
 token_env = "NAVI_GITHUB_TOKEN"
 # For GitHub Enterprise Server, set api_base = "https://ghe.example.com/api/v3"
+# Also poll your involved open PRs directly, not just the notifications inbox, so
+# reviews on your PRs and activity in muted repos still reach you. Set false to
+# rely on notifications only.
+track_prs = true
 
 [gitlab]
 # Off by default. Enable to get review-request and mention alerts from GitLab.
