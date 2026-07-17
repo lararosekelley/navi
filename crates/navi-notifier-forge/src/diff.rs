@@ -44,6 +44,21 @@ pub struct DiffContext {
     /// everything else on first sight (reviews, comments, mentions) - the old
     /// behaviour, for sources that can't supply a watermark.
     pub first_sight_since: Option<OffsetDateTime>,
+    /// The viewer's team memberships as `"org/slug"` keys (lowercased), so a review
+    /// requested from a team you're in counts as a request to you. Empty for
+    /// providers without team review requests.
+    pub viewer_teams: HashSet<String>,
+}
+
+/// Key a team by its org and slug so a "reviewers" team in one org never matches
+/// the same-named team in another. Shared with the sources so both sides of the
+/// match (the PR's request and your memberships) key teams identically.
+pub fn team_key(owner: &str, slug: &str) -> String {
+    format!(
+        "{}/{}",
+        owner.to_ascii_lowercase(),
+        slug.to_ascii_lowercase()
+    )
 }
 
 /// Diff `data` against `old`, returning the events to deliver and the snapshot to
@@ -63,7 +78,11 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     let viewer_requested_now = pr
         .requested_reviewers
         .iter()
-        .any(|u| eq_login(&u.login, viewer));
+        .any(|u| eq_login(&u.login, viewer))
+        || pr.requested_teams.iter().any(|t| {
+            ctx.viewer_teams
+                .contains(&team_key(&ctx.repo.owner, &t.slug))
+        });
     let viewer_reviewed_now = old.viewer_reviewed
         || data.reviews.iter().any(|r| {
             r.user.as_ref().is_some_and(|u| eq_login(&u.login, viewer)) && r.state != "PENDING"
@@ -87,7 +106,7 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         is_reviewer,
     };
 
-    let new_snapshot = build_snapshot(data, viewer, old);
+    let new_snapshot = build_snapshot(data, viewer, viewer_requested_now, old);
 
     let mut events = Vec::new();
     let mut emit = |kind: EventKind,
@@ -319,8 +338,14 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     (events, new_snapshot)
 }
 
-/// Compute the snapshot to persist after this poll.
-fn build_snapshot(data: &PrData, viewer: &str, old: &PrSnapshot) -> PrSnapshot {
+/// Compute the snapshot to persist after this poll. `viewer_requested_now` is
+/// threaded in (rather than recomputed) so it accounts for team requests too.
+fn build_snapshot(
+    data: &PrData,
+    viewer: &str,
+    viewer_requested_now: bool,
+    old: &PrSnapshot,
+) -> PrSnapshot {
     let pr = &data.pull_request;
     PrSnapshot {
         seen_reviews: data
@@ -330,10 +355,7 @@ fn build_snapshot(data: &PrData, viewer: &str, old: &PrSnapshot) -> PrSnapshot {
             .collect(),
         seen_review_comments: data.review_comments.iter().map(|c| c.id).collect(),
         seen_issue_comments: data.issue_comments.iter().map(|c| c.id).collect(),
-        viewer_requested: pr
-            .requested_reviewers
-            .iter()
-            .any(|u| eq_login(&u.login, viewer)),
+        viewer_requested: viewer_requested_now,
         viewer_reviewed: old.viewer_reviewed
             || data.reviews.iter().any(|r| {
                 r.user.as_ref().is_some_and(|u| eq_login(&u.login, viewer)) && r.state != "PENDING"

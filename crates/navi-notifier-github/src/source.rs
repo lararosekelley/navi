@@ -2,18 +2,32 @@
 //! and diffs into normalized events. All GitHub-specific I/O lives here; the
 //! decision logic lives in the pure `navi-notifier-forge` diff engine.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::SourceError;
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
-use navi_notifier_forge::{diff, first_sight_watermark, DiffContext, PrSnapshot};
+use navi_notifier_forge::{diff, first_sight_watermark, team_key, DiffContext, PrSnapshot};
 use octocrab::Octocrab;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
+
+/// A team from `GET /user/teams`, reduced to what we need to match team requests.
+#[derive(Deserialize)]
+struct GithubTeam {
+    slug: String,
+    organization: GithubOrg,
+}
+
+#[derive(Deserialize)]
+struct GithubOrg {
+    login: String,
+}
 
 use crate::notification::Notification;
 
@@ -56,6 +70,24 @@ impl GitHubSource {
             octo,
             viewer: OnceCell::new(),
         })
+    }
+
+    /// The viewer's team memberships as `"org/slug"` keys, for matching team review
+    /// requests. Fetched every poll (not cached like the login) so joining or
+    /// leaving a team is picked up without a restart; it's one cheap request.
+    /// Best effort: if the token can't list teams (needs `read:org`), team requests
+    /// just won't be detected.
+    async fn viewer_team_keys(&self) -> HashSet<String> {
+        match self.get_all::<GithubTeam>("/user/teams").await {
+            Ok(teams) => teams
+                .into_iter()
+                .map(|t| team_key(&t.organization.login, &t.slug))
+                .collect(),
+            Err(e) => {
+                warn!(error = %e, "could not list your teams; team review requests won't be detected");
+                HashSet::new()
+            }
+        }
     }
 
     /// The authenticated user's login, fetched once and cached.
@@ -167,6 +199,7 @@ impl Source for GitHubSource {
 
     async fn poll(&self, state: &dyn StateStore) -> Result<Vec<Event>, SourceError> {
         let viewer = self.viewer_login().await?.to_string();
+        let viewer_teams = self.viewer_team_keys().await;
         let poll_start = OffsetDateTime::now_utc();
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
 
@@ -220,6 +253,7 @@ impl Source for GitHubSource {
                 },
                 now: poll_start,
                 first_sight_since: first_sight_watermark(n.updated_at.as_deref()),
+                viewer_teams: viewer_teams.clone(),
             };
             let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
 

@@ -101,6 +101,8 @@ impl GiteaPull {
                 .into_iter()
                 .map(GiteaUser::into_forge)
                 .collect(),
+            // Gitea team review requests aren't modelled yet.
+            requested_teams: Vec::new(),
         }
     }
 }

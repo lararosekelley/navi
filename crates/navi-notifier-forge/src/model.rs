@@ -48,6 +48,17 @@ pub struct PullRequest {
     pub merged_by: Option<User>,
     #[serde(default)]
     pub requested_reviewers: Vec<User>,
+    /// Teams whose review is requested. Used to detect a request routed to a team
+    /// you belong to (GitHub); empty for providers without team requests.
+    #[serde(default)]
+    pub requested_teams: Vec<Team>,
+}
+
+/// A team on a forge (GitHub). Only the slug is needed to match a request against
+/// your team memberships.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Team {
+    pub slug: String,
 }
 
 /// A submitted review.
