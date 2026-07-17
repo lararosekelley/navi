@@ -30,7 +30,9 @@ publish-jobs = ["homebrew", "./publish-crates"]
 # Whether to install an updater program
 install-updater = false
 # Custom message to display on successful install
-install-success-msg = "navi installed! Run `navi init` to create your config, then `navi test-slack`."
+# No backticks: the installer prints this via a shell, so `...` would be
+# command-substituted (actually run) at install time.
+install-success-msg = "navi installed! Run 'navi init' to create your config, then 'navi test-slack'."
 
 # The single user-facing binary shipped in the artifacts.
 [dist.binaries]
