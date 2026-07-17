@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 128 128" width="128" height="128" role="img" aria-labelledby="t">
+  <title id="t">navi</title>
+  <defs>
+    <!-- soft outer halo -->
+    <radialGradient id="halo" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#cc6699" stop-opacity="0.55"/>
+      <stop offset="45%" stop-color="#cc6699" stop-opacity="0.22"/>
+      <stop offset="100%" stop-color="#cc6699" stop-opacity="0"/>
+    </radialGradient>
+    <!-- luminous orb core -->
+    <radialGradient id="core" cx="42%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#fff2f8"/>
+      <stop offset="35%" stop-color="#f0aecb"/>
+      <stop offset="75%" stop-color="#cc6699"/>
+      <stop offset="100%" stop-color="#b34d7f"/>
+    </radialGradient>
+    <!-- translucent wing -->
+    <linearGradient id="wing" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f0aecb" stop-opacity="0.15"/>
+      <stop offset="100%" stop-color="#cc6699" stop-opacity="0.6"/>
+    </linearGradient>
+  </defs>
+
+  <!-- glow -->
+  <circle cx="64" cy="64" r="60" fill="url(#halo)"/>
+
+  <!-- four wings on the diagonals -->
+  <g fill="url(#wing)" stroke="#cc6699" stroke-width="1.5" stroke-opacity="0.5">
+    <path d="M0 0 C-15 -15 -11 -40 0 -44 C11 -40 15 -15 0 0 Z" transform="translate(64,64) rotate(45)"/>
+    <path d="M0 0 C-15 -15 -11 -40 0 -44 C11 -40 15 -15 0 0 Z" transform="translate(64,64) rotate(135)"/>
+    <path d="M0 0 C-15 -15 -11 -40 0 -44 C11 -40 15 -15 0 0 Z" transform="translate(64,64) rotate(225)"/>
+    <path d="M0 0 C-15 -15 -11 -40 0 -44 C11 -40 15 -15 0 0 Z" transform="translate(64,64) rotate(315)"/>
+  </g>
+
+  <!-- glowing orb -->
+  <circle cx="64" cy="64" r="16" fill="url(#core)"/>
+  <circle cx="58" cy="58" r="4.5" fill="#fff6fb" fill-opacity="0.85"/>
+</svg>

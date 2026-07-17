@@ -1,3 +1,6 @@
+<img src="https://raw.githubusercontent.com/lararosekelley/navi/main/assets/logo.svg"
+     width="48" height="48" alt="navi logo" />
+
 # navi
 
 [![crates.io](https://img.shields.io/crates/v/navi-notifier?color=cc6699)](https://crates.io/crates/navi-notifier)
@@ -8,7 +11,7 @@
 ---
 
 `navi` is a free, open-source, and locally-run service for keeping you up-to-date with code review requests. It supports
-GitHub and GitLab as sources and Slack and Discord as notifiers, with planned support for Gitea/Forgejo and email.
+GitHub, GitLab, and Gitea/Forgejo as sources and Slack and Discord as notifiers, with planned support for email.
 
 It will notify you when:
 
@@ -145,8 +148,10 @@ A Cargo workspace with a provider-agnostic core and thin provider crates:
 | Crate                  | Role                                                                                                                                                   |
 | ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------ |
 | `navi-notifier-core`   | Normalized event model, the `Source`/`Notifier`/`StateStore` traits, the rule/filter layer, and the poll→filter→deliver engine. No provider specifics. |
+| `navi-notifier-forge`  | Shared diff engine + model for GitHub-shaped forges (used by the github and gitea sources).                                                            |
 | `navi-notifier-github` | `Source`: notifications polling + PR-timeline diffing.                                                                                                 |
 | `navi-notifier-gitlab` | `Source`: review-request and mention alerts from the Todos API.                                                                                        |
+| `navi-notifier-gitea`  | `Source`: Gitea/Forgejo, reusing the forge diff engine.                                                                                                |
 | `navi-notifier-slack`  | `Notifier`: Block Kit DMs via a bot token.                                                                                                             |
 | `navi-notifier-discord`| `Notifier`: embed DMs via a bot token, or a channel webhook.                                                                                           |
 | `navi-notifier`        | The binary (`navi`): config, SQLite state store, provider registry, daemon loop, CLI.                                                                  |
