@@ -6,6 +6,7 @@ mod cli;
 mod completions;
 mod config;
 mod envfile;
+mod logs;
 mod prompt;
 mod service;
 mod setup;
@@ -45,6 +46,13 @@ fn main() -> Result<()> {
     // to call once the runtime's worker threads are up). Only fills unset vars.
     envfile::load_beside_config(&config_path);
 
+    // `logs` (especially --follow) is a long-running synchronous tail; run it
+    // without spinning up the async runtime, which it neither needs nor should
+    // block a thread of.
+    if let Command::Logs { follow, lines } = &cli.command {
+        return logs::show(*follow, *lines);
+    }
+
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -58,6 +66,7 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
         Command::Run => cmd_run(&config_path).await,
         Command::TestSlack => cmd_test_slack(&config_path).await,
+        Command::Logs { .. } => unreachable!("logs is handled before the runtime in main"),
         Command::Completions { shell } => completions::print(shell),
         Command::Setup { yes, refresh } => setup::setup(yes, refresh),
         Command::Service { action } => match action {

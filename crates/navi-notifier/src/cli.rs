@@ -46,6 +46,16 @@ pub enum Command {
     /// Send a sample Block Kit message to verify Slack credentials and DM target.
     TestSlack,
 
+    /// Tail the background service's logs (journald / launchd / Task Scheduler).
+    Logs {
+        /// Follow the log, streaming new lines as they arrive.
+        #[arg(long, short = 'f')]
+        follow: bool,
+        /// Number of past lines to show.
+        #[arg(long, short = 'n', default_value_t = 50)]
+        lines: usize,
+    },
+
     /// Print a shell completion script (bash, zsh, fish, powershell, elvish).
     Completions {
         /// The shell to generate completions for.
