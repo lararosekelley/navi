@@ -197,6 +197,8 @@ impl Source for GiteaSource {
                 },
                 now: poll_start,
                 first_sight_since: first_sight_watermark(n.updated_at.as_deref()),
+                // Gitea team review requests aren't modelled yet.
+                viewer_teams: std::collections::HashSet::new(),
             };
             let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
 

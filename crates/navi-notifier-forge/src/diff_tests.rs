@@ -3,7 +3,7 @@
 // first sight, and idempotence once the snapshot is persisted.
 
 use super::*;
-use crate::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
+use crate::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, Team, User};
 use navi_notifier_core::model::{EventKind, ReviewState};
 
 const VIEWER: &str = "me";
@@ -24,6 +24,7 @@ fn ctx() -> DiffContext {
         repo: Repo::new("acme", "widgets"),
         now: OffsetDateTime::UNIX_EPOCH,
         first_sight_since: None,
+        viewer_teams: std::collections::HashSet::new(),
     }
 }
 
@@ -42,6 +43,7 @@ fn base_pr() -> PullRequest {
         user: Some(user(AUTHOR)),
         merged_by: None,
         requested_reviewers: vec![],
+        requested_teams: vec![],
     }
 }
 
@@ -109,6 +111,53 @@ fn icomment_at(id: u64, login: &str, body: &str, at: &str) -> IssueComment {
 
 fn kinds(events: &[Event]) -> Vec<&EventKind> {
     events.iter().map(|e| &e.kind).collect()
+}
+
+#[test]
+fn review_requested_via_team_membership() {
+    // #21: the request is routed to a team you belong to, not to you directly.
+    let mut pr = base_pr();
+    pr.requested_teams = vec![Team {
+        slug: "reviewers".into(),
+    }];
+    let cx = DiffContext {
+        viewer_teams: std::collections::HashSet::from(["acme/reviewers".to_string()]),
+        ..ctx()
+    };
+    let (events, snap) = diff(&cx, &data(pr), &initialized());
+    assert_eq!(kinds(&events), vec![&EventKind::ReviewRequested]);
+    assert!(snap.viewer_requested, "team request must persist so it won't re-fire");
+}
+
+#[test]
+fn team_request_ignored_when_not_a_member() {
+    let mut pr = base_pr();
+    pr.requested_teams = vec![Team {
+        slug: "reviewers".into(),
+    }];
+    // Default ctx has no team memberships.
+    let (events, _) = diff(&ctx(), &data(pr), &initialized());
+    assert!(events.is_empty(), "unexpected: {:?}", kinds(&events));
+}
+
+#[test]
+fn team_request_isolated_by_org() {
+    // The repo is acme/widgets. Membership in a same-named team of a *different*
+    // org must not match this org's request.
+    let mut pr = base_pr();
+    pr.requested_teams = vec![Team {
+        slug: "reviewers".into(),
+    }];
+    let cx = DiffContext {
+        viewer_teams: std::collections::HashSet::from(["contoso/reviewers".to_string()]),
+        ..ctx()
+    };
+    let (events, _) = diff(&cx, &data(pr), &initialized());
+    assert!(
+        events.is_empty(),
+        "cross-org team must not match: {:?}",
+        kinds(&events)
+    );
 }
 
 #[test]
