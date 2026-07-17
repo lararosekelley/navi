@@ -20,6 +20,9 @@ use crate::prompt::confirm;
 /// launchd label and Task Scheduler task name; also used to locate them again.
 const LAUNCHD_LABEL: &str = "dev.navi.navi";
 const WINDOWS_TASK_NAME: &str = "Navi";
+/// Where the logon task appends navi's output. PowerShell env-expands this in the
+/// task action; the `%VAR%` form is what we print to the user.
+const WINDOWS_LOG_DISPLAY: &str = r"%LOCALAPPDATA%\navi\navi.log";
 
 /// Install and start the background service for the current OS.
 pub fn install(config_path: &Path, yes: bool) -> Result<()> {
@@ -302,7 +305,8 @@ fn install_task(exe: &str, config: &Path, yes: bool) -> Result<()> {
     run(Command::new("schtasks").args(schtasks_create_args(exe, config)))?;
 
     println!("registered the '{WINDOWS_TASK_NAME}' task; navi will start at your next sign-in");
-    println!("navi runs hidden (no console window). start it now with:");
+    println!("navi runs hidden (no console window); output goes to {WINDOWS_LOG_DISPLAY}");
+    println!("start it now with:");
     println!("  schtasks /Run /TN {WINDOWS_TASK_NAME}");
     println!("the task inherits your user environment, so set tokens persistently:");
     println!("  setx NAVI_GITHUB_TOKEN ghp_...");
@@ -341,10 +345,12 @@ fn status_task() -> Result<()> {
 }
 
 /// Arguments to `schtasks` that register the logon task. The action runs navi
-/// through a hidden-window PowerShell so no console appears at sign-in.
+/// through a hidden-window PowerShell so no console appears at sign-in, and
+/// redirects all output to a per-user log file (creating its directory first),
+/// since a hidden task otherwise has nowhere to log.
 fn schtasks_create_args(exe: &str, config: &Path) -> Vec<String> {
     let action = format!(
-        "powershell -WindowStyle Hidden -NoProfile -Command \"& '{exe}' run --config '{config}'\"",
+        "powershell -WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; & '{exe}' run --config '{config}' *>> $log\"",
         exe = exe,
         config = config.display(),
     );
@@ -507,6 +513,12 @@ mod tests {
         let action = args.last().unwrap();
         assert!(action.contains("WindowStyle Hidden"));
         assert!(action.contains("C:\\navi.exe"));
+        assert!(action.contains("*>>"), "output must be redirected to a log");
+        assert!(action.contains("navi.log"));
+        assert!(
+            action.contains("$env:LOCALAPPDATA"),
+            "log must live under LOCALAPPDATA"
+        );
     }
 
     #[test]
