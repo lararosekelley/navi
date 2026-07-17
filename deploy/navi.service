@@ -8,14 +8,16 @@
 #   systemctl --user enable --now navi.service
 #   journalctl --user -u navi -f      # follow logs
 #
-# ~/.config/navi/navi.env should contain (chmod 600):
-#   NAVI_GITHUB_TOKEN=ghp_xxx
-#   NAVI_SLACK_TOKEN=xoxb-xxx
+# ~/.config/navi/navi.env should contain (chmod 600) the tokens for the sources
+# and destinations you enabled in config.toml, e.g.:
+#   NAVI_GITHUB_TOKEN=ghp_xxx     # github source (on by default)
+#   NAVI_SLACK_TOKEN=xoxb-xxx     # slack destination (on by default)
+#   # plus NAVI_GITLAB_TOKEN / NAVI_GITEA_TOKEN / NAVI_DISCORD_TOKEN / NAVI_EMAIL_PASSWORD as needed
 #
 # To keep navi running when you're logged out:  loginctl enable-linger $USER
 
 [Unit]
-Description=navi: focused PR-review alerts to Slack
+Description=navi: focused PR-review alerts
 After=network-online.target
 Wants=network-online.target
 

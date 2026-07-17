@@ -1,4 +1,6 @@
-//! `navi`: focused, configurable PR-review alerts from GitHub to Slack.
+//! `navi`: focused, configurable PR-review alerts. Sources (GitHub, GitLab,
+//! Gitea) and destinations (Slack, Discord, email) are provider crates wired
+//! together here through the registry in `wiring`.
 
 mod cli;
 mod completions;

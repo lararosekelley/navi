@@ -66,7 +66,7 @@ pub trait Source: Send + Sync {
     }
 }
 
-/// A delivery target for events (Slack today; Discord, email, … later).
+/// A delivery target for events (Slack, Discord, email, ...).
 #[async_trait]
 pub trait Destination: Send + Sync {
     /// Stable identifier, e.g. `"slack"`.

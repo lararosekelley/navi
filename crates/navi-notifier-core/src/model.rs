@@ -1,6 +1,6 @@
 //! Provider-agnostic domain model.
 //!
-//! Every source (GitHub today; GitLab, etc. later) normalizes its native payloads
+//! Every source (GitHub, GitLab, Gitea, ...) normalizes its native payloads
 //! into these types so that the engine, rule layer, and destinations never need to
 //! know which provider an event came from.
 
