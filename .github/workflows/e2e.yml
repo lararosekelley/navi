@@ -1,17 +1,27 @@
-# Live end-to-end smoke test against the real GitHub + Slack APIs.
+# End-to-end tests, in one workflow with two jobs:
 #
-# navi keys off *your* GitHub notifications, so there's no ephemeral-repo
-# lifecycle to drive (that would need a second account acting on you). Instead
-# this proves the two things the mock tests structurally can't: that real
-# credentials authenticate and that today's live payload shapes still parse:
-# one real notifications poll, and one real Slack DM. See src/bin/navi-e2e.rs.
+#   gitea-mailpit  Hermetic: Dockerized Gitea + Mailpit, no secrets. Proves a real
+#                  navi loop (Gitea source -> email destination) end to end.
+#   live           Live: real GitHub + Slack credentials. Proves the two things the
+#                  mock tests structurally can't - that real creds authenticate and
+#                  that today's live payload shapes still parse (one notifications
+#                  poll + one Slack DM). See src/bin/navi-e2e.rs.
 #
-# Triggers:
-#   - workflow_dispatch: run by hand.
-#   - workflow_call: invoked by the dist-generated release.yml as a plan-job, so
-#     a failing live run blocks the release before anything is built or published.
+# Triggers and gating:
+#   - push to main:      runs the hermetic job (live would be a real DM per merge).
+#   - workflow_dispatch: runs both, on demand.
+#   - workflow_call:     invoked by the dist-generated release.yml as a plan-job
+#                        (`custom-e2e`, secrets: inherit), so a failing run blocks
+#                        the release before anything is built or published.
 #
-# Secrets (add under repo Settings → Secrets and variables → Actions):
+# Per-job `if` keeps each job's cadence tight:
+#   - hermetic skips the release-tag path (it already ran on the push to main).
+#   - live runs only on manual dispatch and the release gate (never on push/PR:
+#     a DM per merge is noise, and fork PRs can't see secrets).
+# PRs still exercise the hermetic job because release.yml also triggers on
+# pull_request and calls this workflow via `custom-e2e`.
+#
+# Live secrets (Settings -> Secrets and variables -> Actions):
 #   NAVI_GITHUB_TOKEN   GitHub PAT (notifications + repo read)
 #   NAVI_SLACK_TOKEN    Slack bot token (chat:write + im:write)
 # Optional repo variable:
@@ -19,6 +29,9 @@
 name: E2E
 
 on:
+  push:
+    branches:
+      - main
   workflow_dispatch:
   workflow_call:
     inputs:
@@ -29,11 +42,63 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: e2e-${{ github.head_ref || github.ref }}
+  cancel-in-progress: true
+
 jobs:
-  e2e:
-    # Never run on the pull_request event the dist release.yml also triggers on
-    # (fork PRs can't see secrets); this is a release gate + manual dispatch only.
-    if: github.event_name != 'pull_request'
+  gitea-mailpit:
+    # Hermetic and secret-free, so it runs everywhere except the release tag path.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Start Mailpit and Gitea
+        run: |
+          docker run -d --name navi-mailpit -p 1025:1025 -p 8025:8025 axllent/mailpit:latest
+          docker run -d --name navi-gitea -p 3000:3000 \
+            -e GITEA__security__INSTALL_LOCK=true \
+            -e GITEA__server__ROOT_URL=http://localhost:3000/ \
+            gitea/gitea:1.22
+          for i in $(seq 1 90); do
+            curl -fsS http://localhost:3000/api/v1/version >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      - name: Seed a Gitea admin token
+        run: |
+          docker exec -u git navi-gitea gitea admin user create \
+            --username navi-admin --password 'navi-admin-pass-1' \
+            --email admin@navi.local --admin --must-change-password=false
+          token=$(curl -fsS -u navi-admin:navi-admin-pass-1 -X POST \
+            http://localhost:3000/api/v1/users/navi-admin/tokens \
+            -H 'Content-Type: application/json' \
+            -d '{"name":"admin","scopes":["write:admin","write:user"]}' | jq -r .sha1)
+          echo "GITEA_ADMIN_TOKEN=$token" >> "$GITHUB_ENV"
+
+      - name: Run the Gitea -> Mailpit e2e
+        env:
+          GITEA_URL: http://localhost:3000
+          MAILPIT_HTTP: http://localhost:8025
+          MAILPIT_SMTP_HOST: localhost
+          MAILPIT_SMTP_PORT: "1025"
+        run: cargo run --features e2e --bin navi-e2e-gitea
+
+      - name: Gitea logs on failure
+        if: failure()
+        run: docker logs navi-gitea | tail -50
+
+  live:
+    # Real credentials: manual dispatch and the release gate only.
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
