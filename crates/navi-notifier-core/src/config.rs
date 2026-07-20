@@ -59,8 +59,10 @@ impl EventToggles {
     }
 }
 
-/// Repository allow/deny filtering. Patterns are `owner/name` with an optional
-/// trailing `/*` wildcard on the name (e.g. `acme/*` matches all repos in `acme`).
+/// Repository allow/deny filtering. Patterns are `owner/name`, where either side
+/// may use `*`: a whole owner (`acme/*`), a name prefix (`acme/tmp-*` matches
+/// `acme/tmp-123`), or any owner (`*/tmp-*`). GitHub names can't contain `*`, so a
+/// `*` is always a wildcard.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct RepoFilter {
@@ -82,15 +84,22 @@ impl RepoFilter {
     }
 }
 
-/// Matches `owner/name` against a pattern that may end in `/*`.
+/// Matches an `owner/name` repo against a pattern. Each side is matched
+/// independently: `*` on the owner matches any owner; a name ending in `*` is a
+/// prefix match (`*` alone matches any name), otherwise both sides are exact. A
+/// pattern without a `/` can never match a repo.
 fn pattern_matches(pattern: &str, full_name: &str) -> bool {
-    if let Some(owner_prefix) = pattern.strip_suffix("/*") {
-        full_name
-            .split_once('/')
-            .is_some_and(|(owner, _)| owner == owner_prefix)
-    } else {
-        pattern == full_name
-    }
+    let (Some((owner_pat, name_pat)), Some((owner, name))) =
+        (pattern.split_once('/'), full_name.split_once('/'))
+    else {
+        return false;
+    };
+    let owner_ok = owner_pat == "*" || owner_pat == owner;
+    let name_ok = match name_pat.strip_suffix('*') {
+        Some(prefix) => name.starts_with(prefix),
+        None => name_pat == name,
+    };
+    owner_ok && name_ok
 }
 
 /// Quiet hours during which non-urgent events are suppressed. Times are `HH:MM` in
@@ -157,4 +166,52 @@ pub struct RuleConfig {
     pub mute: Vec<MuteRule>,
     pub quiet_hours: QuietHours,
     pub merge_close: MergeCloseScope,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repo_pattern_exact_and_whole_owner() {
+        assert!(pattern_matches("acme/widgets", "acme/widgets"));
+        assert!(!pattern_matches("acme/widgets", "acme/gadgets"));
+        // Whole-owner wildcard (backward-compatible with the old `owner/*`).
+        assert!(pattern_matches("acme/*", "acme/anything"));
+        assert!(!pattern_matches("acme/*", "other/anything"));
+    }
+
+    #[test]
+    fn repo_pattern_name_prefix() {
+        // The git-stk-e2e-* case: a name prefix under a specific owner.
+        assert!(pattern_matches("acme/tmp-*", "acme/tmp-123"));
+        assert!(pattern_matches("acme/tmp-*", "acme/tmp-")); // prefix boundary
+        assert!(!pattern_matches("acme/tmp-*", "acme/temp-1")); // must start with the prefix
+        assert!(!pattern_matches("acme/tmp-*", "other/tmp-1")); // owner still exact
+    }
+
+    #[test]
+    fn repo_pattern_any_owner() {
+        assert!(pattern_matches("*/tmp-*", "acme/tmp-1"));
+        assert!(pattern_matches("*/tmp-*", "other/tmp-9"));
+        assert!(!pattern_matches("*/tmp-*", "acme/prod-1"));
+        // Any owner, exact name.
+        assert!(pattern_matches("*/widgets", "acme/widgets"));
+        assert!(!pattern_matches("*/widgets", "acme/gadgets"));
+    }
+
+    #[test]
+    fn repo_pattern_without_slash_never_matches() {
+        assert!(!pattern_matches("acme", "acme/widgets"));
+    }
+
+    #[test]
+    fn repo_filter_deny_wins_and_prefix_denies() {
+        let filter = RepoFilter {
+            allow: Vec::new(),
+            deny: vec!["me/git-stk-e2e-*".into()],
+        };
+        assert!(!filter.permits("me/git-stk-e2e-abc123"));
+        assert!(filter.permits("me/real-project"));
+    }
 }
