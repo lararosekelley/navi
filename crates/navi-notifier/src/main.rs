@@ -385,8 +385,10 @@ closed = true
 ready_for_review = true
 
 [rules.repos]
-# Empty allow = all repos. Patterns: "owner/name" or "owner/*". deny wins over allow.
+# Empty allow = all repos. Patterns: "owner/name", "owner/*" (whole owner),
+# "owner/tmp-*" (name prefix), or "*/tmp-*" (any owner). deny wins over allow.
 allow = []
+# e.g. deny = ["me/git-stk-e2e-*"] to ignore ephemeral test repos.
 deny = []
 
 [rules.quiet_hours]
