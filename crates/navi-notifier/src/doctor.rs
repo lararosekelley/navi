@@ -72,6 +72,7 @@ async fn check_github(config: &Config) {
         token,
         api_base: config.github.api_base.clone(),
         track_prs: config.github.track_prs,
+        mark_read: false,
     }) {
         Ok(s) => s,
         Err(e) => {

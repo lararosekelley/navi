@@ -58,6 +58,17 @@ fn source_with(server: &MockServer, track_prs: bool) -> GitHubSource {
         token: "test-token".into(),
         api_base: Some(server.uri()),
         track_prs,
+        mark_read: false,
+    })
+    .expect("build source")
+}
+
+fn source_marks_read(server: &MockServer) -> GitHubSource {
+    GitHubSource::new(GitHubSourceConfig {
+        token: "test-token".into(),
+        api_base: Some(server.uri()),
+        track_prs: false,
+        mark_read: true,
     })
     .expect("build source")
 }
@@ -164,6 +175,38 @@ async fn poll_ignores_non_pull_request_notifications() {
     let source = source_for(&server);
     let events = source.poll(&MemState::default()).await.expect("poll");
     assert!(events.is_empty());
+}
+
+#[tokio::test]
+async fn mark_read_marks_the_thread_after_commit() {
+    let server = MockServer::start().await;
+    // A numeric thread id, since commit() marks the thread by parsed id.
+    let notif = json!([{
+        "id": "123456",
+        "reason": "review_requested",
+        "updated_at": "2024-01-02T03:04:05Z",
+        "subject": {
+            "title": "Add gizmo",
+            "url": format!("{}/repos/acme/widgets/pulls/1", server.uri()),
+            "type": "PullRequest"
+        },
+        "repository": { "name": "widgets", "owner": { "login": "acme" }, "html_url": "https://github.com/acme/widgets" }
+    }]);
+    mock_github(&server, notif, open_pr(json!([{ "login": "me" }]))).await;
+    Mock::given(method("PATCH"))
+        .and(path("/notifications/threads/123456"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let source = source_marks_read(&server);
+    let state = MemState::default();
+    let events = source.poll(&state).await.expect("poll");
+    assert_eq!(events.len(), 1);
+    // The engine calls commit() after delivery; here we call it directly.
+    source.commit(&state, &events[0]).await.expect("commit");
+    // wiremock verifies the PATCH fired (.expect(1)) when the server drops.
 }
 
 #[tokio::test]
