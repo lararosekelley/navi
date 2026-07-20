@@ -37,11 +37,30 @@ pub(crate) fn config_dir() -> Option<PathBuf> {
     Some(base.join("navi"))
 }
 
-pub fn upgrade(head: bool, _force: bool, no_restart: bool) -> Result<()> {
+pub fn upgrade(head: bool, force: bool, no_restart: bool) -> Result<()> {
     if head {
         // --head cargo-installs to ~/.cargo/bin, a different path than the service
         // runs, so a restart wouldn't pick it up; leave the service alone.
         return upgrade_to_head();
+    }
+    let installed = env!("CARGO_PKG_VERSION");
+    // Skip a redundant re-download when we're already current, unless --force.
+    // Best-effort: only the lookup runs the network, and if it (or version
+    // parsing) can't confirm we're current, we fall through and install as before.
+    let latest = if force {
+        None
+    } else {
+        remote_release_versions()
+            .ok()
+            .and_then(|v| v.into_iter().max())
+    };
+    if let Some(installed_version) = parse_version(installed) {
+        if !upgrade_needed(installed_version, latest, force) {
+            println!(
+                "navi {installed} is already the latest release; nothing to upgrade (use --force to reinstall)"
+            );
+            return Ok(());
+        }
     }
     println!("upgrading navi to the latest release");
     run_installer(None)?;
@@ -252,6 +271,13 @@ fn version_string((major, minor, patch): Version3) -> String {
     format!("{major}.{minor}.{patch}")
 }
 
+/// Whether `navi upgrade` should reinstall: always when forced, otherwise only
+/// when the installed version is behind the latest. `latest = None` (we couldn't
+/// determine it, e.g. offline) proceeds, keeping the version check best-effort.
+fn upgrade_needed(installed: Version3, latest: Option<Version3>, force: bool) -> bool {
+    force || latest.is_none_or(|latest| installed < latest)
+}
+
 /// Released versions, from the repo's `vX.Y.Z` tags.
 fn remote_release_versions() -> Result<Vec<Version3>> {
     let output = Command::new("git")
@@ -308,6 +334,20 @@ mod tests {
             resolve_target(installed, floor, None, &available).unwrap(),
             (0, 1, 5)
         );
+    }
+
+    #[test]
+    fn upgrade_needed_skips_only_when_confirmed_current() {
+        // Already on the latest → skip (the loop this fixes).
+        assert!(!upgrade_needed((0, 1, 9), Some((0, 1, 9)), false));
+        // Behind → upgrade.
+        assert!(upgrade_needed((0, 1, 8), Some((0, 1, 9)), false));
+        // Ahead of the latest release (e.g. a --head build) → don't reinstall.
+        assert!(!upgrade_needed((0, 2, 0), Some((0, 1, 9)), false));
+        // --force always reinstalls, even when current.
+        assert!(upgrade_needed((0, 1, 9), Some((0, 1, 9)), true));
+        // Couldn't determine the latest → proceed, best-effort.
+        assert!(upgrade_needed((0, 1, 9), None, false));
     }
 
     #[test]
