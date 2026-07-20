@@ -173,6 +173,13 @@ fn todo_to_event(todo: &Todo, viewer: &str, now: OffsetDateTime) -> Option<Event
         .or_else(|| target.web_url.clone())
         .unwrap_or_default();
 
+    let actor = todo
+        .author
+        .as_ref()
+        .map(|u| Actor::new(u.username.as_str()))
+        .unwrap_or_else(|| Actor::new("unknown"));
+    let actor_is_viewer = actor.login.eq_ignore_ascii_case(viewer);
+
     Some(Event {
         source_id: SOURCE_ID.to_string(),
         kind,
@@ -187,12 +194,9 @@ fn todo_to_event(todo: &Todo, viewer: &str, now: OffsetDateTime) -> Option<Event
         viewer: ViewerRelationship {
             is_author,
             is_reviewer: true,
+            actor_is_viewer,
         },
-        actor: todo
-            .author
-            .as_ref()
-            .map(|u| Actor::new(u.username.as_str()))
-            .unwrap_or_else(|| Actor::new("unknown")),
+        actor,
         occurred_at: occurred,
         target_url: Some(target.web_url.clone().unwrap_or_default()),
         excerpt: todo.body.clone().filter(|b| !b.is_empty()),

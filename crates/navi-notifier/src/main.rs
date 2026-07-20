@@ -268,6 +268,7 @@ fn sample_event() -> Event {
         viewer: ViewerRelationship {
             is_author: true,
             is_reviewer: false,
+            actor_is_viewer: false,
         },
         actor: Actor::new("navi"),
         occurred_at: OffsetDateTime::now_utc(),

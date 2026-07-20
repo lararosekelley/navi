@@ -134,7 +134,7 @@ fn build_message(from: &Mailbox, to: &Mailbox, event: &Event) -> Result<Message,
 
 /// A plain-text, one-line headline (no markup).
 fn headline(event: &Event) -> String {
-    let actor = event.actor.label();
+    let actor = event.actor_label();
     match &event.kind {
         EventKind::ReviewRequested => format!("{actor} requested your review"),
         EventKind::ReReviewRequested => format!("{actor} requested a re-review"),

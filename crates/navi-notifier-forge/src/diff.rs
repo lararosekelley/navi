@@ -104,6 +104,8 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     let viewer_rel = ViewerRelationship {
         is_author,
         is_reviewer,
+        // Set per-event in `emit`; this base value is always overridden.
+        actor_is_viewer: false,
     };
 
     let new_snapshot = build_snapshot(data, viewer, viewer_requested_now, old);
@@ -119,7 +121,10 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
             source_id: ctx.source_id.clone(),
             kind,
             pull_request: normalized_pr.clone(),
-            viewer: viewer_rel,
+            viewer: ViewerRelationship {
+                actor_is_viewer: eq_login(&actor.login, viewer),
+                ..viewer_rel
+            },
             actor,
             occurred_at: occurred,
             target_url: target.or_else(|| Some(normalized_pr.url.clone())),
