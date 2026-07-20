@@ -134,6 +134,8 @@ pub struct ViewerRelationship {
     pub is_author: bool,
     /// The viewer is (or was) a requested reviewer or has reviewed.
     pub is_reviewer: bool,
+    /// The actor of this event is the viewer themselves (self-action).
+    pub actor_is_viewer: bool,
 }
 
 /// A fully normalized event ready for filtering and delivery.
@@ -160,6 +162,16 @@ pub struct Event {
 }
 
 impl Event {
+    /// Display name for the actor, collapsing self-actions to "you" so a
+    /// notification about your own action doesn't read as a third party.
+    pub fn actor_label(&self) -> &str {
+        if self.viewer.actor_is_viewer {
+            "you"
+        } else {
+            self.actor.label()
+        }
+    }
+
     /// Convenience for building a dedup key from provider-stable parts.
     /// Callers should feed identifiers that never change for a given action
     /// (e.g. `github:owner/repo#12:review:456789`).

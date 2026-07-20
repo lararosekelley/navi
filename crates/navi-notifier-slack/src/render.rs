@@ -15,7 +15,7 @@ pub struct Rendered {
 pub fn render(event: &Event) -> Rendered {
     let pr = &event.pull_request;
     let repo_ref = format!("{}#{}", pr.repo.full_name(), pr.number);
-    let actor = event.actor.label();
+    let actor = event.actor_label();
     let headline = headline(event, actor);
 
     // Fallback text (also what shows in the notification/push).
@@ -131,6 +131,15 @@ mod tests {
         let s = serde_json::to_string(&r.blocks).unwrap();
         assert!(s.contains("Add &lt;gizmo&gt; &amp; sprocket"));
         assert!(!s.contains("Add <gizmo>"));
+    }
+
+    #[test]
+    fn self_action_reads_as_you() {
+        let mut e = event(EventKind::Merged);
+        e.viewer.actor_is_viewer = true;
+        let r = render(&e);
+        assert!(r.text.contains("you merged your PR"), "got {:?}", r.text);
+        assert!(!r.text.contains("reviewer merged"));
     }
 
     #[test]

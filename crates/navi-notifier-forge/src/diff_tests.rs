@@ -332,6 +332,26 @@ fn mention_beats_reply() {
 }
 
 #[test]
+fn actor_is_viewer_flags_self_actions() {
+    // Viewer merges their own PR: the event's actor is the viewer.
+    let mut pr = base_pr();
+    pr.merged = true;
+    pr.merged_at = Some("2024-01-03T00:00:00Z".into());
+    pr.merged_by = Some(user(VIEWER));
+    let (events, _) = diff(&ctx(), &data(pr), &initialized());
+    assert_eq!(kinds(&events), vec![&EventKind::Merged]);
+    assert!(events[0].viewer.actor_is_viewer);
+
+    // Someone else merges it: not a self-action.
+    let mut pr = base_pr();
+    pr.merged = true;
+    pr.merged_at = Some("2024-01-03T00:00:00Z".into());
+    pr.merged_by = Some(user("merger"));
+    let (events, _) = diff(&ctx(), &data(pr), &initialized());
+    assert!(!events[0].viewer.actor_is_viewer);
+}
+
+#[test]
 fn merged_closed_ready_transitions() {
     // Merged.
     let mut pr = base_pr();

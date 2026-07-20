@@ -12,7 +12,7 @@ pub struct Rendered {
 pub fn render(event: &Event) -> Rendered {
     let pr = &event.pull_request;
     let repo_ref = format!("{}#{}", pr.repo.full_name(), pr.number);
-    let actor = event.actor.label();
+    let actor = event.actor_label();
     let (headline, color) = headline(event, actor);
     let link = event.target_url.clone().unwrap_or_else(|| pr.url.clone());
 
