@@ -1061,6 +1061,7 @@ name = "navi-notifier-core"
 version = "0.1.8"
 dependencies = [
  "async-trait",
+ "regex",
  "serde",
  "serde_json",
  "thiserror 1.0.69",

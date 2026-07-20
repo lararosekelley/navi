@@ -125,6 +125,27 @@ impl Default for MergeCloseScope {
     }
 }
 
+/// Which field of an event a [`MuteRule`] matches against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MuteField {
+    Author,
+    Title,
+    Excerpt,
+}
+
+/// A pattern mute: suppress events whose `field` matches `pattern`. With
+/// `regex = false` it's a case-insensitive substring match; with `regex = true`
+/// it's a full regex (use `(?i)` for case-insensitivity there).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MuteRule {
+    #[serde(rename = "match")]
+    pub field: MuteField,
+    pub pattern: String,
+    #[serde(default)]
+    pub regex: bool,
+}
+
 /// The complete rule configuration consumed by the engine's filter stage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -133,6 +154,8 @@ pub struct RuleConfig {
     pub repos: RepoFilter,
     /// Logins whose actions never generate notifications (e.g. bots).
     pub mute_authors: BTreeSet<String>,
+    /// Pattern mutes for noisier filtering than exact logins.
+    pub mute: Vec<MuteRule>,
     pub quiet_hours: QuietHours,
     pub merge_close: MergeCloseScope,
 }

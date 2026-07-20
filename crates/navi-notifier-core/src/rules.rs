@@ -5,7 +5,7 @@
 //! identity-dependent is passed in via [`FilterContext`] rather than read from the
 //! environment, keeping this layer deterministic.
 
-use crate::config::RuleConfig;
+use crate::config::{MuteField, MuteRule, RuleConfig};
 use crate::model::{Event, EventKind};
 
 /// Ambient inputs the filter needs but that don't belong to the event itself.
@@ -23,6 +23,7 @@ pub enum DropReason {
     EventKindDisabled,
     RepoFiltered,
     AuthorMuted,
+    Muted,
     QuietHours,
     MergeCloseScope,
 }
@@ -34,15 +35,83 @@ pub enum Decision {
     Drop(DropReason),
 }
 
+/// A mute rule compiled once when the engine is built.
+#[derive(Debug, Clone)]
+struct CompiledMute {
+    field: MuteField,
+    matcher: Matcher,
+}
+
+#[derive(Debug, Clone)]
+enum Matcher {
+    /// Case-insensitive substring; the needle is stored lowercased.
+    Substring(String),
+    Regex(regex::Regex),
+}
+
+impl CompiledMute {
+    fn matches(&self, event: &Event) -> bool {
+        let hay = match self.field {
+            MuteField::Author => event.actor.login.as_str(),
+            MuteField::Title => event.pull_request.title.as_str(),
+            MuteField::Excerpt => event.excerpt.as_deref().unwrap_or(""),
+        };
+        match &self.matcher {
+            Matcher::Substring(needle) => hay.to_ascii_lowercase().contains(needle.as_str()),
+            Matcher::Regex(re) => re.is_match(hay),
+        }
+    }
+}
+
+/// A mute rule that didn't compile (bad regex). Surfaced at engine-build time so
+/// the user fixes their config instead of it silently never matching.
+#[derive(Debug)]
+pub struct InvalidMutePattern {
+    pub pattern: String,
+    pub source: regex::Error,
+}
+
+impl std::fmt::Display for InvalidMutePattern {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "invalid mute regex `{}`: {}", self.pattern, self.source)
+    }
+}
+
+impl std::error::Error for InvalidMutePattern {}
+
+fn compile_mute(rule: &MuteRule) -> Result<CompiledMute, InvalidMutePattern> {
+    let matcher = if rule.regex {
+        Matcher::Regex(
+            regex::Regex::new(&rule.pattern).map_err(|source| InvalidMutePattern {
+                pattern: rule.pattern.clone(),
+                source,
+            })?,
+        )
+    } else {
+        Matcher::Substring(rule.pattern.to_ascii_lowercase())
+    };
+    Ok(CompiledMute {
+        field: rule.field,
+        matcher,
+    })
+}
+
 /// Applies [`RuleConfig`] to events.
 #[derive(Debug, Clone)]
 pub struct RuleEngine {
     config: RuleConfig,
+    mutes: Vec<CompiledMute>,
 }
 
 impl RuleEngine {
-    pub fn new(config: RuleConfig) -> Self {
-        Self { config }
+    /// Build the engine, compiling any mute patterns once. Fails on a bad regex.
+    pub fn new(config: RuleConfig) -> Result<Self, InvalidMutePattern> {
+        let mutes = config
+            .mute
+            .iter()
+            .map(compile_mute)
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(Self { config, mutes })
     }
 
     pub fn config(&self) -> &RuleConfig {
@@ -57,6 +126,10 @@ impl RuleEngine {
 
         if self.config.mute_authors.contains(&event.actor.login) {
             return Decision::Drop(DropReason::AuthorMuted);
+        }
+
+        if self.mutes.iter().any(|m| m.matches(event)) {
+            return Decision::Drop(DropReason::Muted);
         }
 
         if !self
@@ -123,7 +196,9 @@ fn parse_hhmm(s: &str) -> Option<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{EventToggles, MergeCloseScope, QuietHours, RepoFilter};
+    use crate::config::{
+        EventToggles, MergeCloseScope, MuteField, MuteRule, QuietHours, RepoFilter,
+    };
     use crate::model::{Actor, PullRequest, Repo, ReviewState, ViewerRelationship};
     use time::OffsetDateTime;
 
@@ -152,7 +227,7 @@ mod tests {
     fn disabled_event_kind_is_dropped() {
         let mut cfg = RuleConfig::default();
         cfg.events.review_submitted = false;
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         let e = event(EventKind::ReviewSubmitted {
             state: ReviewState::Approved,
         });
@@ -166,11 +241,91 @@ mod tests {
     fn muted_author_is_dropped() {
         let mut cfg = RuleConfig::default();
         cfg.mute_authors.insert("reviewer1".into());
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         assert_eq!(
             engine.decide(&event(EventKind::Mentioned), &FilterContext::default()),
             Decision::Drop(DropReason::AuthorMuted)
         );
+    }
+
+    fn mute(field: MuteField, pattern: &str, regex: bool) -> RuleConfig {
+        RuleConfig {
+            mute: vec![MuteRule {
+                field,
+                pattern: pattern.into(),
+                regex,
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn mute_pattern_by_author_substring() {
+        let engine = RuleEngine::new(mute(MuteField::Author, "[bot]", false)).unwrap();
+        let mut bot = event(EventKind::Mentioned);
+        bot.actor = Actor::new("dependabot[bot]");
+        assert_eq!(
+            engine.decide(&bot, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+        // A human actor is unaffected.
+        assert_eq!(
+            engine.decide(&event(EventKind::Mentioned), &FilterContext::default()),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn mute_pattern_by_author_regex() {
+        let engine = RuleEngine::new(mute(MuteField::Author, r"(?i)\[bot\]$", true)).unwrap();
+        let mut bot = event(EventKind::Mentioned);
+        bot.actor = Actor::new("dependabot[bot]");
+        assert_eq!(
+            engine.decide(&bot, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+        // A login that merely contains "bot" mid-string doesn't match the anchor.
+        let mut human = event(EventKind::Mentioned);
+        human.actor = Actor::new("botanist");
+        assert_eq!(
+            engine.decide(&human, &FilterContext::default()),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn mute_pattern_by_title_regex() {
+        let engine = RuleEngine::new(mute(MuteField::Title, r"^Bump ", true)).unwrap();
+        let mut e = event(EventKind::ReviewRequested);
+        e.pull_request.title = "Bump serde to 1.2".into();
+        assert_eq!(
+            engine.decide(&e, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+        // "Add gizmo" doesn't match.
+        assert_eq!(
+            engine.decide(
+                &event(EventKind::ReviewRequested),
+                &FilterContext::default()
+            ),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn mute_pattern_by_excerpt() {
+        let engine = RuleEngine::new(mute(MuteField::Excerpt, "coverage", false)).unwrap();
+        let mut e = event(EventKind::Mentioned);
+        e.excerpt = Some("Coverage decreased by 0.1%".into());
+        assert_eq!(
+            engine.decide(&e, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+    }
+
+    #[test]
+    fn bad_mute_regex_is_a_config_error() {
+        assert!(RuleEngine::new(mute(MuteField::Title, "(unclosed", true)).is_err());
     }
 
     #[test]
@@ -182,7 +337,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         assert_eq!(
             engine.decide(&event(EventKind::Mentioned), &FilterContext::default()),
             Decision::Drop(DropReason::RepoFiltered)
@@ -198,7 +353,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         assert_eq!(
             engine.decide(&event(EventKind::Mentioned), &FilterContext::default()),
             Decision::Deliver
@@ -214,7 +369,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         // Viewer neither authored nor reviewed → dropped.
         assert_eq!(
             engine.decide(&event(EventKind::Merged), &FilterContext::default()),
@@ -224,7 +379,7 @@ mod tests {
 
     #[test]
     fn merge_delivered_when_author() {
-        let engine = RuleEngine::new(RuleConfig::default());
+        let engine = RuleEngine::new(RuleConfig::default()).unwrap();
         let mut e = event(EventKind::Merged);
         e.viewer.is_author = true;
         assert_eq!(
@@ -243,7 +398,7 @@ mod tests {
             },
             ..Default::default()
         };
-        let engine = RuleEngine::new(cfg);
+        let engine = RuleEngine::new(cfg).unwrap();
         let e = event(EventKind::Mentioned);
         // 23:00 is inside the quiet window.
         let ctx = FilterContext {
@@ -262,7 +417,7 @@ mod tests {
 
     #[test]
     fn default_toggles_allow_common_events() {
-        let engine = RuleEngine::new(RuleConfig::default());
+        let engine = RuleEngine::new(RuleConfig::default()).unwrap();
         assert!(EventToggles::default().review_requested);
         assert_eq!(
             engine.decide(
