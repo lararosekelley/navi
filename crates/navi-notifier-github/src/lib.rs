@@ -9,4 +9,4 @@
 mod notification;
 mod source;
 
-pub use source::{GitHubSource, GitHubSourceConfig};
+pub use source::{GitHubDoctor, GitHubSource, GitHubSourceConfig};
