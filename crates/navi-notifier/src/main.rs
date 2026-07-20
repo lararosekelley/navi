@@ -372,7 +372,7 @@ from = "navi <navi@example.com>"
 to = "you <you@example.com>"
 
 [rules.events]
-# Toggle individual alert kinds. Everything below defaults on except ready_for_review.
+# Toggle individual alert kinds; everything below is on by default.
 review_requested = true
 re_review_requested = true
 review_submitted = true
@@ -381,7 +381,7 @@ comment_reply = true
 mentioned = true
 merged = true
 closed = true
-ready_for_review = false
+ready_for_review = true
 
 [rules.repos]
 # Empty allow = all repos. Patterns: "owner/name" or "owner/*". deny wins over allow.
