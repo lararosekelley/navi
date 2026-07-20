@@ -489,10 +489,12 @@ fn status_task() -> Result<()> {
 /// redirects all output to a per-user log file (creating its directory first),
 /// since a hidden task otherwise has nowhere to log.
 fn schtasks_create_args(exe: &str, config: &Path) -> Vec<String> {
+    // Double any single quote so a path like C:\Users\O'Brien\... can't break out
+    // of the PowerShell single-quoted string it sits in.
+    let exe = ps_single_quote_escape(exe);
+    let config = ps_single_quote_escape(&config.display().to_string());
     let action = format!(
         "powershell -WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; & '{exe}' run --config '{config}' *>> $log\"",
-        exe = exe,
-        config = config.display(),
     );
     vec![
         "/Create".into(),
@@ -610,6 +612,11 @@ fn xml_escape(s: &str) -> String {
         .replace('>', "&gt;")
 }
 
+/// Double single quotes for safe embedding in a PowerShell single-quoted string.
+fn ps_single_quote_escape(s: &str) -> String {
+    s.replace('\'', "''")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -639,6 +646,18 @@ mod tests {
         assert!(plist.contains(". \"/Users/me/.config/navi/navi.env\""));
         assert!(plist.contains("exec \"/usr/local/bin/navi\" run"));
         assert!(plist.contains("/Users/me/Library/Logs/navi.log"));
+    }
+
+    #[test]
+    fn schtasks_escapes_single_quotes_in_paths() {
+        let args = schtasks_create_args(
+            "C:\\Users\\O'Brien\\navi.exe",
+            Path::new("C:\\Users\\O'Brien\\config.toml"),
+        );
+        let action = args.last().unwrap();
+        // Doubled quotes keep the path inside its single-quoted PowerShell string.
+        assert!(action.contains("'C:\\Users\\O''Brien\\navi.exe'"));
+        assert!(action.contains("'C:\\Users\\O''Brien\\config.toml'"));
     }
 
     #[test]
