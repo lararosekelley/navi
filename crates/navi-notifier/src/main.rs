@@ -327,6 +327,9 @@ token_env = "NAVI_GITHUB_TOKEN"
 # reviews on your PRs and activity in muted repos still reach you. Set false to
 # rely on notifications only.
 track_prs = true
+# Mark a notification thread read once navi has delivered its event. Off by
+# default so navi never touches your read/unread state unless you opt in.
+mark_read = false
 
 [gitlab]
 # Off by default. Enable to get review-request and mention alerts from GitLab.

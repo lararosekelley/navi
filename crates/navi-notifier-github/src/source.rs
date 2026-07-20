@@ -2,7 +2,8 @@
 //! and diffs into normalized events. All GitHub-specific I/O lives here; the
 //! decision logic lives in the pure `navi-notifier-forge` diff engine.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
 
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
@@ -60,6 +61,8 @@ pub struct GitHubSourceConfig {
     pub api_base: Option<String>,
     /// Poll your involved open PRs directly (search), on top of notifications.
     pub track_prs: bool,
+    /// Mark a notification thread read once its event has been delivered.
+    pub mark_read: bool,
 }
 
 pub struct GitHubSource {
@@ -67,6 +70,10 @@ pub struct GitHubSource {
     /// Cached authenticated login, resolved lazily on first poll.
     viewer: OnceCell<String>,
     track_prs: bool,
+    mark_read: bool,
+    /// scope (`owner/repo#n`) -> notification thread id, for the mark-read commit
+    /// hook. Populated during a poll, only when `mark_read` is on.
+    threads: Mutex<HashMap<String, String>>,
 }
 
 impl GitHubSource {
@@ -89,6 +96,8 @@ impl GitHubSource {
             octo,
             viewer: OnceCell::new(),
             track_prs: config.track_prs,
+            mark_read: config.mark_read,
+            threads: Mutex::new(HashMap::new()),
         })
     }
 
@@ -363,6 +372,9 @@ impl Source for GitHubSource {
         let viewer = self.viewer_login().await?.to_string();
         let viewer_teams = self.viewer_team_keys().await;
         let poll_start = OffsetDateTime::now_utc();
+        if self.mark_read {
+            self.threads.lock().unwrap().clear();
+        }
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
 
         let notifs = self.notifications(since.as_deref()).await?;
@@ -394,6 +406,13 @@ impl Source for GitHubSource {
                 if updated.as_str() <= seen.as_str() {
                     continue;
                 }
+            }
+
+            if self.mark_read {
+                self.threads
+                    .lock()
+                    .unwrap()
+                    .insert(scope.clone(), n.id.clone());
             }
 
             let evs = self
@@ -472,6 +491,35 @@ impl Source for GitHubSource {
             .await?;
 
         Ok(events)
+    }
+
+    /// Mark the notification thread read once an event has been delivered, when
+    /// enabled. Only notification-derived events map to a thread; PRs found via the
+    /// involved-PR search have none, and are left alone.
+    async fn commit(&self, _state: &dyn StateStore, event: &Event) -> Result<(), SourceError> {
+        if !self.mark_read {
+            return Ok(());
+        }
+        let scope = format!(
+            "{}/{}#{}",
+            event.pull_request.repo.owner, event.pull_request.repo.name, event.pull_request.number
+        );
+        let thread_id = self.threads.lock().unwrap().get(&scope).cloned();
+        // No thread mapped for this scope (e.g. found via search, not a notification).
+        let Some(raw) = thread_id else {
+            return Ok(());
+        };
+        let Ok(id) = raw.parse::<u64>() else {
+            warn!(raw = %raw, scope = %scope, "mark-read: thread id is not numeric, skipping");
+            return Ok(());
+        };
+        self.octo
+            .activity()
+            .notifications()
+            .mark_as_read(id.into())
+            .await
+            .map_err(map_err)?;
+        Ok(())
     }
 }
 

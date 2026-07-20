@@ -65,6 +65,9 @@ pub struct GitHubConfig {
     /// notifications inbox. Catches reviews on your own PRs and activity in muted
     /// repos, which GitHub often doesn't surface as notifications.
     pub track_prs: bool,
+    /// Mark a notification thread read once its event has been delivered. Off by
+    /// default so navi doesn't touch your read/unread state unless you ask.
+    pub mark_read: bool,
 }
 
 impl Default for GitHubConfig {
@@ -74,6 +77,7 @@ impl Default for GitHubConfig {
             token_env: "NAVI_GITHUB_TOKEN".into(),
             token: None,
             track_prs: true,
+            mark_read: false,
             api_base: None,
         }
     }
