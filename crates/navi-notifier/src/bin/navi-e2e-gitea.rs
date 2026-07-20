@@ -124,7 +124,7 @@ async fn run() -> Result<(), String> {
         vec![Arc::new(source)],
         vec![Arc::new(email)],
         vec![],
-        RuleEngine::new(RuleConfig::default()),
+        RuleEngine::new(RuleConfig::default()).expect("default rules"),
         Arc::new(MemState::default()),
     );
 

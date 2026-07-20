@@ -373,7 +373,7 @@ mod tests {
             vec![Arc::new(MockSource { events })],
             vec![destination],
             vec![],
-            RuleEngine::new(rules),
+            RuleEngine::new(rules).expect("valid test rules"),
             state.clone(),
         );
         (engine, state)

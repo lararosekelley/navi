@@ -84,7 +84,7 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
         "no destinations enabled in config"
     );
 
-    let rules = RuleEngine::new(config.rules.clone());
+    let rules = RuleEngine::new(config.rules.clone()).context("compiling mute patterns")?;
     Ok(Engine::new(
         sources,
         destinations,

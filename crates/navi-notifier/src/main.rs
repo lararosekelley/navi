@@ -392,6 +392,17 @@ reviewer = true
 # [rules]
 # mute_authors = ["dependabot[bot]"]
 
+# Pattern mutes filter by matching a field. `match` is author | title | excerpt;
+# set regex = true for a regex, otherwise it's a case-insensitive substring.
+# [[rules.mute]]
+# match = "author"
+# pattern = "[bot]"
+#
+# [[rules.mute]]
+# match = "title"
+# pattern = "^Bump "
+# regex = true
+
 # Routes wire sources to destinations. Omit this section entirely to send every
 # source to every enabled destination. List routes to be explicit, e.g. github+gitlab
 # to slack, or github to discord:
