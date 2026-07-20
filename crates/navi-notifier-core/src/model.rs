@@ -172,6 +172,17 @@ impl Event {
         }
     }
 
+    /// How to refer to the PR in a headline, from the viewer's angle: "your PR"
+    /// when you authored it, otherwise "<author>'s PR" - so a review, merge, or
+    /// close on a PR you only review isn't mislabeled as yours.
+    pub fn pr_phrase(&self) -> String {
+        if self.viewer.is_author {
+            "your PR".to_string()
+        } else {
+            format!("{}'s PR", self.pull_request.author.label())
+        }
+    }
+
     /// Convenience for building a dedup key from provider-stable parts.
     /// Callers should feed identifiers that never change for a given action
     /// (e.g. `github:owner/repo#12:review:456789`).

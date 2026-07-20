@@ -139,7 +139,7 @@ fn headline(event: &Event) -> String {
         EventKind::ReviewRequested => format!("{actor} requested your review"),
         EventKind::ReReviewRequested => format!("{actor} requested a re-review"),
         EventKind::ReviewSubmitted { state } => match state {
-            ReviewState::Approved => format!("{actor} approved your PR"),
+            ReviewState::Approved => format!("{actor} approved {}", event.pr_phrase()),
             ReviewState::ChangesRequested => format!("{actor} requested changes"),
             ReviewState::Commented => format!("{actor} left a review comment"),
         },
@@ -152,8 +152,8 @@ fn headline(event: &Event) -> String {
             }
         }
         EventKind::Mentioned => format!("{actor} mentioned you"),
-        EventKind::Merged => format!("{actor} merged your PR"),
-        EventKind::Closed => "Your PR was closed".to_string(),
+        EventKind::Merged => format!("{actor} merged {}", event.pr_phrase()),
+        EventKind::Closed => format!("{} was closed", event.pr_phrase()),
         EventKind::ReadyForReview => format!("{actor} marked a PR ready for review"),
     }
 }
@@ -256,5 +256,17 @@ mod tests {
     fn includes_excerpt_in_body() {
         let raw = formatted(EventKind::Mentioned, "k3");
         assert!(raw.contains("looks good"));
+    }
+
+    #[test]
+    fn possessive_reflects_authorship() {
+        // You only review it → the author's name, never "your PR".
+        let theirs = headline(&event(EventKind::Merged, "k")); // is_author = false, author octo
+        assert!(theirs.contains("merged octo's PR"), "got {theirs}");
+        assert!(!theirs.contains("your PR"));
+        // You authored it → "your PR".
+        let mut mine = event(EventKind::Merged, "k");
+        mine.viewer.is_author = true;
+        assert!(headline(&mine).contains("merged your PR"));
     }
 }

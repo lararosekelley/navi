@@ -45,7 +45,10 @@ fn headline(event: &Event, actor: &str) -> (String, u32) {
         EventKind::ReviewRequested => (format!("👀 **{actor}** requested your review"), 0x5865f2),
         EventKind::ReReviewRequested => (format!("🔁 **{actor}** requested a re-review"), 0x5865f2),
         EventKind::ReviewSubmitted { state } => match state {
-            ReviewState::Approved => (format!("✅ **{actor}** approved your PR"), 0x2ecc71),
+            ReviewState::Approved => (
+                format!("✅ **{actor}** approved {}", event.pr_phrase()),
+                0x2ecc71,
+            ),
             ReviewState::ChangesRequested => {
                 (format!("⚠️ **{actor}** requested changes"), 0xe67e22)
             }
@@ -61,8 +64,11 @@ fn headline(event: &Event, actor: &str) -> (String, u32) {
             (text, 0x3498db)
         }
         EventKind::Mentioned => (format!("👋 **{actor}** mentioned you"), 0xf1c40f),
-        EventKind::Merged => (format!("🟣 **{actor}** merged your PR"), 0x9b59b6),
-        EventKind::Closed => ("🚫 Your PR was closed".to_string(), 0xe74c3c),
+        EventKind::Merged => (
+            format!("🟣 **{actor}** merged {}", event.pr_phrase()),
+            0x9b59b6,
+        ),
+        EventKind::Closed => (format!("🚫 {} was closed", event.pr_phrase()), 0xe74c3c),
         EventKind::ReadyForReview => (
             format!("🚀 **{actor}** marked a PR ready for review"),
             0x2ecc71,
@@ -125,5 +131,24 @@ mod tests {
         let r = render(&event(EventKind::Mentioned));
         let fields = r.embed["fields"].as_array().unwrap();
         assert!(fields.iter().any(|f| f["name"] == "Comment"));
+    }
+
+    #[test]
+    fn possessive_reflects_authorship() {
+        // You only review it → the author's name, never "your PR".
+        let d = render(&event(EventKind::Merged)).embed["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d.contains("merged octo's PR"), "got {d}");
+        assert!(!d.contains("your PR"));
+        // You authored it → "your PR".
+        let mut mine = event(EventKind::Merged);
+        mine.viewer.is_author = true;
+        let d2 = render(&mine).embed["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d2.contains("merged your PR"), "got {d2}");
     }
 }

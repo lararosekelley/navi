@@ -57,7 +57,12 @@ fn headline(event: &Event, actor: &str) -> String {
             format!(":arrows_counterclockwise: {a} requested a re-review")
         }
         EventKind::ReviewSubmitted { state } => match state {
-            ReviewState::Approved => format!(":white_check_mark: {a} approved your PR"),
+            ReviewState::Approved => {
+                format!(
+                    ":white_check_mark: {a} approved {}",
+                    escape(&event.pr_phrase())
+                )
+            }
             ReviewState::ChangesRequested => format!(":warning: {a} requested changes"),
             ReviewState::Commented => format!(":speech_balloon: {a} left a review comment"),
         },
@@ -70,8 +75,8 @@ fn headline(event: &Event, actor: &str) -> String {
             }
         }
         EventKind::Mentioned => format!(":wave: {a} mentioned you"),
-        EventKind::Merged => format!(":purple_heart: {a} merged your PR"),
-        EventKind::Closed => ":no_entry_sign: Your PR was closed".to_string(),
+        EventKind::Merged => format!(":purple_heart: {a} merged {}", escape(&event.pr_phrase())),
+        EventKind::Closed => format!(":no_entry_sign: {} was closed", escape(&event.pr_phrase())),
         EventKind::ReadyForReview => format!(":rocket: {a} marked a PR ready for review"),
     }
 }
@@ -137,9 +142,23 @@ mod tests {
     fn self_action_reads_as_you() {
         let mut e = event(EventKind::Merged);
         e.viewer.actor_is_viewer = true;
+        e.viewer.is_author = true;
         let r = render(&e);
         assert!(r.text.contains("you merged your PR"), "got {:?}", r.text);
         assert!(!r.text.contains("reviewer merged"));
+    }
+
+    #[test]
+    fn possessive_reflects_authorship() {
+        // You authored it → "your PR".
+        let mut mine = event(EventKind::Merged);
+        mine.viewer.is_author = true;
+        assert!(render(&mine).text.contains("merged your PR"));
+
+        // You only review it → the author's name, never "your PR".
+        let theirs = render(&event(EventKind::Merged)).text; // default is_author = false
+        assert!(theirs.contains("merged octo's PR"), "got {theirs}");
+        assert!(!theirs.contains("your PR"));
     }
 
     #[test]
