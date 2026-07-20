@@ -31,6 +31,17 @@ struct GithubOrg {
     login: String,
 }
 
+/// What the GitHub token can see, for `navi doctor`.
+pub struct GitHubDoctor {
+    pub login: String,
+    /// Orgs the token can see, or `None` if the request failed (token likely
+    /// lacks `read:org` or needs SAML re-authorization) - distinct from an
+    /// empty list, which genuinely means "no orgs".
+    pub orgs: Option<Vec<String>>,
+    /// Whether `read:org` is present (team review requests can be detected).
+    pub team_detection: bool,
+}
+
 use crate::notification::Notification;
 
 const SOURCE_ID: &str = "github";
@@ -97,6 +108,25 @@ impl GitHubSource {
                 HashSet::new()
             }
         }
+    }
+
+    /// Report the authenticated identity and what the token can actually see - the
+    /// orgs it's authorized for and whether team detection (`read:org`) works. This
+    /// surfaces the silent org-blindness (SAML SSO, muted repos) that otherwise
+    /// looks like navi being broken.
+    pub async fn doctor(&self) -> Result<GitHubDoctor, SourceError> {
+        let login = self.viewer_login().await?.to_string();
+        let orgs = self
+            .get_all::<GithubOrg>("/user/orgs")
+            .await
+            .map(|v| v.into_iter().map(|o| o.login).collect())
+            .ok();
+        let team_detection = self.get_all::<GithubTeam>("/user/teams").await.is_ok();
+        Ok(GitHubDoctor {
+            login,
+            orgs,
+            team_detection,
+        })
     }
 
     /// The authenticated user's login, fetched once and cached.

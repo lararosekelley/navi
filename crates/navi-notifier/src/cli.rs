@@ -46,6 +46,9 @@ pub enum Command {
     /// Send a sample Block Kit message to verify Slack credentials and DM target.
     TestSlack,
 
+    /// Report what each enabled provider can see (identity, visible orgs, creds).
+    Doctor,
+
     /// Tail the background service's logs (journald / launchd / Task Scheduler).
     Logs {
         /// Follow the log, streaming new lines as they arrive.

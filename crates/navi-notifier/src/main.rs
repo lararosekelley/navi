@@ -5,6 +5,7 @@
 mod cli;
 mod completions;
 mod config;
+mod doctor;
 mod envfile;
 mod logs;
 mod prompt;
@@ -66,6 +67,7 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
         Command::Run => cmd_run(&config_path).await,
         Command::TestSlack => cmd_test_slack(&config_path).await,
+        Command::Doctor => cmd_doctor(&config_path).await,
         Command::Logs { .. } => unreachable!("logs is handled before the runtime in main"),
         Command::Completions { shell } => completions::print(shell),
         Command::Setup { yes, refresh } => setup::setup(yes, refresh),
@@ -186,6 +188,11 @@ async fn cmd_test_slack(config_path: &Path) -> Result<()> {
         config.slack.dm_to
     );
     Ok(())
+}
+
+async fn cmd_doctor(config_path: &Path) -> Result<()> {
+    let config = load_and_init_logging(config_path)?;
+    doctor::doctor(&config).await
 }
 
 /// Print a human-readable summary of a run (used by `once`).
