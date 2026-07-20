@@ -1028,7 +1028,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1058,7 +1058,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "regex",
@@ -1072,7 +1072,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-discord"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "navi-notifier-core",
@@ -1087,7 +1087,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-email"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "lettre",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-forge"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "navi-notifier-core",
  "serde",
@@ -1108,7 +1108,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-gitea"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "navi-notifier-core",
@@ -1124,7 +1124,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-github"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1141,7 +1141,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-gitlab"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "navi-notifier-core",
@@ -1156,7 +1156,7 @@ dependencies = [
 
 [[package]]
 name = "navi-notifier-slack"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "navi-notifier-core",

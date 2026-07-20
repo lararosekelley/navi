@@ -13,7 +13,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.8"
+version = "0.1.9"
 edition = "2021"
 rust-version = "1.85"
 license = "MIT"
@@ -38,14 +38,14 @@ allow-branch = ["main"]
 
 [workspace.dependencies]
 # Internal (version required so the crates are publishable to crates.io)
-navi-notifier-core = { path = "crates/navi-notifier-core", version = "0.1.8" }
-navi-notifier-forge = { path = "crates/navi-notifier-forge", version = "0.1.8" }
-navi-notifier-github = { path = "crates/navi-notifier-github", version = "0.1.8" }
-navi-notifier-gitea = { path = "crates/navi-notifier-gitea", version = "0.1.8" }
-navi-notifier-gitlab = { path = "crates/navi-notifier-gitlab", version = "0.1.8" }
-navi-notifier-slack = { path = "crates/navi-notifier-slack", version = "0.1.8" }
-navi-notifier-discord = { path = "crates/navi-notifier-discord", version = "0.1.8" }
-navi-notifier-email = { path = "crates/navi-notifier-email", version = "0.1.8" }
+navi-notifier-core = { path = "crates/navi-notifier-core", version = "0.1.9" }
+navi-notifier-forge = { path = "crates/navi-notifier-forge", version = "0.1.9" }
+navi-notifier-github = { path = "crates/navi-notifier-github", version = "0.1.9" }
+navi-notifier-gitea = { path = "crates/navi-notifier-gitea", version = "0.1.9" }
+navi-notifier-gitlab = { path = "crates/navi-notifier-gitlab", version = "0.1.9" }
+navi-notifier-slack = { path = "crates/navi-notifier-slack", version = "0.1.9" }
+navi-notifier-discord = { path = "crates/navi-notifier-discord", version = "0.1.9" }
+navi-notifier-email = { path = "crates/navi-notifier-email", version = "0.1.9" }
 
 # Async runtime
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "time", "sync"] }
