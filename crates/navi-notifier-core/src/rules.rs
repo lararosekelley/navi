@@ -419,6 +419,7 @@ mod tests {
     fn default_toggles_allow_common_events() {
         let engine = RuleEngine::new(RuleConfig::default()).unwrap();
         assert!(EventToggles::default().review_requested);
+        assert!(EventToggles::default().ready_for_review);
         assert_eq!(
             engine.decide(
                 &event(EventKind::ReviewRequested),

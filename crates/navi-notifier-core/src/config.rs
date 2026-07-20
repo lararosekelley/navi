@@ -35,8 +35,7 @@ impl Default for EventToggles {
             mentioned: true,
             merged: true,
             closed: true,
-            // Off by default: ready-for-review tends to be higher-volume/lower-signal.
-            ready_for_review: false,
+            ready_for_review: true,
         }
     }
 }
