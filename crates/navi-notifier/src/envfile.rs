@@ -3,8 +3,9 @@
 //! A background service does not inherit your interactive shell, so tokens have
 //! to come from somewhere it can see. navi loads `navi.env` itself at startup so
 //! foreground `navi run` and the service read the same file regardless of how
-//! they were launched. Loading is additive: an already-set process variable
-//! wins, so a value in your shell (or CI) still overrides the file.
+//! they were launched. `navi.env` is **authoritative**: a value in the file
+//! overrides any process/shell variable of the same name, so the file is the
+//! single source of truth (migration note: shell env no longer wins over it).
 
 use std::path::Path;
 
@@ -13,8 +14,9 @@ use tracing::warn;
 /// Env-file name, kept next to the config file.
 const ENV_FILE: &str = "navi.env";
 
-/// Load the `navi.env` beside `config_path` into the process environment, filling
-/// only variables that are not already set. A missing file is not an error.
+/// Load the `navi.env` beside `config_path` into the process environment,
+/// overriding any variables already set (the file is authoritative). A missing
+/// file is not an error.
 pub fn load_beside_config(config_path: &Path) {
     let Some(dir) = config_path.parent() else {
         return;
@@ -30,9 +32,8 @@ pub fn load_beside_config(config_path: &Path) {
     };
     warn_if_group_or_world_readable(&path);
     for (key, value) in parse(&text) {
-        if std::env::var_os(&key).is_none() {
-            std::env::set_var(&key, &value);
-        }
+        // Authoritative: the file wins over any existing process/shell variable.
+        std::env::set_var(&key, &value);
     }
 }
 
@@ -123,7 +124,7 @@ no_equals_here\n\
     }
 
     #[test]
-    fn load_fills_unset_and_never_overrides() {
+    fn load_is_authoritative_over_process_env() {
         let _guard = EnvGuard(&["NAVI_ENVFILE_TEST_FRESH", "NAVI_ENVFILE_TEST_PRESET"]);
         let dir = tempfile::tempdir().unwrap();
         let cfg = dir.path().join("config.toml");
@@ -142,8 +143,8 @@ no_equals_here\n\
         );
         assert_eq!(
             std::env::var("NAVI_ENVFILE_TEST_PRESET").unwrap(),
-            "from_env",
-            "an already-set variable must win over the file"
+            "from_file",
+            "navi.env is authoritative: the file must win over a shell variable"
         );
     }
 
