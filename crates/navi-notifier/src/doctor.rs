@@ -74,6 +74,7 @@ async fn check_github(config: &Config) {
         track_prs: config.github.track_prs,
         mark_read: false,
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     }) {
         Ok(s) => s,
         Err(e) => {

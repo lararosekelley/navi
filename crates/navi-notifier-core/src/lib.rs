@@ -17,6 +17,8 @@ pub mod traits;
 pub use config::RuleConfig;
 pub use engine::{Engine, EventOutcome, EventRecord, Route, RunReport};
 pub use error::{DestinationError, SourceError, StateError};
-pub use model::{Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship};
+pub use model::{
+    Actor, Backfill, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
+};
 pub use rules::{Decision, DropReason, FilterContext, RuleEngine};
 pub use traits::{Destination, Source, StateStore};

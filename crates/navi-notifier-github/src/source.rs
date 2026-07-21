@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
-use navi_notifier_core::SourceError;
+use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
 use navi_notifier_forge::{
     diff, first_sight_watermark, team_key, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
@@ -66,6 +66,8 @@ pub struct GitHubSourceConfig {
     /// Hold a comment back until it is at least this many seconds old (0 = off), so
     /// edit-in-place bots resolve to their final text before we notify.
     pub comment_min_age_secs: u64,
+    /// How much pre-existing activity to surface on the very first poll.
+    pub backfill: Backfill,
 }
 
 pub struct GitHubSource {
@@ -83,6 +85,8 @@ pub struct GitHubSource {
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
     /// Min comment age before notifying (`None` = off), passed through to the diff.
     comment_min_age: Option<Duration>,
+    /// First-run backfill mode, applied to the involved-PR sweep on the first poll.
+    backfill: Backfill,
 }
 
 impl GitHubSource {
@@ -110,6 +114,7 @@ impl GitHubSource {
             pending_snapshots: Mutex::new(HashMap::new()),
             comment_min_age: (config.comment_min_age_secs > 0)
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
+            backfill: config.backfill,
         })
     }
 
@@ -277,6 +282,7 @@ impl GitHubSource {
         number: u64,
         repo_url: Option<String>,
         first_sight_since: Option<OffsetDateTime>,
+        first_sight_backfill: Option<Backfill>,
         viewer: &str,
         viewer_teams: &HashSet<String>,
         now: OffsetDateTime,
@@ -307,6 +313,7 @@ impl GitHubSource {
             first_sight_since,
             viewer_teams: viewer_teams.clone(),
             comment_min_age: self.comment_min_age,
+            first_sight_backfill,
         };
         let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
         let bytes = serde_json::to_vec(&new_snapshot)
@@ -395,6 +402,19 @@ impl Source for GitHubSource {
         }
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
 
+        // On the first poll ever (no cursor yet), the involved-PR sweep applies the
+        // configured backfill mode instead of the normal recent-only first-sight.
+        // `review_requests` is exactly the established behaviour, so only `none` and
+        // `all_open` need the override.
+        let first_run = state.get_cursor(SOURCE_ID, "backfilled").await?.is_none();
+        let sweep_backfill =
+            (first_run && self.backfill != Backfill::ReviewRequests).then_some(self.backfill);
+        // Backfill runs on the involved-PR sweep, which only happens with track_prs.
+        // Warn rather than silently no-op when the two are configured at odds.
+        if first_run && self.backfill == Backfill::AllOpen && !self.track_prs {
+            warn!("backfill = \"all_open\" needs github.track_prs = true; skipping first-run backfill");
+        }
+
         let notifs = self.notifications(since.as_deref()).await?;
         debug!(count = notifs.len(), "fetched notifications");
 
@@ -441,6 +461,8 @@ impl Source for GitHubSource {
                     number,
                     n.repository.html_url.clone(),
                     first_sight_watermark(n.updated_at.as_deref()),
+                    // Notifications are always "just happened", never backfill.
+                    None,
                     &viewer,
                     &viewer_teams,
                     poll_start,
@@ -473,8 +495,9 @@ impl Source for GitHubSource {
                             }
                         }
                         // No triggering notification here to anchor first sight, so
-                        // surface only activity from the last leeway window; older
-                        // history is baselined silently (no first-run backlog).
+                        // normally surface only activity from the last leeway window;
+                        // older history is baselined silently. On the first poll,
+                        // `sweep_backfill` overrides that per the configured mode.
                         let evs = self
                             .process_pr(
                                 state,
@@ -483,6 +506,7 @@ impl Source for GitHubSource {
                                 number,
                                 Some(format!("https://github.com/{owner}/{repo}")),
                                 Some(poll_start - FIRST_SIGHT_LEEWAY),
+                                sweep_backfill,
                                 &viewer,
                                 &viewer_teams,
                                 poll_start,
@@ -507,6 +531,10 @@ impl Source for GitHubSource {
         state
             .put_cursor(SOURCE_ID, "notif_since", &next_since)
             .await?;
+        // Mark the initial catch-up done so later polls use normal first-sight.
+        if first_run {
+            state.put_cursor(SOURCE_ID, "backfilled", "1").await?;
+        }
 
         Ok(events)
     }

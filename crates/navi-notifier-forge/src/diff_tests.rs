@@ -26,6 +26,7 @@ fn ctx() -> DiffContext {
         first_sight_since: None,
         viewer_teams: std::collections::HashSet::new(),
         comment_min_age: None,
+        first_sight_backfill: None,
     }
 }
 
@@ -440,4 +441,43 @@ fn comment_min_age_holds_fresh_comments() {
     };
     let (events, _) = diff(&cx, &d, &initialized());
     assert_eq!(events.len(), 1, "min-age off must not hold anything");
+}
+
+#[test]
+fn first_run_backfill_modes_gate_what_surfaces() {
+    // A brand-new PR (empty snapshot) where you're a requested reviewer, someone
+    // approved, and a comment mentions you: three distinct first-sight events.
+    let mut pr = base_pr();
+    pr.requested_reviewers = vec![user(VIEWER)];
+    let mut d = data(pr);
+    d.reviews = vec![review(1, "other", "APPROVED")];
+    d.issue_comments = vec![icomment(2, "other", "ping @me please")];
+
+    let surfaced = |backfill| {
+        let cx = DiffContext {
+            first_sight_backfill: backfill,
+            ..ctx()
+        };
+        let (events, _) = diff(&cx, &d, &PrSnapshot::default());
+        kinds(&events).into_iter().cloned().collect::<Vec<_>>()
+    };
+
+    // silent ("none"): baseline, not even the outstanding review ask.
+    assert!(surfaced(Some(Backfill::Silent)).is_empty());
+    // review_requests: only what's waiting on you.
+    assert_eq!(
+        surfaced(Some(Backfill::ReviewRequests)),
+        vec![EventKind::ReviewRequested]
+    );
+    // all_open: every derivable event on the PR.
+    assert_eq!(
+        surfaced(Some(Backfill::AllOpen)),
+        vec![
+            EventKind::ReviewRequested,
+            EventKind::ReviewSubmitted {
+                state: ReviewState::Approved
+            },
+            EventKind::Mentioned,
+        ]
+    );
 }

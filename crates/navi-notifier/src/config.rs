@@ -8,7 +8,7 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
-use navi_notifier_core::RuleConfig;
+use navi_notifier_core::{Backfill, RuleConfig};
 use serde::{Deserialize, Serialize};
 
 /// The full configuration tree.
@@ -70,6 +70,10 @@ pub struct General {
     /// you get one accurate alert instead of the transient one. Costs up to this
     /// much delay on comment alerts.
     pub comment_min_age_secs: u64,
+    /// How much pre-existing activity to surface on navi's very first poll, before
+    /// it has any stored state. `review_requests` (default) shows PRs awaiting your
+    /// review; `none` baselines silently; `all_open` backfills every involved PR.
+    pub backfill: Backfill,
 }
 
 impl Default for General {
@@ -79,6 +83,7 @@ impl Default for General {
             log_level: "info".into(),
             utc_offset_minutes: 0,
             comment_min_age_secs: 0,
+            backfill: Backfill::default(),
         }
     }
 }
