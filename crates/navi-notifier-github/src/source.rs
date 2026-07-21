@@ -74,6 +74,10 @@ pub struct GitHubSource {
     /// scope (`owner/repo#n`) -> notification thread id, for the mark-read commit
     /// hook. Populated during a poll, only when `mark_read` is on.
     threads: Mutex<HashMap<String, String>>,
+    /// scope (`owner/repo#n`) -> serialized new snapshot, deferred during a poll and
+    /// flushed by `commit_snapshots` only for PRs whose delivery didn't fail, so a
+    /// failed send can't advance state past an undelivered event.
+    pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl GitHubSource {
@@ -98,6 +102,7 @@ impl GitHubSource {
             track_prs: config.track_prs,
             mark_read: config.mark_read,
             threads: Mutex::new(HashMap::new()),
+            pending_snapshots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -298,7 +303,9 @@ impl GitHubSource {
         let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
         let bytes = serde_json::to_vec(&new_snapshot)
             .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
-        state.put_snapshot(SOURCE_ID, &scope, &bytes).await?;
+        // Defer persistence to `commit_snapshots` (after delivery), so a send failure
+        // leaves the prior snapshot in place and this PR's events re-derive next poll.
+        self.pending_snapshots.lock().unwrap().insert(scope, bytes);
         Ok(evs)
     }
 
@@ -372,6 +379,9 @@ impl Source for GitHubSource {
         let viewer = self.viewer_login().await?.to_string();
         let viewer_teams = self.viewer_team_keys().await;
         let poll_start = OffsetDateTime::now_utc();
+        // Fresh stash each pass; a prior pass's deferred snapshots were either
+        // flushed by `commit_snapshots` or (on a dry run) are intentionally dropped.
+        self.pending_snapshots.lock().unwrap().clear();
         if self.mark_read {
             self.threads.lock().unwrap().clear();
         }
@@ -500,10 +510,7 @@ impl Source for GitHubSource {
         if !self.mark_read {
             return Ok(());
         }
-        let scope = format!(
-            "{}/{}#{}",
-            event.pull_request.repo.owner, event.pull_request.repo.name, event.pull_request.number
-        );
+        let scope = event.scope();
         let thread_id = self.threads.lock().unwrap().get(&scope).cloned();
         // No thread mapped for this scope (e.g. found via search, not a notification).
         let Some(raw) = thread_id else {
@@ -520,6 +527,36 @@ impl Source for GitHubSource {
             .await
             .map_err(map_err)?;
         Ok(())
+    }
+
+    /// Persist the snapshots deferred during `poll`, skipping any PR whose delivery
+    /// failed this pass so its events re-derive next time. Draining the stash makes
+    /// this idempotent if called twice.
+    async fn commit_snapshots(
+        &self,
+        state: &dyn StateStore,
+        failed_scopes: &HashSet<String>,
+    ) -> Result<(), SourceError> {
+        let pending: Vec<(String, Vec<u8>)> =
+            self.pending_snapshots.lock().unwrap().drain().collect();
+        // Attempt every entry: a single write failure must not drop the others
+        // (they were already drained). A scope we fail to persist just re-derives
+        // next poll. Surface the first error after trying them all.
+        let mut first_err = None;
+        for (scope, bytes) in pending {
+            if failed_scopes.contains(&scope) {
+                continue;
+            }
+            if let Err(e) = state
+                .put_snapshot(SOURCE_ID, &scope, &bytes)
+                .await
+                .map_err(SourceError::from)
+            {
+                warn!(%scope, error = %e, "failed to persist snapshot; it will re-derive next poll");
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 }
 

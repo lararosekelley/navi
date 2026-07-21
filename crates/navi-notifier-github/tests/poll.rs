@@ -7,6 +7,8 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use common::MemState;
 use navi_notifier_core::model::EventKind;
 use navi_notifier_core::traits::{Source, StateStore};
@@ -207,6 +209,74 @@ async fn mark_read_marks_the_thread_after_commit() {
     // The engine calls commit() after delivery; here we call it directly.
     source.commit(&state, &events[0]).await.expect("commit");
     // wiremock verifies the PATCH fired (.expect(1)) when the server drops.
+}
+
+#[tokio::test]
+async fn snapshot_is_deferred_until_commit() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+
+    let source = source_for(&server);
+    let state = MemState::default();
+    let events = source.poll(&state).await.expect("poll");
+    assert_eq!(events.len(), 1);
+
+    // poll() must not have persisted the snapshot yet - that's the exactly-once fix.
+    assert!(
+        state
+            .get_snapshot("github", "acme/widgets#1")
+            .await
+            .unwrap()
+            .is_none(),
+        "snapshot should be deferred until commit_snapshots"
+    );
+
+    // Flushing with no failed scopes persists it.
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .expect("commit");
+    assert!(state
+        .get_snapshot("github", "acme/widgets#1")
+        .await
+        .unwrap()
+        .is_some());
+}
+
+#[tokio::test]
+async fn failed_scope_snapshot_is_held_back() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+
+    let source = source_for(&server);
+    let state = MemState::default();
+    source.poll(&state).await.expect("poll");
+
+    // The PR's delivery failed this pass, so its snapshot must not advance -
+    // leaving the old state so the event re-derives (and dedup covers re-sends).
+    let failed = HashSet::from(["acme/widgets#1".to_string()]);
+    source
+        .commit_snapshots(&state, &failed)
+        .await
+        .expect("commit");
+    assert!(
+        state
+            .get_snapshot("github", "acme/widgets#1")
+            .await
+            .unwrap()
+            .is_none(),
+        "a failed scope's snapshot must be held back"
+    );
 }
 
 #[tokio::test]

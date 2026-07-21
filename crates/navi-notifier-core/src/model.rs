@@ -183,6 +183,16 @@ impl Event {
         }
     }
 
+    /// Provider-stable per-PR key (`owner/repo#number`). Groups an event with the
+    /// pull request it came from, so the engine can advance per-PR state as a unit.
+    pub fn scope(&self) -> String {
+        format!(
+            "{}#{}",
+            self.pull_request.repo.full_name(),
+            self.pull_request.number
+        )
+    }
+
     /// Convenience for building a dedup key from provider-stable parts.
     /// Callers should feed identifiers that never change for a given action
     /// (e.g. `github:owner/repo#12:review:456789`).

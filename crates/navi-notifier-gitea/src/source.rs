@@ -2,6 +2,9 @@
 //! the same PR/reviews/comments and reuses the shared `navi-notifier-forge` diff
 //! engine; only the payload mapping (in `api`) and notification URL shape differ.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
@@ -31,6 +34,9 @@ pub struct GiteaSource {
     token: String,
     api_base: String,
     viewer: OnceCell<String>,
+    /// scope (`owner/repo#n`) -> serialized new snapshot, deferred during a poll and
+    /// flushed by `commit_snapshots` only for PRs whose delivery didn't fail.
+    pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
 }
 
 impl GiteaSource {
@@ -51,6 +57,7 @@ impl GiteaSource {
                 .api_base
                 .unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
             viewer: OnceCell::new(),
+            pending_snapshots: Mutex::new(HashMap::new()),
         })
     }
 
@@ -155,6 +162,8 @@ impl Source for GiteaSource {
     async fn poll(&self, state: &dyn StateStore) -> Result<Vec<Event>, SourceError> {
         let viewer = self.viewer_login().await?.to_string();
         let poll_start = OffsetDateTime::now_utc();
+        // Fresh stash each pass; deferred snapshots persist via `commit_snapshots`.
+        self.pending_snapshots.lock().unwrap().clear();
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
         let notifs = self.notifications(since.as_deref()).await?;
         debug!(count = notifs.len(), "fetched gitea notifications");
@@ -204,7 +213,8 @@ impl Source for GiteaSource {
 
             let bytes = serde_json::to_vec(&new_snapshot)
                 .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
-            state.put_snapshot(SOURCE_ID, &scope, &bytes).await?;
+            // Defer persistence to `commit_snapshots` (after delivery).
+            self.pending_snapshots.lock().unwrap().insert(scope, bytes);
             events.extend(evs);
         }
 
@@ -216,6 +226,34 @@ impl Source for GiteaSource {
             .await?;
 
         Ok(events)
+    }
+
+    /// Persist the snapshots deferred during `poll`, skipping any PR whose delivery
+    /// failed this pass so its events re-derive next time.
+    async fn commit_snapshots(
+        &self,
+        state: &dyn StateStore,
+        failed_scopes: &HashSet<String>,
+    ) -> Result<(), SourceError> {
+        let pending: Vec<(String, Vec<u8>)> =
+            self.pending_snapshots.lock().unwrap().drain().collect();
+        // Attempt every entry: one write failure must not drop the others (already
+        // drained). A scope we fail to persist just re-derives next poll.
+        let mut first_err = None;
+        for (scope, bytes) in pending {
+            if failed_scopes.contains(&scope) {
+                continue;
+            }
+            if let Err(e) = state
+                .put_snapshot(SOURCE_ID, &scope, &bytes)
+                .await
+                .map_err(SourceError::from)
+            {
+                warn!(%scope, error = %e, "failed to persist snapshot; it will re-derive next poll");
+                first_err.get_or_insert(e);
+            }
+        }
+        first_err.map_or(Ok(()), Err)
     }
 }
 
