@@ -10,7 +10,7 @@ mod render;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use navi_notifier_core::traits::Destination;
+use navi_notifier_core::traits::{Destination, StateStore};
 use navi_notifier_core::{DestinationError, Event};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -180,11 +180,15 @@ impl Destination for DiscordDestination {
         "discord"
     }
 
-    async fn send(&self, event: &Event) -> Result<(), DestinationError> {
+    async fn send(&self, event: &Event, _state: &dyn StateStore) -> Result<(), DestinationError> {
         self.post(&render(event), &event.dedup_key).await
     }
 
-    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+    async fn send_digest(
+        &self,
+        events: &[Event],
+        _state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
         self.post(&render_digest(events), "digest").await
     }
 }

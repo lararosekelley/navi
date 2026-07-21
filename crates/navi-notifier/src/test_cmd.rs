@@ -27,7 +27,9 @@ pub async fn run(
 
     if let Some(id) = destination {
         let dest = wiring::build_destination(config, &id)?;
-        dest.send(&sample_event())
+        // Ephemeral state so the preview leaves real cursors (e.g. Slack threads) alone.
+        let state = MemStore::default();
+        dest.send(&sample_event(), &state)
             .await
             .with_context(|| format!("sending a sample to `{id}`"))?;
         println!("sent a sample message to `{id}`");

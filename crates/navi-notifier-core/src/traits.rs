@@ -93,15 +93,24 @@ pub trait Destination: Send + Sync {
 
     /// Deliver a single, already-filtered event. Implementations should be
     /// resilient to transient failure (retry/backoff) before returning `Err`.
-    async fn send(&self, event: &Event) -> Result<(), DestinationError>;
+    ///
+    /// `state` is the same store the engine and sources use; a destination may
+    /// read/write its own namespaced cursors through it (e.g. Slack maps a PR to
+    /// the thread it opened, so later events on that PR reply under it). Most
+    /// destinations ignore it.
+    async fn send(&self, event: &Event, state: &dyn StateStore) -> Result<(), DestinationError>;
 
     /// Deliver a batch of events as one digest. The default sends them
     /// individually; destinations override this to render a single summary
     /// message. Called by the engine's periodic digest flush; `events` is
     /// non-empty.
-    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+    async fn send_digest(
+        &self,
+        events: &[Event],
+        state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
         for event in events {
-            self.send(event).await?;
+            self.send(event, state).await?;
         }
         Ok(())
     }
