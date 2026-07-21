@@ -7,12 +7,77 @@
 //! overrides any process/shell variable of the same name, so the file is the
 //! single source of truth (migration note: shell env no longer wins over it).
 
+use std::io::Write;
 use std::path::Path;
 
+use anyhow::{anyhow, Context, Result};
+use tempfile::NamedTempFile;
 use tracing::warn;
 
 /// Env-file name, kept next to the config file.
 const ENV_FILE: &str = "navi.env";
+
+/// Set `key=value` in the `navi.env` beside `config_path`: update an existing
+/// entry (preserving comments and every other line) or append a new one. Creates
+/// the file (chmod 600 on unix) if missing. Idempotent and re-runnable.
+pub fn upsert(config_path: &Path, key: &str, value: &str) -> Result<()> {
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent directory"))?;
+    std::fs::create_dir_all(dir).ok();
+    let path = dir.join(ENV_FILE);
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let contents = upsert_line(&existing, key, value);
+
+    // Write through an owner-only temp file, then rename into place. The token is
+    // never briefly world-readable the way a fresh `fs::write` under a 0644 umask
+    // would leave it, and a crash mid-write can't truncate the existing file.
+    let mut tmp = NamedTempFile::new_in(dir)
+        .with_context(|| format!("creating temp file in {}", dir.display()))?;
+    set_owner_only(tmp.path());
+    tmp.write_all(contents.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))?;
+    tmp.persist(&path)
+        .with_context(|| format!("replacing {}", path.display()))?;
+    Ok(())
+}
+
+/// Pure core of [`upsert`]: return the file text with `key=value` updated in
+/// place, or appended if absent.
+fn upsert_line(existing: &str, key: &str, value: &str) -> String {
+    let new_line = format!("{key}={value}");
+    let mut replaced = false;
+    let mut lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            let trimmed = line.trim_start();
+            if !trimmed.starts_with('#') {
+                if let Some((k, _)) = trimmed.split_once('=') {
+                    if k.trim() == key {
+                        replaced = true;
+                        return new_line.clone();
+                    }
+                }
+            }
+            line.to_string()
+        })
+        .collect();
+    if !replaced {
+        lines.push(new_line);
+    }
+    let mut out = lines.join("\n");
+    out.push('\n');
+    out
+}
+
+#[cfg(unix)]
+fn set_owner_only(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+}
+
+#[cfg(not(unix))]
+fn set_owner_only(_path: &Path) {}
 
 /// Load the `navi.env` beside `config_path` into the process environment,
 /// overriding any variables already set (the file is authoritative). A missing
@@ -149,8 +214,44 @@ no_equals_here\n\
     }
 
     #[test]
+    fn upsert_line_updates_or_appends_preserving_others() {
+        let existing = "# creds\nNAVI_GITHUB_TOKEN=old\nNAVI_SLACK_TOKEN=xoxb\n";
+        // Existing key is updated; comments and other entries survive.
+        let out = upsert_line(existing, "NAVI_GITHUB_TOKEN", "new");
+        assert!(out.contains("# creds"));
+        assert!(out.contains("NAVI_GITHUB_TOKEN=new"));
+        assert!(!out.contains("NAVI_GITHUB_TOKEN=old"));
+        assert!(out.contains("NAVI_SLACK_TOKEN=xoxb"));
+        // A new key is appended, leaving the rest intact.
+        let out2 = upsert_line(existing, "NAVI_DISCORD_TOKEN", "bot");
+        assert!(out2.contains("NAVI_GITHUB_TOKEN=old"));
+        assert!(out2.contains("NAVI_DISCORD_TOKEN=bot"));
+        // Empty input yields just the one line.
+        assert_eq!(upsert_line("", "K", "v"), "K=v\n");
+    }
+
+    #[test]
     fn load_missing_file_is_noop() {
         let dir = tempfile::tempdir().unwrap();
         load_beside_config(&dir.path().join("config.toml"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn upsert_creates_the_file_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = dir.path().join("config.toml");
+        upsert(&cfg, "NAVI_GITHUB_TOKEN", "ghp_secret").unwrap();
+        let env_path = dir.path().join(ENV_FILE);
+        let mode = std::fs::metadata(&env_path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "the token file must never be readable by others"
+        );
+        assert!(std::fs::read_to_string(&env_path)
+            .unwrap()
+            .contains("NAVI_GITHUB_TOKEN=ghp_secret"));
     }
 }

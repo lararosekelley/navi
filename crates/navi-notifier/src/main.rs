@@ -8,6 +8,7 @@ mod config;
 mod config_cmd;
 mod doctor;
 mod envfile;
+mod guided;
 mod logs;
 mod prompt;
 mod providers;
@@ -44,7 +45,7 @@ fn main() -> Result<()> {
 
     // Load navi.env before starting the async runtime, so populating the process
     // environment happens while we're still single-threaded (set_var is not safe
-    // to call once the runtime's worker threads are up). Only fills unset vars.
+    // to call once the runtime's worker threads are up). navi.env is authoritative.
     envfile::load_beside_config(&config_path);
 
     // `logs` (especially --follow) is a long-running synchronous tail; run it
@@ -277,10 +278,7 @@ fn cmd_init(path: &Path, force: bool) -> Result<()> {
     std::fs::write(path, starter_config())
         .with_context(|| format!("writing config to {}", path.display()))?;
     println!("Wrote starter config to {}", path.display());
-    println!(
-        "Next: set your source and destination tokens (e.g. NAVI_GITHUB_TOKEN, NAVI_SLACK_TOKEN)."
-    );
-    println!("Then verify with `navi test-slack`, or run once with `navi once --dry-run`.");
+    guided::opt_in(path)?;
     service::offer_after_init(path)?;
     Ok(())
 }
@@ -307,8 +305,10 @@ utc_offset_minutes = 0
 # settles to its final text first. Costs up to this much delay on comment alerts.
 comment_min_age_secs = 0
 
+# Every provider starts disabled. `navi init` walks you through enabling the ones
+# you want; or flip one yourself, e.g. `navi config set github.enabled true`.
 [github]
-enabled = true
+enabled = false
 # Env var holding a GitHub PAT with `notifications` + `repo` (read) scope.
 token_env = "NAVI_GITHUB_TOKEN"
 # For GitHub Enterprise Server, set api_base = "https://ghe.example.com/api/v3"
@@ -334,7 +334,7 @@ token_env = "NAVI_GITEA_TOKEN"
 # For your instance, set api_base = "https://gitea.example.com/api/v1"
 
 [slack]
-enabled = true
+enabled = false
 # Env var holding a Slack bot token (xoxb-...). Needs chat:write + im:write.
 token_env = "NAVI_SLACK_TOKEN"
 # "self" DMs whoever the token authenticates as; or set a Slack user id like "U0123".

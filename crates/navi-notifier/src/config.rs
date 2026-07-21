@@ -106,7 +106,7 @@ pub struct GitHubConfig {
 impl Default for GitHubConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             token_env: "NAVI_GITHUB_TOKEN".into(),
             token: None,
             track_prs: true,
@@ -175,7 +175,7 @@ pub struct SlackConfig {
 impl Default for SlackConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             token_env: "NAVI_SLACK_TOKEN".into(),
             token: None,
             dm_to: "self".into(),
@@ -355,4 +355,20 @@ pub fn resolve_state_path() -> Result<PathBuf> {
     let dirs = directories::ProjectDirs::from("dev", "navi", "navi")
         .ok_or_else(|| anyhow!("could not determine a data directory for this platform"))?;
     Ok(dirs.data_dir().join("navi.sqlite3"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_providers_default_to_disabled() {
+        // #12: nothing is on until the user (or `navi init`) opts in.
+        assert!(!GitHubConfig::default().enabled);
+        assert!(!GitLabConfig::default().enabled);
+        assert!(!GiteaConfig::default().enabled);
+        assert!(!SlackConfig::default().enabled);
+        assert!(!DiscordConfig::default().enabled);
+        assert!(!EmailConfig::default().enabled);
+    }
 }
