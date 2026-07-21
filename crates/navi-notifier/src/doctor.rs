@@ -73,6 +73,7 @@ async fn check_github(config: &Config) {
         api_base: config.github.api_base.clone(),
         track_prs: config.github.track_prs,
         mark_read: false,
+        comment_min_age_secs: 0,
     }) {
         Ok(s) => s,
         Err(e) => {

@@ -27,6 +27,8 @@ pub struct GiteaSourceConfig {
     pub token: String,
     /// API base, e.g. `https://gitea.example.com/api/v1` (or a Forgejo instance).
     pub api_base: Option<String>,
+    /// Hold a comment back until it is at least this many seconds old (0 = off).
+    pub comment_min_age_secs: u64,
 }
 
 pub struct GiteaSource {
@@ -37,6 +39,8 @@ pub struct GiteaSource {
     /// scope (`owner/repo#n`) -> serialized new snapshot, deferred during a poll and
     /// flushed by `commit_snapshots` only for PRs whose delivery didn't fail.
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
+    /// Min comment age before notifying (`None` = off), passed through to the diff.
+    comment_min_age: Option<Duration>,
 }
 
 impl GiteaSource {
@@ -58,6 +62,8 @@ impl GiteaSource {
                 .unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
             viewer: OnceCell::new(),
             pending_snapshots: Mutex::new(HashMap::new()),
+            comment_min_age: (config.comment_min_age_secs > 0)
+                .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
         })
     }
 
@@ -208,6 +214,7 @@ impl Source for GiteaSource {
                 first_sight_since: first_sight_watermark(n.updated_at.as_deref()),
                 // Gitea team review requests aren't modelled yet.
                 viewer_teams: std::collections::HashSet::new(),
+                comment_min_age: self.comment_min_age,
             };
             let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
 

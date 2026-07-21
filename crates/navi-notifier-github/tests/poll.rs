@@ -61,6 +61,7 @@ fn source_with(server: &MockServer, track_prs: bool) -> GitHubSource {
         api_base: Some(server.uri()),
         track_prs,
         mark_read: false,
+        comment_min_age_secs: 0,
     })
     .expect("build source")
 }
@@ -71,6 +72,7 @@ fn source_marks_read(server: &MockServer) -> GitHubSource {
         api_base: Some(server.uri()),
         track_prs: false,
         mark_read: true,
+        comment_min_age_secs: 0,
     })
     .expect("build source")
 }

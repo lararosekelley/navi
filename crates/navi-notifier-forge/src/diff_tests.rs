@@ -25,6 +25,7 @@ fn ctx() -> DiffContext {
         now: OffsetDateTime::UNIX_EPOCH,
         first_sight_since: None,
         viewer_teams: std::collections::HashSet::new(),
+        comment_min_age: None,
     }
 }
 
@@ -389,4 +390,54 @@ fn mentions_respects_boundaries() {
     assert!(!mentions("email me@host.com", "me")); // preceded by alnum
     assert!(!mentions("hi @mentor", "me")); // longer username
     assert!(!mentions("nothing here", "me"));
+}
+
+#[test]
+fn comment_min_age_holds_fresh_comments() {
+    use time::format_description::well_known::Rfc3339;
+
+    // A PR you authored, with a reply from someone else (surfaces as CommentReply).
+    let mut pr = base_pr();
+    pr.user = Some(user(VIEWER));
+    let mut d = data(pr);
+    d.issue_comments = vec![icomment_at(2, "someoneelse", "just replied", "2024-01-02T03:04:05Z")];
+
+    let min_age = Some(time::Duration::seconds(60));
+    let held_now = OffsetDateTime::parse("2024-01-02T03:04:35Z", &Rfc3339).unwrap(); // +30s
+    let settled_now = OffsetDateTime::parse("2024-01-02T03:06:05Z", &Rfc3339).unwrap(); // +120s
+
+    // Too fresh: held back, and left unseen so it re-derives next poll.
+    let cx = DiffContext {
+        now: held_now,
+        comment_min_age: min_age,
+        ..ctx()
+    };
+    let (events, snap) = diff(&cx, &d, &initialized());
+    assert!(events.is_empty(), "fresh comment should be held: {:?}", kinds(&events));
+    assert!(
+        !snap.seen_issue_comments.contains(&2),
+        "a held comment must stay unseen so it re-derives once settled"
+    );
+
+    // Settled: emitted and now recorded as seen.
+    let cx = DiffContext {
+        now: settled_now,
+        comment_min_age: min_age,
+        ..ctx()
+    };
+    let (events, snap) = diff(&cx, &d, &initialized());
+    assert_eq!(
+        kinds(&events),
+        vec![&EventKind::CommentReply { on_your_comment: false }]
+    );
+    assert!(snap.seen_issue_comments.contains(&2));
+
+    // Disabled (None): emitted even when fresh - the default, no behavior change.
+    let cx = DiffContext {
+        now: held_now,
+        comment_min_age: None,
+        ..ctx()
+    };
+    let (events, _) = diff(&cx, &d, &initialized());
+    assert_eq!(events.len(), 1, "min-age off must not hold anything");
 }

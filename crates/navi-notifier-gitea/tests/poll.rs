@@ -63,6 +63,7 @@ async fn poll_emits_outstanding_review_request() {
     let source = GiteaSource::new(GiteaSourceConfig {
         token: "test-token".into(),
         api_base: Some(server.uri()),
+        comment_min_age_secs: 0,
     })
     .expect("build");
 

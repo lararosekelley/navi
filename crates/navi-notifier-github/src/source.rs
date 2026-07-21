@@ -63,6 +63,9 @@ pub struct GitHubSourceConfig {
     pub track_prs: bool,
     /// Mark a notification thread read once its event has been delivered.
     pub mark_read: bool,
+    /// Hold a comment back until it is at least this many seconds old (0 = off), so
+    /// edit-in-place bots resolve to their final text before we notify.
+    pub comment_min_age_secs: u64,
 }
 
 pub struct GitHubSource {
@@ -78,6 +81,8 @@ pub struct GitHubSource {
     /// flushed by `commit_snapshots` only for PRs whose delivery didn't fail, so a
     /// failed send can't advance state past an undelivered event.
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
+    /// Min comment age before notifying (`None` = off), passed through to the diff.
+    comment_min_age: Option<Duration>,
 }
 
 impl GitHubSource {
@@ -103,6 +108,8 @@ impl GitHubSource {
             mark_read: config.mark_read,
             threads: Mutex::new(HashMap::new()),
             pending_snapshots: Mutex::new(HashMap::new()),
+            comment_min_age: (config.comment_min_age_secs > 0)
+                .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
         })
     }
 
@@ -299,6 +306,7 @@ impl GitHubSource {
             now,
             first_sight_since,
             viewer_teams: viewer_teams.clone(),
+            comment_min_age: self.comment_min_age,
         };
         let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
         let bytes = serde_json::to_vec(&new_snapshot)

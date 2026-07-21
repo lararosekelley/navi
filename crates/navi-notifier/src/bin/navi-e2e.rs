@@ -54,6 +54,7 @@ async fn run() -> Result<(), String> {
         // Keep this smoke test scoped to the notifications path.
         track_prs: false,
         mark_read: false,
+        comment_min_age_secs: 0,
     })
     .map_err(|e| format!("building GitHub source: {e}"))?;
     let state = MemState::default();
