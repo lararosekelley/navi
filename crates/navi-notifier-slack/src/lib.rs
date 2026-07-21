@@ -61,7 +61,7 @@ impl SlackDestination {
         })
     }
 
-    /// Verify credentials and return the authenticated identity string (for `test-slack`).
+    /// Verify credentials and return the authenticated identity string.
     pub async fn verify(&self) -> Result<String, DestinationError> {
         let resp: AuthTest = self.call("auth.test", &json!({})).await?;
         Ok(format!(

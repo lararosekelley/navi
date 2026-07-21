@@ -13,6 +13,7 @@ mod prompt;
 mod service;
 mod setup;
 mod state;
+mod test_cmd;
 mod upgrade;
 mod wiring;
 
@@ -21,9 +22,6 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use navi_notifier_core::model::{
-    Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
-};
 use navi_notifier_core::{Engine, EventOutcome, FilterContext, RunReport};
 use time::OffsetDateTime;
 use tracing::{info, warn};
@@ -67,7 +65,10 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Init { force } => cmd_init(&config_path, force),
         Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
         Command::Run => cmd_run(&config_path).await,
-        Command::TestSlack => cmd_test_slack(&config_path).await,
+        Command::Test {
+            source,
+            destination,
+        } => cmd_test(&config_path, source, destination).await,
         Command::Doctor => cmd_doctor(&config_path).await,
         Command::Config { action } => match action {
             ConfigAction::Get { key } => config_cmd::get(&config_path, &key),
@@ -183,25 +184,13 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     Ok(())
 }
 
-async fn cmd_test_slack(config_path: &Path) -> Result<()> {
+async fn cmd_test(
+    config_path: &Path,
+    source: Option<String>,
+    destination: Option<String>,
+) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let destination = wiring::build_slack(&config.slack)?;
-    let who = destination
-        .verify()
-        .await
-        .context("verifying Slack credentials (auth.test)")?;
-    println!("Authenticated with Slack as {who}");
-
-    use navi_notifier_core::traits::Destination;
-    destination
-        .send(&sample_event())
-        .await
-        .context("sending sample message")?;
-    println!(
-        "Sent a sample message to your configured Slack target ({}).",
-        config.slack.dm_to
-    );
-    Ok(())
+    test_cmd::run(&config, source, destination).await
 }
 
 async fn cmd_doctor(config_path: &Path) -> Result<()> {
@@ -262,34 +251,6 @@ async fn shutdown_signal() {
     tokio::select! {
         _ = ctrl_c => {}
         _ = terminate => {}
-    }
-}
-
-/// A representative event used by `test-slack` to exercise rendering + delivery.
-fn sample_event() -> Event {
-    Event {
-        source_id: "github".into(),
-        kind: EventKind::ReviewSubmitted {
-            state: ReviewState::ChangesRequested,
-        },
-        pull_request: PullRequest {
-            repo: Repo::new("acme", "widgets"),
-            number: 42,
-            title: "navi test message".into(),
-            url: "https://github.com/acme/widgets/pull/42".into(),
-            author: Actor::new("you"),
-            draft: false,
-        },
-        viewer: ViewerRelationship {
-            is_author: true,
-            is_reviewer: false,
-            actor_is_viewer: false,
-        },
-        actor: Actor::new("navi"),
-        occurred_at: OffsetDateTime::now_utc(),
-        target_url: Some("https://github.com/acme/widgets/pull/42".into()),
-        excerpt: Some("If you can read this, navi can DM you. 🎉".into()),
-        dedup_key: "navi:test-slack".into(),
     }
 }
 
