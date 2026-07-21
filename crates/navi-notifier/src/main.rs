@@ -318,6 +318,10 @@ log_level = "info"
 # Offset from UTC in minutes, used only for quiet-hours evaluation.
 # e.g. -420 = US Pacific (PDT), 60 = Central Europe.
 utc_offset_minutes = 0
+# Hold a comment this many seconds before notifying (0 = off), so a bot that posts
+# a placeholder and edits it in place (e.g. "Claude Code is working…" → the review)
+# settles to its final text first. Costs up to this much delay on comment alerts.
+comment_min_age_secs = 0
 
 [github]
 enabled = true

@@ -38,6 +38,12 @@ pub struct General {
     /// (e.g. `-420` for US Pacific, `60` for CET). Determining the OS local offset
     /// reliably inside a multithreaded runtime is unsound, so we take it explicitly.
     pub utc_offset_minutes: i32,
+    /// Hold a comment back until it is at least this many seconds old before
+    /// notifying (0 = off). Lets a bot that posts a placeholder comment and edits it
+    /// in place (e.g. "working…" → the finished review) settle to its final text so
+    /// you get one accurate alert instead of the transient one. Costs up to this
+    /// much delay on comment alerts.
+    pub comment_min_age_secs: u64,
 }
 
 impl Default for General {
@@ -46,6 +52,7 @@ impl Default for General {
             poll_interval_secs: 60,
             log_level: "info".into(),
             utc_offset_minutes: 0,
+            comment_min_age_secs: 0,
         }
     }
 }

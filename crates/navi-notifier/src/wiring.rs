@@ -25,6 +25,7 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
             api_base: config.github.api_base.clone(),
             track_prs: config.github.track_prs,
             mark_read: config.github.mark_read,
+            comment_min_age_secs: config.general.comment_min_age_secs,
         })
         .context("initializing GitHub source")?;
         sources.push(Arc::new(source));
@@ -41,6 +42,7 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
         let source = GiteaSource::new(GiteaSourceConfig {
             token: config.gitea.resolve_token()?,
             api_base: config.gitea.api_base.clone(),
+            comment_min_age_secs: config.general.comment_min_age_secs,
         })
         .context("initializing Gitea source")?;
         sources.push(Arc::new(source));

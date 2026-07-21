@@ -48,6 +48,10 @@ pub struct DiffContext {
     /// requested from a team you're in counts as a request to you. Empty for
     /// providers without team review requests.
     pub viewer_teams: HashSet<String>,
+    /// Hold a comment back until it is at least this old, so a bot that posts a
+    /// placeholder and edits it in place resolves to its final text before we
+    /// notify. `None` disables the hold (emit as soon as seen).
+    pub comment_min_age: Option<time::Duration>,
 }
 
 /// Key a team by its org and slug so a "reviewers" team in one org never matches
@@ -108,7 +112,14 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         actor_is_viewer: false,
     };
 
-    let new_snapshot = build_snapshot(data, viewer, viewer_requested_now, old);
+    let new_snapshot = build_snapshot(
+        data,
+        viewer,
+        viewer_requested_now,
+        old,
+        ctx.now,
+        ctx.comment_min_age,
+    );
 
     let mut events = Vec::new();
     let mut emit = |kind: EventKind,
@@ -216,6 +227,10 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         if eq_login(author, viewer) {
             continue;
         }
+        // Hold a too-fresh comment; it stays unseen and re-derives once settled.
+        if !is_settled(c.created_at.as_deref(), ctx.now, ctx.comment_min_age) {
+            continue;
+        }
         let root = c.in_reply_to_id.unwrap_or(c.id);
         let on_your_comment = c
             .in_reply_to_id
@@ -257,6 +272,10 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
         }
         let author = c.user.as_ref().map(|u| u.login.as_str()).unwrap_or("ghost");
         if eq_login(author, viewer) {
+            continue;
+        }
+        // Hold a too-fresh comment; it stays unseen and re-derives once settled.
+        if !is_settled(c.created_at.as_deref(), ctx.now, ctx.comment_min_age) {
             continue;
         }
         if mentions(&c.body, viewer) {
@@ -343,6 +362,23 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     (events, new_snapshot)
 }
 
+/// Whether a comment is old enough to notify about, given the optional min-age
+/// hold. A missing or unparseable timestamp counts as settled, so bad data never
+/// holds a comment back forever.
+fn is_settled(
+    created_at: Option<&str>,
+    now: OffsetDateTime,
+    min_age: Option<time::Duration>,
+) -> bool {
+    let Some(min_age) = min_age else {
+        return true;
+    };
+    let Some(created) = created_at.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()) else {
+        return true;
+    };
+    now - created >= min_age
+}
+
 /// Compute the snapshot to persist after this poll. `viewer_requested_now` is
 /// threaded in (rather than recomputed) so it accounts for team requests too.
 fn build_snapshot(
@@ -350,6 +386,8 @@ fn build_snapshot(
     viewer: &str,
     viewer_requested_now: bool,
     old: &PrSnapshot,
+    now: OffsetDateTime,
+    comment_min_age: Option<time::Duration>,
 ) -> PrSnapshot {
     let pr = &data.pull_request;
     PrSnapshot {
@@ -358,8 +396,20 @@ fn build_snapshot(
             .iter()
             .map(|r| (r.id, r.state.clone()))
             .collect(),
-        seen_review_comments: data.review_comments.iter().map(|c| c.id).collect(),
-        seen_issue_comments: data.issue_comments.iter().map(|c| c.id).collect(),
+        // A held (not-yet-settled) comment is intentionally left unseen so it is
+        // re-evaluated next poll, by which point its edits have landed.
+        seen_review_comments: data
+            .review_comments
+            .iter()
+            .filter(|c| is_settled(c.created_at.as_deref(), now, comment_min_age))
+            .map(|c| c.id)
+            .collect(),
+        seen_issue_comments: data
+            .issue_comments
+            .iter()
+            .filter(|c| is_settled(c.created_at.as_deref(), now, comment_min_age))
+            .map(|c| c.id)
+            .collect(),
         viewer_requested: viewer_requested_now,
         viewer_reviewed: old.viewer_reviewed
             || data.reviews.iter().any(|r| {
