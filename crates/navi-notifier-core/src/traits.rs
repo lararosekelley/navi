@@ -5,6 +5,8 @@
 //! together through the registry, so adding GitLab or Discord is "implement a trait,
 //! register a constructor" with no engine changes.
 
+use std::collections::HashSet;
+
 use async_trait::async_trait;
 
 use crate::error::{DestinationError, SourceError, StateError};
@@ -62,6 +64,23 @@ pub trait Source: Send + Sync {
     /// the source advance provider-side state (e.g. mark a notification thread read).
     /// Default: no-op.
     async fn commit(&self, _state: &dyn StateStore, _event: &Event) -> Result<(), SourceError> {
+        Ok(())
+    }
+
+    /// Called once per poll after all of its events have been processed, with the
+    /// set of scopes ([`Event::scope`], e.g. `owner/repo#12`) that had at least one
+    /// delivery failure this pass. A source that defers snapshot persistence during
+    /// [`Source::poll`] should flush it here for every deferred scope **not** in
+    /// `failed_scopes` — so a delivery failure leaves the prior snapshot in place and
+    /// the event re-derives next poll, while the dedup set stops anything that did
+    /// send from sending twice. This is what makes delivery exactly-once rather than
+    /// at-most-once. Skipped on dry runs. Default: no-op (for sources that don't
+    /// defer, e.g. cursor-only ones).
+    async fn commit_snapshots(
+        &self,
+        _state: &dyn StateStore,
+        _failed_scopes: &HashSet<String>,
+    ) -> Result<(), SourceError> {
         Ok(())
     }
 }

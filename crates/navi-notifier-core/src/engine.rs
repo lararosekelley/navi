@@ -5,6 +5,7 @@
 //! [`Destination`], [`StateStore`], and [`Event`]. The daemon layer owns scheduling;
 //! this owns a single pass ([`Engine::run_once`]).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
@@ -127,12 +128,31 @@ impl Engine {
             debug!(source = source.id(), count = events.len(), "polled events");
             let targets = self.destinations_for(source.id());
 
+            let mut source_records = Vec::new();
             for event in events {
                 let record = self
                     .process_event(source.as_ref(), &targets, event, &ctx, dry_run)
                     .await;
-                report.records.push(record);
+                source_records.push(record);
             }
+
+            // Flush the source's deferred per-PR snapshots, holding back any PR that
+            // had a delivery failure so its events re-derive next pass (dedup stops
+            // the ones that did send from re-sending). A dry run persists nothing.
+            if !dry_run {
+                let failed_scopes: HashSet<String> = source_records
+                    .iter()
+                    .filter(|r| matches!(r.outcome, EventOutcome::DeliveryFailed { .. }))
+                    .map(|r| r.event.scope())
+                    .collect();
+                if let Err(err) = source
+                    .commit_snapshots(self.state.as_ref(), &failed_scopes)
+                    .await
+                {
+                    warn!(source = source.id(), %err, "committing snapshots failed");
+                }
+            }
+            report.records.extend(source_records);
         }
 
         info!(
@@ -310,8 +330,11 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
     struct MockSource {
         events: Vec<Event>,
+        /// Records the `failed_scopes` each `commit_snapshots` call received.
+        committed: Mutex<Vec<HashSet<String>>>,
     }
     #[async_trait]
     impl Source for MockSource {
@@ -320,6 +343,14 @@ mod tests {
         }
         async fn poll(&self, _state: &dyn StateStore) -> Result<Vec<Event>, SourceError> {
             Ok(self.events.clone())
+        }
+        async fn commit_snapshots(
+            &self,
+            _state: &dyn StateStore,
+            failed_scopes: &HashSet<String>,
+        ) -> Result<(), SourceError> {
+            self.committed.lock().unwrap().push(failed_scopes.clone());
+            Ok(())
         }
     }
 
@@ -370,7 +401,10 @@ mod tests {
     ) -> (Engine, Arc<MemState>) {
         let state = Arc::new(MemState::default());
         let engine = Engine::new(
-            vec![Arc::new(MockSource { events })],
+            vec![Arc::new(MockSource {
+                events,
+                ..Default::default()
+            })],
             vec![destination],
             vec![],
             RuleEngine::new(rules).expect("valid test rules"),
@@ -440,6 +474,74 @@ mod tests {
         assert!(destination.sent.lock().unwrap().is_empty());
         // Not marked delivered → a real run afterwards would still deliver.
         assert!(!state.was_delivered("k1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn commit_snapshots_holds_back_only_failed_scopes() {
+        // A clean delivery: commit_snapshots runs with no failed scopes, so the
+        // source is free to persist everything it deferred.
+        let ok = Arc::new(MockSource {
+            events: vec![ev(EventKind::Mentioned, "k1")],
+            ..Default::default()
+        });
+        let engine = Engine::new(
+            vec![ok.clone()],
+            vec![Arc::new(MockDestination::default())],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        let calls = ok.committed.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(
+            calls[0].is_empty(),
+            "clean run should report no failed scopes"
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_snapshots_reports_the_failed_pr_scope() {
+        // A failed delivery: the event's PR scope must be reported so the source
+        // holds its snapshot back and the event re-derives next pass.
+        let src = Arc::new(MockSource {
+            events: vec![ev(EventKind::Mentioned, "k1")],
+            ..Default::default()
+        });
+        let engine = Engine::new(
+            vec![src.clone()],
+            vec![Arc::new(MockDestination {
+                fail: true,
+                ..Default::default()
+            })],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        let calls = src.committed.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].contains("acme/widgets#1"), "got {:?}", calls[0]);
+    }
+
+    #[tokio::test]
+    async fn dry_run_does_not_commit_snapshots() {
+        let src = Arc::new(MockSource {
+            events: vec![ev(EventKind::Mentioned, "k1")],
+            ..Default::default()
+        });
+        let engine = Engine::new(
+            vec![src.clone()],
+            vec![Arc::new(MockDestination::default())],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), true).await;
+        assert!(
+            src.committed.lock().unwrap().is_empty(),
+            "dry run must not flush snapshots"
+        );
     }
 
     #[tokio::test]
