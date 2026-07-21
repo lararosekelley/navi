@@ -35,9 +35,16 @@ pub enum Decision {
     Drop(DropReason),
 }
 
-/// A mute rule compiled once when the engine is built.
+/// A mute rule compiled once when the engine is built: one or more conditions, all
+/// of which must match (AND) for the rule to fire.
 #[derive(Debug, Clone)]
 struct CompiledMute {
+    conditions: Vec<CompiledCondition>,
+}
+
+/// One field/matcher pair within a rule.
+#[derive(Debug, Clone)]
+struct CompiledCondition {
     field: MuteField,
     matcher: Matcher,
 }
@@ -51,6 +58,12 @@ enum Matcher {
 
 impl CompiledMute {
     fn matches(&self, event: &Event) -> bool {
+        self.conditions.iter().all(|c| c.matches(event))
+    }
+}
+
+impl CompiledCondition {
+    fn matches(&self, event: &Event) -> bool {
         let hay = match self.field {
             MuteField::Author => event.actor.login.as_str(),
             MuteField::Title => event.pull_request.title.as_str(),
@@ -63,37 +76,105 @@ impl CompiledMute {
     }
 }
 
-/// A mute rule that didn't compile (bad regex). Surfaced at engine-build time so
-/// the user fixes their config instead of it silently never matching.
+/// A mute rule that couldn't be compiled. Surfaced at engine-build time so the user
+/// fixes their config instead of it silently never (or always) matching.
 #[derive(Debug)]
-pub struct InvalidMutePattern {
-    pub pattern: String,
-    pub source: regex::Error,
+pub enum InvalidMutePattern {
+    /// A pattern failed to compile as a regex.
+    Regex {
+        pattern: String,
+        source: regex::Error,
+    },
+    /// `match` was given without `pattern` (or vice versa).
+    IncompleteMatch,
+    /// `regex = true` set on a rule with no `match`/`pattern` - the top-level flag
+    /// only applies to that form; flat fields use their own `<field>_regex`.
+    RegexWithoutMatch,
+    /// A rule with no conditions - it would match everything and mute the feed.
+    Empty,
 }
 
 impl std::fmt::Display for InvalidMutePattern {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "invalid mute regex `{}`: {}", self.pattern, self.source)
+        match self {
+            Self::Regex { pattern, source } => {
+                write!(f, "invalid mute regex `{pattern}`: {source}")
+            }
+            Self::IncompleteMatch => {
+                write!(f, "a mute rule sets `match` without `pattern` (or vice versa)")
+            }
+            Self::RegexWithoutMatch => write!(
+                f,
+                "`regex = true` needs a `match`/`pattern`; for flat fields use author_regex/title_regex/excerpt_regex"
+            ),
+            Self::Empty => write!(
+                f,
+                "a mute rule has no conditions; set `match`/`pattern` or an author/title/excerpt field"
+            ),
+        }
     }
 }
 
 impl std::error::Error for InvalidMutePattern {}
 
-fn compile_mute(rule: &MuteRule) -> Result<CompiledMute, InvalidMutePattern> {
-    let matcher = if rule.regex {
+fn compile_condition(
+    field: MuteField,
+    pattern: &str,
+    regex: bool,
+) -> Result<CompiledCondition, InvalidMutePattern> {
+    let matcher = if regex {
         Matcher::Regex(
-            regex::Regex::new(&rule.pattern).map_err(|source| InvalidMutePattern {
-                pattern: rule.pattern.clone(),
+            regex::Regex::new(pattern).map_err(|source| InvalidMutePattern::Regex {
+                pattern: pattern.to_string(),
                 source,
             })?,
         )
     } else {
-        Matcher::Substring(rule.pattern.to_ascii_lowercase())
+        Matcher::Substring(pattern.to_ascii_lowercase())
     };
-    Ok(CompiledMute {
-        field: rule.field,
-        matcher,
-    })
+    Ok(CompiledCondition { field, matcher })
+}
+
+fn compile_mute(rule: &MuteRule) -> Result<CompiledMute, InvalidMutePattern> {
+    let mut conditions = Vec::new();
+    match (rule.field, rule.pattern.as_deref()) {
+        (Some(field), Some(pattern)) => {
+            conditions.push(compile_condition(field, pattern, rule.regex)?)
+        }
+        (None, None) => {
+            // `regex` only wires into match/pattern; a lone `regex = true` on a
+            // flat rule would silently do nothing, so reject it.
+            if rule.regex {
+                return Err(InvalidMutePattern::RegexWithoutMatch);
+            }
+        }
+        _ => return Err(InvalidMutePattern::IncompleteMatch),
+    }
+    if let Some(pattern) = rule.author.as_deref() {
+        conditions.push(compile_condition(
+            MuteField::Author,
+            pattern,
+            rule.author_regex,
+        )?);
+    }
+    if let Some(pattern) = rule.title.as_deref() {
+        conditions.push(compile_condition(
+            MuteField::Title,
+            pattern,
+            rule.title_regex,
+        )?);
+    }
+    if let Some(pattern) = rule.excerpt.as_deref() {
+        conditions.push(compile_condition(
+            MuteField::Excerpt,
+            pattern,
+            rule.excerpt_regex,
+        )?);
+    }
+    if conditions.is_empty() {
+        return Err(InvalidMutePattern::Empty);
+    }
+    Ok(CompiledMute { conditions })
 }
 
 /// Applies [`RuleConfig`] to events.
@@ -251,10 +332,18 @@ mod tests {
     fn mute(field: MuteField, pattern: &str, regex: bool) -> RuleConfig {
         RuleConfig {
             mute: vec![MuteRule {
-                field,
-                pattern: pattern.into(),
+                field: Some(field),
+                pattern: Some(pattern.into()),
                 regex,
+                ..Default::default()
             }],
+            ..Default::default()
+        }
+    }
+
+    fn mute_rules(rules: Vec<MuteRule>) -> RuleConfig {
+        RuleConfig {
+            mute: rules,
             ..Default::default()
         }
     }
@@ -326,6 +415,86 @@ mod tests {
     #[test]
     fn bad_mute_regex_is_a_config_error() {
         assert!(RuleEngine::new(mute(MuteField::Title, "(unclosed", true)).is_err());
+    }
+
+    #[test]
+    fn multi_condition_rule_requires_all_to_match() {
+        // Mute the bot's CI chatter only: author AND excerpt must both match.
+        let engine = RuleEngine::new(mute_rules(vec![MuteRule {
+            author: Some("github-actions[bot]".into()),
+            excerpt: Some("CircleCI pipeline triggered".into()),
+            ..Default::default()
+        }]))
+        .unwrap();
+
+        let mut bot_ci = event(EventKind::Mentioned);
+        bot_ci.actor = Actor::new("github-actions[bot]");
+        bot_ci.excerpt = Some("CircleCI pipeline triggered for abc123".into());
+        assert_eq!(
+            engine.decide(&bot_ci, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+
+        // Same author, different text → not muted (the AND fails).
+        let mut bot_review = event(EventKind::Mentioned);
+        bot_review.actor = Actor::new("github-actions[bot]");
+        bot_review.excerpt = Some("Claude finished the review".into());
+        assert_eq!(
+            engine.decide(&bot_review, &FilterContext::default()),
+            Decision::Deliver
+        );
+
+        // Matching text from a human → not muted (author condition fails).
+        let mut human = event(EventKind::Mentioned);
+        human.actor = Actor::new("lara");
+        human.excerpt = Some("CircleCI pipeline triggered, fyi".into());
+        assert_eq!(
+            engine.decide(&human, &FilterContext::default()),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn per_field_regex_flag_applies() {
+        let engine = RuleEngine::new(mute_rules(vec![MuteRule {
+            author: Some(r"\[bot\]$".into()),
+            author_regex: true,
+            ..Default::default()
+        }]))
+        .unwrap();
+        let mut bot = event(EventKind::Mentioned);
+        bot.actor = Actor::new("dependabot[bot]");
+        assert_eq!(
+            engine.decide(&bot, &FilterContext::default()),
+            Decision::Drop(DropReason::Muted)
+        );
+    }
+
+    #[test]
+    fn empty_mute_rule_is_a_config_error() {
+        // A rule with no conditions would match everything; reject it at build time.
+        assert!(RuleEngine::new(mute_rules(vec![MuteRule::default()])).is_err());
+    }
+
+    #[test]
+    fn match_without_pattern_is_a_config_error() {
+        assert!(RuleEngine::new(mute_rules(vec![MuteRule {
+            field: Some(MuteField::Title),
+            ..Default::default()
+        }]))
+        .is_err());
+    }
+
+    #[test]
+    fn top_level_regex_on_a_flat_rule_is_a_config_error() {
+        // `regex = true` only applies to match/pattern; on a flat rule it would
+        // silently do nothing (flat fields use `<field>_regex`), so reject it.
+        assert!(RuleEngine::new(mute_rules(vec![MuteRule {
+            author: Some(".*bot.*".into()),
+            regex: true,
+            ..Default::default()
+        }]))
+        .is_err());
     }
 
     #[test]
