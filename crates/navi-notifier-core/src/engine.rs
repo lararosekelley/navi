@@ -287,7 +287,7 @@ impl Engine {
         let mut errors = Vec::new();
         let mut delivered_to = Vec::new();
         for destination in targets {
-            match destination.send(&event).await {
+            match destination.send(&event, self.state.as_ref()).await {
                 Ok(()) => delivered_to.push(destination.id().to_string()),
                 Err(err) => {
                     error!(destination = destination.id(), %err, "delivery failed");
@@ -365,7 +365,7 @@ impl Engine {
             if batch.is_empty() {
                 continue;
             }
-            if let Err(err) = dest.send_digest(&batch).await {
+            if let Err(err) = dest.send_digest(&batch, self.state.as_ref()).await {
                 error!(destination = dest.id(), %err, "digest flush failed");
                 all_ok = false;
             }
@@ -500,14 +500,22 @@ mod tests {
                 &self.id
             }
         }
-        async fn send(&self, event: &Event) -> Result<(), DestinationError> {
+        async fn send(
+            &self,
+            event: &Event,
+            _state: &dyn StateStore,
+        ) -> Result<(), DestinationError> {
             if self.fail {
                 return Err(DestinationError::Delivery("boom".into()));
             }
             self.sent.lock().unwrap().push(event.dedup_key.clone());
             Ok(())
         }
-        async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+        async fn send_digest(
+            &self,
+            events: &[Event],
+            _state: &dyn StateStore,
+        ) -> Result<(), DestinationError> {
             if self.fail {
                 return Err(DestinationError::Delivery("boom".into()));
             }

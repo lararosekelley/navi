@@ -9,7 +9,7 @@ use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use navi_notifier_core::model::{Event, EventKind, ReviewState};
-use navi_notifier_core::traits::Destination;
+use navi_notifier_core::traits::{Destination, StateStore};
 use navi_notifier_core::DestinationError;
 use tracing::debug;
 
@@ -93,7 +93,7 @@ impl Destination for EmailDestination {
         "email"
     }
 
-    async fn send(&self, event: &Event) -> Result<(), DestinationError> {
+    async fn send(&self, event: &Event, _state: &dyn StateStore) -> Result<(), DestinationError> {
         let message = build_message(&self.from, &self.to, event)?;
         self.mailer
             .send(message)
@@ -103,7 +103,11 @@ impl Destination for EmailDestination {
         Ok(())
     }
 
-    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+    async fn send_digest(
+        &self,
+        events: &[Event],
+        _state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
         let message = build_digest_message(&self.from, &self.to, events)?;
         self.mailer
             .send(message)

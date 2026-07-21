@@ -10,7 +10,7 @@ mod render;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use navi_notifier_core::traits::Destination;
+use navi_notifier_core::traits::{Destination, StateStore};
 use navi_notifier_core::{DestinationError, Event};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -151,34 +151,74 @@ impl Destination for SlackDestination {
         "slack"
     }
 
-    async fn send(&self, event: &Event) -> Result<(), DestinationError> {
-        self.post(&render(event), &event.dedup_key).await
+    async fn send(&self, event: &Event, state: &dyn StateStore) -> Result<(), DestinationError> {
+        // Group a PR's events into one Slack thread: the first message we post for a
+        // PR becomes the parent; later ones reply under it. Threading is best-effort,
+        // so a state read/write failure just falls back to a top-level message.
+        let key = thread_key(event);
+        let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
+        let posted_ts = self
+            .post(&render(event), &event.dedup_key, parent.as_deref())
+            .await?;
+        if parent.is_none() {
+            if let Some(ts) = posted_ts {
+                let _ = state.put_cursor(SLACK_NS, &key, &ts).await;
+            }
+        }
+        Ok(())
     }
 
-    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
-        self.post(&render_digest(events), "digest").await
+    async fn send_digest(
+        &self,
+        events: &[Event],
+        _state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
+        // A digest spans many PRs, so it posts at the top level, not in any thread.
+        self.post(&render_digest(events), "digest", None)
+            .await
+            .map(|_| ())
     }
+}
+
+/// Namespace for the Slack destination's own cursors in the shared state store.
+const SLACK_NS: &str = "slack";
+
+/// Cursor key mapping a PR to the ts of the Slack message that opened its thread.
+/// Includes the source id so a GitHub and a GitLab PR that happen to share an
+/// `owner/repo#number` don't collapse into one thread.
+fn thread_key(event: &Event) -> String {
+    format!("thread:{}:{}", event.source_id, event.scope())
 }
 
 impl SlackDestination {
     /// Post a rendered message to the resolved channel, retrying transient
-    /// failures. `label` is only for the debug log.
-    async fn post(&self, rendered: &Rendered, label: &str) -> Result<(), DestinationError> {
+    /// failures. When `thread_ts` is set the message replies under that thread.
+    /// Returns the posted message's `ts` (the thread anchor). `label` is only for
+    /// the debug log.
+    async fn post(
+        &self,
+        rendered: &Rendered,
+        label: &str,
+        thread_ts: Option<&str>,
+    ) -> Result<Option<String>, DestinationError> {
         let channel = self.target().await?.to_string();
-        let body = json!({
+        let mut body = json!({
             "channel": channel,
             "text": rendered.text,
             "blocks": rendered.blocks,
             "unfurl_links": false,
         });
+        if let Some(ts) = thread_ts {
+            body["thread_ts"] = json!(ts);
+        }
 
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.call::<PostMessage>("chat.postMessage", &body).await {
-                Ok(_) => {
+                Ok(posted) => {
                     debug!(label, channel, "delivered to slack");
-                    return Ok(());
+                    return Ok(posted.ts);
                 }
                 Err(DestinationError::RateLimited { retry_after_secs })
                     if attempt < MAX_ATTEMPTS =>
@@ -231,7 +271,7 @@ struct Channel {
 
 #[derive(Deserialize)]
 struct PostMessage {
+    /// The posted message's timestamp id, used as the thread anchor for a PR.
     #[serde(default)]
-    #[allow(dead_code)]
     ts: Option<String>,
 }

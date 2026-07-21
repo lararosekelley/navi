@@ -1,14 +1,41 @@
 //! Discord destination tests against a mock Discord API.
 
+use async_trait::async_trait;
 use navi_notifier_core::model::{
     Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
-use navi_notifier_core::traits::Destination;
+use navi_notifier_core::traits::{Destination, StateStore};
+use navi_notifier_core::StateError;
 use navi_notifier_discord::{DiscordDestination, DiscordDestinationConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+/// Discord ignores the state store, so a no-op suffices.
+struct NoState;
+
+#[async_trait]
+impl StateStore for NoState {
+    async fn get_snapshot(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, StateError> {
+        Ok(None)
+    }
+    async fn put_snapshot(&self, _: &str, _: &str, _: &[u8]) -> Result<(), StateError> {
+        Ok(())
+    }
+    async fn was_delivered(&self, _: &str) -> Result<bool, StateError> {
+        Ok(false)
+    }
+    async fn mark_delivered(&self, _: &str) -> Result<(), StateError> {
+        Ok(())
+    }
+    async fn get_cursor(&self, _: &str, _: &str) -> Result<Option<String>, StateError> {
+        Ok(None)
+    }
+    async fn put_cursor(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
+        Ok(())
+    }
+}
 
 fn sample_event() -> Event {
     Event {
@@ -48,7 +75,10 @@ async fn webhook_mode_posts_embed() {
         api_base: None,
     })
     .expect("build");
-    destination.send(&sample_event()).await.expect("send");
+    destination
+        .send(&sample_event(), &NoState)
+        .await
+        .expect("send");
 
     let reqs = server.received_requests().await.unwrap();
     let post = reqs
@@ -83,7 +113,10 @@ async fn dm_mode_opens_channel_then_posts() {
         api_base: Some(server.uri()),
     })
     .expect("build");
-    destination.send(&sample_event()).await.expect("send");
+    destination
+        .send(&sample_event(), &NoState)
+        .await
+        .expect("send");
 
     let reqs = server.received_requests().await.unwrap();
     assert!(reqs.iter().any(|r| r.url.path() == "/channels/D1/messages"));
