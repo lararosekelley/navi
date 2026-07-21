@@ -142,16 +142,34 @@ pub enum MuteField {
     Excerpt,
 }
 
-/// A pattern mute: suppress events whose `field` matches `pattern`. With
-/// `regex = false` it's a case-insensitive substring match; with `regex = true`
-/// it's a full regex (use `(?i)` for case-insensitivity there).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// A pattern mute: suppress events matching its condition(s). Two forms, and a
+/// rule may combine them - all present conditions must match (AND):
+///
+/// - **Single** (legacy): `match = "author|title|excerpt"` + `pattern = "…"`.
+/// - **Flat**: any of `author = "…"`, `title = "…"`, `excerpt = "…"`, each with an
+///   optional `<field>_regex = true`. Use this to scope, e.g. mute a bot's noise:
+///   `author = "github-actions[bot]"` **and** `excerpt = "CircleCI…"`.
+///
+/// Each pattern is a case-insensitive substring by default, or a full regex when
+/// its `regex` flag is set (use `(?i)` for case-insensitivity there). A rule with
+/// no conditions at all is a config error.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct MuteRule {
-    #[serde(rename = "match")]
-    pub field: MuteField,
-    pub pattern: String,
-    #[serde(default)]
+    #[serde(rename = "match", skip_serializing_if = "Option::is_none")]
+    pub field: Option<MuteField>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
     pub regex: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub author: Option<String>,
+    pub author_regex: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    pub title_regex: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub excerpt: Option<String>,
+    pub excerpt_regex: bool,
 }
 
 /// The complete rule configuration consumed by the engine's filter stage.

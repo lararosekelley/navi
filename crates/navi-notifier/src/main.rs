@@ -419,6 +419,12 @@ reviewer = true
 # match = "title"
 # pattern = "^Bump "
 # regex = true
+#
+# Or scope a mute with several fields at once - all must match. This mutes a bot's
+# CI chatter without silencing its actual reviews:
+# [[rules.mute]]
+# author = "github-actions[bot]"
+# excerpt = "CircleCI pipeline triggered"
 
 # Routes wire sources to destinations. Omit this section entirely to send every
 # source to every enabled destination. List routes to be explicit, e.g. github+gitlab
