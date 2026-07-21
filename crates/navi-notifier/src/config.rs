@@ -233,6 +233,11 @@ pub struct RouteConfig {
     /// `alias` keeps configs that used the older `notifier` key working.
     #[serde(alias = "notifier")]
     pub destination: String,
+    /// Optional repo globs (`owner/name`, `owner/*`, `owner/prefix-*`, `*/prefix-*`).
+    /// Empty = every repo from this source. When set, the route only fires for
+    /// events whose repo matches one of them.
+    #[serde(default)]
+    pub repos: Vec<String>,
 }
 
 impl GitHubConfig {
@@ -302,6 +307,7 @@ impl Config {
             .map(|r| navi_notifier_core::Route {
                 source: r.source.clone(),
                 destination: r.destination.clone(),
+                repos: r.repos.clone(),
             })
             .collect()
     }

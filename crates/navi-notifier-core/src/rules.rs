@@ -26,6 +26,8 @@ pub enum DropReason {
     Muted,
     QuietHours,
     MergeCloseScope,
+    /// Routes are configured, but none cover this event's repo.
+    NoMatchingRoute,
 }
 
 /// Outcome of evaluating one event.

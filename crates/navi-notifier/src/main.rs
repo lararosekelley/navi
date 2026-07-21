@@ -432,4 +432,10 @@ reviewer = true
 [[routes]]
 source = "github"
 destination = "slack"
+# Add `repos` (same globs as rules.repos) to scope a route to certain repos; an
+# event fans out to every matching route. e.g. work repos to Slack, personal to email:
+# [[routes]]
+# source = "github"
+# destination = "email"
+# repos = ["me/*"]
 "#;
