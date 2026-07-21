@@ -87,8 +87,9 @@ impl RepoFilter {
 /// Matches an `owner/name` repo against a pattern. Each side is matched
 /// independently: `*` on the owner matches any owner; a name ending in `*` is a
 /// prefix match (`*` alone matches any name), otherwise both sides are exact. A
-/// pattern without a `/` can never match a repo.
-fn pattern_matches(pattern: &str, full_name: &str) -> bool {
+/// pattern without a `/` can never match a repo. Shared with the engine's route
+/// matching so repo globs behave identically in filters and routing.
+pub(crate) fn pattern_matches(pattern: &str, full_name: &str) -> bool {
     let (Some((owner_pat, name_pat)), Some((owner, name))) =
         (pattern.split_once('/'), full_name.split_once('/'))
     else {

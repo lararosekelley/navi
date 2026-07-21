@@ -10,17 +10,22 @@ use std::sync::Arc;
 
 use tracing::{debug, error, info, warn};
 
+use crate::config::pattern_matches;
 use crate::error::SourceError;
 use crate::model::Event;
 use crate::rules::{Decision, DropReason, FilterContext, RuleEngine};
 use crate::traits::{Destination, Source, StateStore};
 
-/// Connects a source to a destination. If a run has no routes at all, the engine
-/// falls back to delivering every source's events to every destination.
+/// Connects a source to a destination, optionally scoped to certain repos. If a
+/// run has no routes at all, the engine falls back to delivering every source's
+/// events to every destination.
 #[derive(Debug, Clone)]
 pub struct Route {
     pub source: String,
     pub destination: String,
+    /// Repo globs this route is limited to (matched via the shared repo matcher).
+    /// Empty = every repo from `source`.
+    pub repos: Vec<String>,
 }
 
 /// What happened to a single event during a run, captured for logging and
@@ -90,17 +95,23 @@ impl Engine {
         }
     }
 
-    /// Destinations that should receive events from `source_id`.
-    fn destinations_for(&self, source_id: &str) -> Vec<Arc<dyn Destination>> {
+    /// Destinations that should receive this event, given its source and repo. A
+    /// route matches when its source matches and its repo globs are empty or match
+    /// the event's repo; every matching route's destination receives it (fan-out).
+    /// With no routes configured at all, every destination receives everything.
+    fn destinations_for(&self, event: &Event) -> Vec<Arc<dyn Destination>> {
         if self.routes.is_empty() {
             return self.destinations.clone();
         }
+        let repo = event.pull_request.repo.full_name();
         self.destinations
             .iter()
             .filter(|n| {
-                self.routes
-                    .iter()
-                    .any(|r| r.source == source_id && r.destination == n.id())
+                self.routes.iter().any(|r| {
+                    r.source == event.source_id
+                        && r.destination == n.id()
+                        && (r.repos.is_empty() || r.repos.iter().any(|p| pattern_matches(p, &repo)))
+                })
             })
             .cloned()
             .collect()
@@ -126,10 +137,11 @@ impl Engine {
             };
 
             debug!(source = source.id(), count = events.len(), "polled events");
-            let targets = self.destinations_for(source.id());
 
             let mut source_records = Vec::new();
             for event in events {
+                // Resolved per event: a route may scope to specific repos.
+                let targets = self.destinations_for(&event);
                 let record = self
                     .process_event(source.as_ref(), &targets, event, &ctx, dry_run)
                     .await;
@@ -214,11 +226,21 @@ impl Engine {
         }
 
         if targets.is_empty() {
-            warn!(source = %event.source_id, "no destination routed for source; event undeliverable");
+            // Routes exist but none cover this repo: an intentional filter, not a
+            // failure. Treating it as failed would hold the snapshot back and
+            // re-derive the same events every poll (a loop).
+            if !self.routes.is_empty() {
+                debug!(source = %event.source_id, "no route matches this repo; suppressing");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::Suppressed(DropReason::NoMatchingRoute),
+                };
+            }
+            warn!(source = %event.source_id, "no destination configured; event undeliverable");
             return EventRecord {
                 event,
                 outcome: EventOutcome::DeliveryFailed {
-                    errors: vec!["no destination routed for this source".into()],
+                    errors: vec!["no destination configured".into()],
                 },
             };
         }
@@ -356,13 +378,18 @@ mod tests {
 
     #[derive(Default)]
     struct MockDestination {
+        id: String,
         sent: Mutex<Vec<String>>,
         fail: bool,
     }
     #[async_trait]
     impl Destination for MockDestination {
         fn id(&self) -> &str {
-            "mock-notify"
+            if self.id.is_empty() {
+                "mock-notify"
+            } else {
+                &self.id
+            }
         }
         async fn send(&self, event: &Event) -> Result<(), DestinationError> {
             if self.fail {
@@ -474,6 +501,82 @@ mod tests {
         assert!(destination.sent.lock().unwrap().is_empty());
         // Not marked delivered → a real run afterwards would still deliver.
         assert!(!state.was_delivered("k1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn routes_scope_by_repo() {
+        // dest-a is limited to acme/*; dest-b takes everything.
+        let a = Arc::new(MockDestination {
+            id: "dest-a".into(),
+            ..Default::default()
+        });
+        let b = Arc::new(MockDestination {
+            id: "dest-b".into(),
+            ..Default::default()
+        });
+        let mut other = ev(EventKind::Mentioned, "k-other");
+        other.pull_request.repo = Repo::new("other", "thing");
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k-acme"), other],
+                ..Default::default()
+            })],
+            vec![a.clone(), b.clone()],
+            vec![
+                Route {
+                    source: "mock".into(),
+                    destination: "dest-a".into(),
+                    repos: vec!["acme/*".into()],
+                },
+                Route {
+                    source: "mock".into(),
+                    destination: "dest-b".into(),
+                    repos: vec![],
+                },
+            ],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        // dest-a only got the acme event; dest-b got both (fan-out + catch-all).
+        assert_eq!(a.sent.lock().unwrap().as_slice(), &["k-acme".to_string()]);
+        assert_eq!(b.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn event_with_no_matching_route_is_suppressed_not_failed() {
+        // A scoped route that this event's repo doesn't match must suppress the
+        // event, not fail it — else its snapshot is held back and it re-derives
+        // every poll (a loop).
+        let dest = Arc::new(MockDestination {
+            id: "dest-a".into(),
+            ..Default::default()
+        });
+        let mut out = ev(EventKind::Mentioned, "k1");
+        out.pull_request.repo = Repo::new("other", "thing");
+        let src = Arc::new(MockSource {
+            events: vec![out],
+            ..Default::default()
+        });
+        let engine = Engine::new(
+            vec![src.clone()],
+            vec![dest.clone()],
+            vec![Route {
+                source: "mock".into(),
+                destination: "dest-a".into(),
+                repos: vec!["acme/*".into()],
+            }],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::Suppressed(DropReason::NoMatchingRoute)
+        ));
+        assert!(dest.sent.lock().unwrap().is_empty());
+        // Not counted as a failed scope, so its snapshot can advance.
+        assert!(src.committed.lock().unwrap()[0].is_empty());
     }
 
     #[tokio::test]
