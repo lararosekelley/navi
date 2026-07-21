@@ -4,7 +4,7 @@
 //! crate's own config. This module only describes how events are filtered and
 //! prioritised once normalized.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -41,6 +41,23 @@ impl Default for EventToggles {
 }
 
 impl EventToggles {
+    /// Whether `tag` is a recognized event kind. Used to reject typos in per-repo
+    /// override keys, which would otherwise be silently ignored.
+    pub fn is_known_tag(tag: &str) -> bool {
+        matches!(
+            tag,
+            "review_requested"
+                | "re_review_requested"
+                | "review_submitted"
+                | "review_dismissed"
+                | "comment_reply"
+                | "mentioned"
+                | "merged"
+                | "closed"
+                | "ready_for_review"
+        )
+    }
+
     /// Whether an event tag is enabled.
     pub fn is_enabled(&self, tag: &str) -> bool {
         match tag {
@@ -173,6 +190,41 @@ pub struct MuteRule {
     pub excerpt_regex: bool,
 }
 
+/// A per-repo override of a subset of the global rules. Everything left unset
+/// inherits the global value (a partial merge, not a wholesale replacement), and
+/// the first override whose `repos` match an event's repo wins. Only event
+/// toggles, quiet hours, and merge/close scope are overridable; the global mutes
+/// and repo allow/deny still apply everywhere.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RuleOverride {
+    /// Repo globs this override applies to (same syntax as `repos`). Required for
+    /// the override to match anything.
+    pub repos: Vec<String>,
+    /// Event tag -> on/off, for just the tags you want to change. Absent tags keep
+    /// the global toggle.
+    pub events: BTreeMap<String, bool>,
+    pub quiet_hours: QuietHoursOverride,
+    pub merge_close: MergeCloseOverride,
+}
+
+/// Per-repo quiet-hours override; each unset field inherits the global one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct QuietHoursOverride {
+    pub enabled: Option<bool>,
+    pub start: Option<String>,
+    pub end: Option<String>,
+}
+
+/// Per-repo merge/close-scope override; each unset field inherits the global one.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MergeCloseOverride {
+    pub author: Option<bool>,
+    pub reviewer: Option<bool>,
+}
+
 /// The complete rule configuration consumed by the engine's filter stage.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -185,6 +237,8 @@ pub struct RuleConfig {
     pub mute: Vec<MuteRule>,
     pub quiet_hours: QuietHours,
     pub merge_close: MergeCloseScope,
+    /// Per-repo overrides applied on top of the settings above.
+    pub overrides: Vec<RuleOverride>,
 }
 
 #[cfg(test)]

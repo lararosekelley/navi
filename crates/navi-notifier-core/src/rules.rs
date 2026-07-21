@@ -5,7 +5,7 @@
 //! identity-dependent is passed in via [`FilterContext`] rather than read from the
 //! environment, keeping this layer deterministic.
 
-use crate::config::{MuteField, MuteRule, RuleConfig};
+use crate::config::{pattern_matches, MuteField, MuteRule, RuleConfig, RuleOverride};
 use crate::model::{Event, EventKind};
 
 /// Ambient inputs the filter needs but that don't belong to the event itself.
@@ -94,6 +94,9 @@ pub enum InvalidMutePattern {
     RegexWithoutMatch,
     /// A rule with no conditions - it would match everything and mute the feed.
     Empty,
+    /// A per-repo override references an unknown event tag (likely a typo), which
+    /// would silently do nothing.
+    UnknownEventTag(String),
 }
 
 impl std::fmt::Display for InvalidMutePattern {
@@ -113,6 +116,9 @@ impl std::fmt::Display for InvalidMutePattern {
                 f,
                 "a mute rule has no conditions; set `match`/`pattern` or an author/title/excerpt field"
             ),
+            Self::UnknownEventTag(tag) => {
+                write!(f, "unknown event tag `{tag}` in a rules.overrides entry")
+            }
         }
     }
 }
@@ -187,13 +193,21 @@ pub struct RuleEngine {
 }
 
 impl RuleEngine {
-    /// Build the engine, compiling any mute patterns once. Fails on a bad regex.
+    /// Build the engine, validating rules once: compile mute patterns (failing on a
+    /// bad regex) and reject per-repo overrides that reference unknown event tags.
     pub fn new(config: RuleConfig) -> Result<Self, InvalidMutePattern> {
         let mutes = config
             .mute
             .iter()
             .map(compile_mute)
             .collect::<Result<Vec<_>, _>>()?;
+        for ovr in &config.overrides {
+            for tag in ovr.events.keys() {
+                if !crate::config::EventToggles::is_known_tag(tag) {
+                    return Err(InvalidMutePattern::UnknownEventTag(tag.clone()));
+                }
+            }
+        }
         Ok(Self { config, mutes })
     }
 
@@ -203,7 +217,19 @@ impl RuleEngine {
 
     /// Decide the fate of a single event. Checks run cheapest-first.
     pub fn decide(&self, event: &Event, ctx: &FilterContext) -> Decision {
-        if !self.config.events.is_enabled(event.kind.tag()) {
+        let repo = event.pull_request.repo.full_name();
+        // The first override whose repos match wins; unset fields inherit global.
+        let ovr = self
+            .config
+            .overrides
+            .iter()
+            .find(|o| o.repos.iter().any(|p| pattern_matches(p, &repo)));
+
+        let tag = event.kind.tag();
+        let kind_enabled = ovr
+            .and_then(|o| o.events.get(tag).copied())
+            .unwrap_or_else(|| self.config.events.is_enabled(tag));
+        if !kind_enabled {
             return Decision::Drop(DropReason::EventKindDisabled);
         }
 
@@ -215,41 +241,48 @@ impl RuleEngine {
             return Decision::Drop(DropReason::Muted);
         }
 
-        if !self
-            .config
-            .repos
-            .permits(&event.pull_request.repo.full_name())
-        {
+        if !self.config.repos.permits(&repo) {
             return Decision::Drop(DropReason::RepoFiltered);
         }
 
         // Merge/close are only interesting depending on your relationship to the PR.
         if matches!(event.kind, EventKind::Merged | EventKind::Closed) {
-            let scope = &self.config.merge_close;
-            let wanted = (scope.author && event.viewer.is_author)
-                || (scope.reviewer && event.viewer.is_reviewer);
+            let g = &self.config.merge_close;
+            let author = ovr.and_then(|o| o.merge_close.author).unwrap_or(g.author);
+            let reviewer = ovr
+                .and_then(|o| o.merge_close.reviewer)
+                .unwrap_or(g.reviewer);
+            let wanted =
+                (author && event.viewer.is_author) || (reviewer && event.viewer.is_reviewer);
             if !wanted {
                 return Decision::Drop(DropReason::MergeCloseScope);
             }
         }
 
-        if self.in_quiet_hours(ctx) {
+        if self.in_quiet_hours(ovr, ctx) {
             return Decision::Drop(DropReason::QuietHours);
         }
 
         Decision::Deliver
     }
 
-    fn in_quiet_hours(&self, ctx: &FilterContext) -> bool {
+    fn in_quiet_hours(&self, ovr: Option<&RuleOverride>, ctx: &FilterContext) -> bool {
         let qh = &self.config.quiet_hours;
-        if !qh.enabled {
+        let enabled = ovr
+            .and_then(|o| o.quiet_hours.enabled)
+            .unwrap_or(qh.enabled);
+        if !enabled {
             return false;
         }
-        let (Some(now), Some(start), Some(end)) = (
-            ctx.local_minutes,
-            parse_hhmm(&qh.start),
-            parse_hhmm(&qh.end),
-        ) else {
+        let start_s = ovr
+            .and_then(|o| o.quiet_hours.start.as_deref())
+            .unwrap_or(&qh.start);
+        let end_s = ovr
+            .and_then(|o| o.quiet_hours.end.as_deref())
+            .unwrap_or(&qh.end);
+        let (Some(now), Some(start), Some(end)) =
+            (ctx.local_minutes, parse_hhmm(start_s), parse_hhmm(end_s))
+        else {
             return false;
         };
         if start == end {
@@ -280,9 +313,11 @@ fn parse_hhmm(s: &str) -> Option<u16> {
 mod tests {
     use super::*;
     use crate::config::{
-        EventToggles, MergeCloseScope, MuteField, MuteRule, QuietHours, RepoFilter,
+        EventToggles, MergeCloseOverride, MergeCloseScope, MuteField, MuteRule, QuietHours,
+        QuietHoursOverride, RepoFilter,
     };
     use crate::model::{Actor, PullRequest, Repo, ReviewState, ViewerRelationship};
+    use std::collections::BTreeMap;
     use time::OffsetDateTime;
 
     fn event(kind: EventKind) -> Event {
@@ -597,6 +632,148 @@ mod tests {
                 &FilterContext::default()
             ),
             Decision::Deliver
+        );
+    }
+
+    /// Build an event for a specific repo (helper for override tests).
+    fn event_in(kind: EventKind, owner: &str, name: &str) -> Event {
+        let mut e = event(kind);
+        e.pull_request.repo = Repo::new(owner, name);
+        e
+    }
+
+    #[test]
+    fn per_repo_override_flips_an_event_toggle() {
+        let cfg = RuleConfig {
+            overrides: vec![RuleOverride {
+                repos: vec!["acme/*".into()],
+                events: BTreeMap::from([("mentioned".to_string(), false)]),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = RuleEngine::new(cfg).unwrap();
+        // acme repo: the override turns `mentioned` off.
+        assert_eq!(
+            engine.decide(
+                &event_in(EventKind::Mentioned, "acme", "widgets"),
+                &FilterContext::default()
+            ),
+            Decision::Drop(DropReason::EventKindDisabled)
+        );
+        // A different repo inherits the global default (mentioned on).
+        assert_eq!(
+            engine.decide(
+                &event_in(EventKind::Mentioned, "other", "thing"),
+                &FilterContext::default()
+            ),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn per_repo_override_narrows_merge_close_scope() {
+        let cfg = RuleConfig {
+            overrides: vec![RuleOverride {
+                repos: vec!["acme/*".into()],
+                merge_close: MergeCloseOverride {
+                    reviewer: Some(false),
+                    author: None,
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = RuleEngine::new(cfg).unwrap();
+        // A merged PR you only reviewed, in acme: reviewer scope off here → dropped.
+        let mut acme = event_in(EventKind::Merged, "acme", "widgets");
+        acme.viewer.is_reviewer = true;
+        assert_eq!(
+            engine.decide(&acme, &FilterContext::default()),
+            Decision::Drop(DropReason::MergeCloseScope)
+        );
+        // Elsewhere the global reviewer scope (on) still delivers it.
+        let mut other = event_in(EventKind::Merged, "other", "thing");
+        other.viewer.is_reviewer = true;
+        assert_eq!(
+            engine.decide(&other, &FilterContext::default()),
+            Decision::Deliver
+        );
+    }
+
+    #[test]
+    fn per_repo_override_can_re_enable_a_globally_disabled_event() {
+        // The primary use case: a kind that's off globally, back on for some repos.
+        let mut cfg = RuleConfig::default();
+        cfg.events.ready_for_review = false;
+        cfg.overrides = vec![RuleOverride {
+            repos: vec!["acme/*".into()],
+            events: BTreeMap::from([("ready_for_review".to_string(), true)]),
+            ..Default::default()
+        }];
+        let engine = RuleEngine::new(cfg).unwrap();
+        // acme: the override turns it back on.
+        assert_eq!(
+            engine.decide(
+                &event_in(EventKind::ReadyForReview, "acme", "widgets"),
+                &FilterContext::default()
+            ),
+            Decision::Deliver
+        );
+        // Elsewhere it stays off.
+        assert_eq!(
+            engine.decide(
+                &event_in(EventKind::ReadyForReview, "other", "thing"),
+                &FilterContext::default()
+            ),
+            Decision::Drop(DropReason::EventKindDisabled)
+        );
+    }
+
+    #[test]
+    fn override_with_unknown_event_tag_is_a_config_error() {
+        let cfg = RuleConfig {
+            overrides: vec![RuleOverride {
+                repos: vec!["acme/*".into()],
+                events: BTreeMap::from([("reivew_submitted".to_string(), false)]), // typo
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(RuleEngine::new(cfg).is_err());
+    }
+
+    #[test]
+    fn per_repo_override_can_disable_quiet_hours() {
+        let cfg = RuleConfig {
+            quiet_hours: QuietHours {
+                enabled: true,
+                start: "09:00".into(),
+                end: "17:00".into(),
+            },
+            overrides: vec![RuleOverride {
+                repos: vec!["acme/*".into()],
+                quiet_hours: QuietHoursOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = RuleEngine::new(cfg).unwrap();
+        let ctx = FilterContext {
+            local_minutes: Some(600), // 10:00, inside the global quiet window
+        };
+        // acme: quiet hours disabled by the override → delivered.
+        assert_eq!(
+            engine.decide(&event_in(EventKind::Mentioned, "acme", "widgets"), &ctx),
+            Decision::Deliver
+        );
+        // Elsewhere the global quiet window suppresses it.
+        assert_eq!(
+            engine.decide(&event_in(EventKind::Mentioned, "other", "thing"), &ctx),
+            Decision::Drop(DropReason::QuietHours)
         );
     }
 }
