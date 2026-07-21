@@ -69,3 +69,12 @@ fn unhandled_actions_are_ignored() {
 fn viewer_authoring_the_mr_is_detected() {
     assert!(map("review_requested", "bob").unwrap().viewer.is_author);
 }
+
+#[test]
+fn actor_being_the_viewer_is_flagged() {
+    // The todo's author (the actor) is "alice"; when that's the viewer, flag it so
+    // the render can say "you" instead of the login.
+    assert!(map("mentioned", "alice").unwrap().viewer.actor_is_viewer);
+    // A different viewer is not the actor.
+    assert!(!map("mentioned", "me").unwrap().viewer.actor_is_viewer);
+}

@@ -237,6 +237,7 @@ async fn mark_read_patches_once_across_repeated_commits() {
     let source = source_marks_read(&server);
     let state = MemState::default();
     let events = source.poll(&state).await.expect("poll");
+    assert_eq!(events.len(), 1);
     source.commit(&state, &events[0]).await.expect("commit");
     source
         .commit(&state, &events[0])
