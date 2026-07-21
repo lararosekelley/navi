@@ -45,14 +45,15 @@ pub fn upgrade(head: bool, force: bool, no_restart: bool) -> Result<()> {
     }
     let installed = env!("CARGO_PKG_VERSION");
     // Skip a redundant re-download when we're already current, unless --force.
-    // Best-effort: only the lookup runs the network, and if it (or version
-    // parsing) can't confirm we're current, we fall through and install as before.
+    // Compare against the latest *published* release (what the installer actually
+    // fetches), not git tags: a release workflow pushes the tag minutes before it
+    // publishes the release, and using tags would make us "upgrade" to a version
+    // that isn't installable yet, reinstalling the current one in a loop.
+    // Best-effort: if the lookup or parsing fails, fall through and install.
     let latest = if force {
         None
     } else {
-        remote_release_versions()
-            .ok()
-            .and_then(|v| v.into_iter().max())
+        latest_release_version()
     };
     if let Some(installed_version) = parse_version(installed) {
         if !upgrade_needed(installed_version, latest, force) {
@@ -200,12 +201,10 @@ pub fn maybe_hint_update() {
     let installed = parse_version(env!("CARGO_PKG_VERSION"));
     let (sender, receiver) = mpsc::channel();
     thread::spawn(move || {
+        // Latest *published* release, so a release still building doesn't trip a
+        // "newer release available" hint you can't yet install (same reason as upgrade).
         let behind = installed
-            .zip(
-                remote_release_versions()
-                    .ok()
-                    .and_then(|v| v.into_iter().max()),
-            )
+            .zip(latest_release_version())
             .is_some_and(|(installed, latest)| latest > installed);
         let _ = sender.send(behind);
     });
@@ -295,7 +294,38 @@ fn upgrade_needed(installed: Version3, latest: Option<Version3>, force: bool) ->
     force || latest.is_none_or(|latest| installed < latest)
 }
 
-/// Released versions, from the repo's `vX.Y.Z` tags.
+/// The latest *published* release version - what `releases/latest` (and thus the
+/// installer) resolves to. `None` on any failure, so the caller falls through and
+/// installs. Unlike the tag list, this only reflects a release once it's published,
+/// so we never try to upgrade to a version that isn't installable yet.
+fn latest_release_version() -> Option<Version3> {
+    // `releases/latest` 302-redirects to `.../releases/tag/vX.Y.Z`; follow it and
+    // read the final URL. Reuses curl, already required for the installer.
+    let output = Command::new("curl")
+        .args([
+            "-sSL",
+            "-o",
+            "/dev/null",
+            "-w",
+            "%{url_effective}",
+            &format!("{REPO_URL}/releases/latest"),
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    version_from_release_url(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Parse the version from a `.../releases/tag/vX.Y.Z` URL.
+fn version_from_release_url(url: &str) -> Option<Version3> {
+    let tag = url.trim().trim_end_matches('/').rsplit('/').next()?;
+    parse_version(tag.strip_prefix('v').unwrap_or(tag))
+}
+
+/// Released versions, from the repo's `vX.Y.Z` tags. Used by `downgrade`, which
+/// legitimately wants every release, not just the latest.
 fn remote_release_versions() -> Result<Vec<Version3>> {
     let output = Command::new("git")
         .args(["ls-remote", "--tags", REPO_URL])
@@ -316,6 +346,24 @@ fn remote_release_versions() -> Result<Vec<Version3>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn version_from_release_url_parses_the_redirect_target() {
+        assert_eq!(
+            version_from_release_url("https://github.com/lararosekelley/navi/releases/tag/v0.2.1"),
+            Some((0, 2, 1))
+        );
+        // Trailing slash tolerated.
+        assert_eq!(
+            version_from_release_url("https://github.com/x/y/releases/tag/v1.10.3/"),
+            Some((1, 10, 3))
+        );
+        // A non-release URL yields nothing (we then fall through and install).
+        assert_eq!(
+            version_from_release_url("https://github.com/x/y/releases"),
+            None
+        );
+    }
 
     #[test]
     fn unix_install_script_hard_fails_on_download_error() {
