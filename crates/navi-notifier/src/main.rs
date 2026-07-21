@@ -145,6 +145,9 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     );
     upgrade::maybe_hint_update();
 
+    let digest_interval = std::time::Duration::from_secs(config.digest.interval_secs.max(1));
+    let mut last_digest = std::time::Instant::now();
+
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
 
@@ -156,6 +159,12 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
                 errors = report.source_errors.len(),
                 "poll pass complete"
             );
+        }
+
+        // Flush the digest on its own cadence, independent of the poll interval.
+        if config.digest.enabled && last_digest.elapsed() >= digest_interval {
+            engine.flush_digest().await;
+            last_digest = std::time::Instant::now();
         }
 
         tokio::select! {
@@ -213,6 +222,7 @@ fn print_report(report: &RunReport, dry_run: bool) {
             EventOutcome::WouldDeliver { to } => format!("WOULD deliver → {}", to.join(", ")),
             EventOutcome::Suppressed(reason) => format!("suppressed ({reason:?})"),
             EventOutcome::AlreadyDelivered => "already delivered".to_string(),
+            EventOutcome::Digested => "digested (batched for the next flush)".to_string(),
             EventOutcome::DeliveryFailed { errors } => format!("FAILED: {}", errors.join("; ")),
         };
         println!("  {head:<40} {outcome}");
@@ -446,4 +456,11 @@ destination = "slack"
 # source = "github"
 # destination = "email"
 # repos = ["me/*"]
+
+# Digest: batch low-signal event kinds into one periodic summary instead of
+# alerting on each. Off by default. Kinds not listed still alert in real time.
+# [digest]
+# enabled = true
+# interval_secs = 3600
+# kinds = ["ready_for_review", "merged", "closed"]
 "#;

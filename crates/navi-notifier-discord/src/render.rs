@@ -39,6 +39,30 @@ pub fn render(event: &Event) -> Rendered {
     }
 }
 
+/// Render a batch of events as a single digest embed. Assumes `events` is non-empty.
+pub fn render_digest(events: &[Event]) -> Rendered {
+    let n = events.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let lines: Vec<String> = events
+        .iter()
+        .map(|e| {
+            let pr = &e.pull_request;
+            let (h, _) = headline(e, e.actor_label());
+            format!("{h} — {}#{}", pr.repo.full_name(), pr.number)
+        })
+        .collect();
+    let embed = json!({
+        "title": format!("navi digest — {n} update{plural}"),
+        "description": truncate(&lines.join("\n"), 4000),
+        "color": 0x5865f2u32,
+        "footer": { "text": "navi" },
+    });
+    Rendered {
+        content: format!("navi digest: {n} update{plural}"),
+        embed,
+    }
+}
+
 /// One-line headline plus an embed color for the event kind.
 fn headline(event: &Event, actor: &str) -> (String, u32) {
     match &event.kind {

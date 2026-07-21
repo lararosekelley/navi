@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-pub use render::{render, Rendered};
+pub use render::{render, render_digest, Rendered};
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_ATTEMPTS: u32 = 3;
@@ -181,8 +181,19 @@ impl Destination for DiscordDestination {
     }
 
     async fn send(&self, event: &Event) -> Result<(), DestinationError> {
+        self.post(&render(event), &event.dedup_key).await
+    }
+
+    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+        self.post(&render_digest(events), "digest").await
+    }
+}
+
+impl DiscordDestination {
+    /// Post a rendered message to the resolved endpoint, retrying transient
+    /// failures. `label` is only for the debug log.
+    async fn post(&self, rendered: &Rendered, label: &str) -> Result<(), DestinationError> {
         let endpoint = self.endpoint().await?;
-        let rendered = render(event);
         let body = json!({ "content": rendered.content, "embeds": [rendered.embed] });
 
         let mut attempt = 0;
@@ -191,7 +202,7 @@ impl Destination for DiscordDestination {
             let resp = self.post_raw(&endpoint, &body).await?;
             match check_status(&resp) {
                 Ok(()) => {
-                    debug!(dedup_key = %event.dedup_key, "delivered to discord");
+                    debug!(label, "delivered to discord");
                     return Ok(());
                 }
                 Err(DestinationError::RateLimited { retry_after_secs })

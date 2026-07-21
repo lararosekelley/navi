@@ -11,7 +11,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info, warn};
 
 use crate::config::pattern_matches;
-use crate::error::SourceError;
+use crate::error::{SourceError, StateError};
 use crate::model::Event;
 use crate::rules::{Decision, DropReason, FilterContext, RuleEngine};
 use crate::traits::{Destination, Source, StateStore};
@@ -37,6 +37,8 @@ pub enum EventOutcome {
     },
     Suppressed(DropReason),
     AlreadyDelivered,
+    /// Buffered into the periodic digest instead of delivered now.
+    Digested,
     DeliveryFailed {
         errors: Vec<String>,
     },
@@ -70,12 +72,19 @@ impl RunReport {
     }
 }
 
+/// State-store keys under which the pending digest is buffered.
+const DIGEST_SOURCE: &str = "__digest__";
+const DIGEST_SCOPE: &str = "pending";
+
 pub struct Engine {
     sources: Vec<Arc<dyn Source>>,
     destinations: Vec<Arc<dyn Destination>>,
     routes: Vec<Route>,
     rules: RuleEngine,
     state: Arc<dyn StateStore>,
+    /// Event tags to batch into the periodic digest instead of delivering now.
+    /// Empty = digest off.
+    digest_kinds: HashSet<String>,
 }
 
 impl Engine {
@@ -92,7 +101,15 @@ impl Engine {
             routes,
             rules,
             state,
+            digest_kinds: HashSet::new(),
         }
+    }
+
+    /// Set the event tags to batch into the periodic digest (builder-style, so
+    /// `new` stays stable). Empty = digest off, the default.
+    pub fn with_digest_kinds(mut self, kinds: HashSet<String>) -> Self {
+        self.digest_kinds = kinds;
+        self
     }
 
     /// Destinations that should receive this event, given its source and repo. A
@@ -245,6 +262,27 @@ impl Engine {
             };
         }
 
+        // Digest kinds are buffered for the periodic flush rather than sent now.
+        // Marked delivered so they don't re-derive; the flush handles routing.
+        if self.digest_kinds.contains(event.kind.tag()) {
+            if let Err(err) = self.enqueue_digest(&event).await {
+                warn!(dedup_key = %event.dedup_key, %err, "failed to buffer digest event");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::DeliveryFailed {
+                        errors: vec![format!("digest buffer: {err}")],
+                    },
+                };
+            }
+            if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
+                warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
+            }
+            return EventRecord {
+                event,
+                outcome: EventOutcome::Digested,
+            };
+        }
+
         // 3. Deliver to every routed destination.
         let mut errors = Vec::new();
         let mut delivered_to = Vec::new();
@@ -279,6 +317,75 @@ impl Engine {
                 outcome: EventOutcome::DeliveryFailed { errors },
             }
         }
+    }
+
+    /// The events currently buffered for the next digest flush.
+    async fn read_digest(&self) -> Result<Vec<Event>, StateError> {
+        match self.state.get_snapshot(DIGEST_SOURCE, DIGEST_SCOPE).await? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| StateError::Serde(format!("digest buffer: {e}"))),
+            None => Ok(Vec::new()),
+        }
+    }
+
+    /// Append an event to the persisted digest buffer.
+    async fn enqueue_digest(&self, event: &Event) -> Result<(), StateError> {
+        let mut pending = self.read_digest().await?;
+        pending.push(event.clone());
+        let bytes = serde_json::to_vec(&pending).map_err(|e| StateError::Serde(e.to_string()))?;
+        self.state
+            .put_snapshot(DIGEST_SOURCE, DIGEST_SCOPE, &bytes)
+            .await
+    }
+
+    /// Flush the buffered digest: one batched message per destination (only the
+    /// events routed to it), then clear the buffer. Called by the daemon on the
+    /// digest interval. Returns how many events were flushed. If any destination
+    /// fails, the buffer is kept for the next interval (which may re-send to
+    /// destinations that already succeeded - acceptable for a low-priority digest).
+    pub async fn flush_digest(&self) -> usize {
+        let pending = match self.read_digest().await {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(%err, "could not read digest buffer; leaving it in place");
+                return 0;
+            }
+        };
+        if pending.is_empty() {
+            return 0;
+        }
+
+        let mut all_ok = true;
+        for dest in &self.destinations {
+            let batch: Vec<Event> = pending
+                .iter()
+                .filter(|e| self.destinations_for(e).iter().any(|d| d.id() == dest.id()))
+                .cloned()
+                .collect();
+            if batch.is_empty() {
+                continue;
+            }
+            if let Err(err) = dest.send_digest(&batch).await {
+                error!(destination = dest.id(), %err, "digest flush failed");
+                all_ok = false;
+            }
+        }
+
+        if !all_ok {
+            return 0;
+        }
+        // If the buffer can't be cleared, don't report success: the events are still
+        // buffered and would re-send next flush, so surface it as a non-clean flush.
+        if let Err(err) = self
+            .state
+            .put_snapshot(DIGEST_SOURCE, DIGEST_SCOPE, b"[]")
+            .await
+        {
+            warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
+            return 0;
+        }
+        info!(count = pending.len(), "digest flushed");
+        pending.len()
     }
 
     fn log_source_error(source_id: &str, err: &SourceError) {
@@ -380,6 +487,8 @@ mod tests {
     struct MockDestination {
         id: String,
         sent: Mutex<Vec<String>>,
+        /// Batches received via `send_digest` (each is the dedup keys in the batch).
+        digests: Mutex<Vec<Vec<String>>>,
         fail: bool,
     }
     #[async_trait]
@@ -396,6 +505,16 @@ mod tests {
                 return Err(DestinationError::Delivery("boom".into()));
             }
             self.sent.lock().unwrap().push(event.dedup_key.clone());
+            Ok(())
+        }
+        async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+            if self.fail {
+                return Err(DestinationError::Delivery("boom".into()));
+            }
+            self.digests
+                .lock()
+                .unwrap()
+                .push(events.iter().map(|e| e.dedup_key.clone()).collect());
             Ok(())
         }
     }
@@ -501,6 +620,44 @@ mod tests {
         assert!(destination.sent.lock().unwrap().is_empty());
         // Not marked delivered → a real run afterwards would still deliver.
         assert!(!state.was_delivered("k1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn digest_kinds_are_buffered_then_flushed() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        // The mentioned event is a digest kind → buffered, not sent immediately.
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
+        assert!(
+            dest.sent.lock().unwrap().is_empty(),
+            "nothing sent immediately"
+        );
+        assert!(dest.digests.lock().unwrap().is_empty(), "not flushed yet");
+
+        // Flushing sends the batch via send_digest, once.
+        let flushed = engine.flush_digest().await;
+        assert_eq!(flushed, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().as_slice(),
+            &[vec!["k1".to_string()]]
+        );
+
+        // A second flush finds an empty buffer and does nothing.
+        assert_eq!(engine.flush_digest().await, 0);
+        assert_eq!(dest.digests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]

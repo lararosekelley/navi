@@ -94,4 +94,15 @@ pub trait Destination: Send + Sync {
     /// Deliver a single, already-filtered event. Implementations should be
     /// resilient to transient failure (retry/backoff) before returning `Err`.
     async fn send(&self, event: &Event) -> Result<(), DestinationError>;
+
+    /// Deliver a batch of events as one digest. The default sends them
+    /// individually; destinations override this to render a single summary
+    /// message. Called by the engine's periodic digest flush; `events` is
+    /// non-empty.
+    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+        for event in events {
+            self.send(event).await?;
+        }
+        Ok(())
+    }
 }

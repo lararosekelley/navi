@@ -88,13 +88,15 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
     );
 
     let rules = RuleEngine::new(config.rules.clone()).context("compiling mute patterns")?;
-    Ok(Engine::new(
-        sources,
-        destinations,
-        config.engine_routes(),
-        rules,
-        state,
-    ))
+    let digest_kinds = if config.digest.enabled {
+        config.digest.kinds.iter().cloned().collect()
+    } else {
+        std::collections::HashSet::new()
+    };
+    Ok(
+        Engine::new(sources, destinations, config.engine_routes(), rules, state)
+            .with_digest_kinds(digest_kinds),
+    )
 }
 
 /// Build the Slack destination, shared by the engine and `test-slack`.
