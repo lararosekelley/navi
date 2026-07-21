@@ -63,6 +63,12 @@ pub enum Command {
         action: ConfigAction,
     },
 
+    /// List providers and their status, or print setup steps for one.
+    Providers {
+        #[command(subcommand)]
+        action: Option<ProvidersAction>,
+    },
+
     /// Tail the background service's logs (journald / launchd / Task Scheduler).
     Logs {
         /// Follow the log, streaming new lines as they arrive.
@@ -129,6 +135,17 @@ pub enum Command {
         /// Don't restart the background service afterwards.
         #[arg(long)]
         no_restart: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ProvidersAction {
+    /// Show each source/destination with its on-off state and whether creds resolve.
+    List,
+    /// Print setup steps for a provider (github|gitlab|gitea|slack|discord|email).
+    Setup {
+        /// The provider to explain.
+        name: String,
     },
 }
 
