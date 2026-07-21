@@ -173,11 +173,18 @@ impl Event {
     }
 
     /// How to refer to the PR in a headline, from the viewer's angle: "your PR"
-    /// when you authored it, otherwise "<author>'s PR" - so a review, merge, or
-    /// close on a PR you only review isn't mislabeled as yours.
+    /// when you authored it, "their own PR" when the actor is the PR's author
+    /// (so it doesn't repeat the name, e.g. "octo merged octo's PR"), otherwise
+    /// "<author>'s PR" - so activity on a PR you only review isn't mislabeled.
     pub fn pr_phrase(&self) -> String {
         if self.viewer.is_author {
             "your PR".to_string()
+        } else if self
+            .actor
+            .login
+            .eq_ignore_ascii_case(&self.pull_request.author.login)
+        {
+            "their own PR".to_string()
         } else {
             format!("{}'s PR", self.pull_request.author.label())
         }

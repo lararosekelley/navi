@@ -159,6 +159,13 @@ mod tests {
         let theirs = render(&event(EventKind::Merged)).text; // default is_author = false
         assert!(theirs.contains("merged octo's PR"), "got {theirs}");
         assert!(!theirs.contains("your PR"));
+
+        // The author acted on their own PR → "their own PR", not "octo merged octo's PR".
+        let mut own = event(EventKind::Merged);
+        own.actor = Actor::new("octo"); // same as the PR author
+        let own = render(&own).text;
+        assert!(own.contains("merged their own PR"), "got {own}");
+        assert!(!own.contains("octo's PR"));
     }
 
     #[test]
