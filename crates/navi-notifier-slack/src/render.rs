@@ -48,6 +48,36 @@ pub fn render(event: &Event) -> Rendered {
     Rendered { text, blocks }
 }
 
+/// Render a batch of events as a single digest message: a header plus one line
+/// per event. Assumes `events` is non-empty.
+pub fn render_digest(events: &[Event]) -> Rendered {
+    let n = events.len();
+    let header = format!(
+        ":inbox_tray: *navi digest* · {n} update{}",
+        if n == 1 { "" } else { "s" }
+    );
+    let lines: Vec<String> = events
+        .iter()
+        .map(|e| {
+            let pr = &e.pull_request;
+            let repo_ref = format!("{}#{}", pr.repo.full_name(), pr.number);
+            format!(
+                "{}  ·  <{}|{}>",
+                headline(e, e.actor_label()),
+                e.target_url.clone().unwrap_or_else(|| pr.url.clone()),
+                repo_ref
+            )
+        })
+        .collect();
+    Rendered {
+        text: format!("navi digest: {n} update{}", if n == 1 { "" } else { "s" }),
+        blocks: vec![json!({
+            "type": "section",
+            "text": { "type": "mrkdwn", "text": format!("{header}\n{}", lines.join("\n")) }
+        })],
+    }
+}
+
 /// The one-line headline with a leading emoji, in Slack mrkdwn.
 fn headline(event: &Event, actor: &str) -> String {
     let a = format!("*{}*", escape(actor));

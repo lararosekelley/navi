@@ -17,7 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-pub use render::{render, Rendered};
+pub use render::{render, render_digest, Rendered};
 
 const DEFAULT_API_BASE: &str = "https://slack.com/api";
 const MAX_ATTEMPTS: u32 = 3;
@@ -152,8 +152,19 @@ impl Destination for SlackDestination {
     }
 
     async fn send(&self, event: &Event) -> Result<(), DestinationError> {
+        self.post(&render(event), &event.dedup_key).await
+    }
+
+    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+        self.post(&render_digest(events), "digest").await
+    }
+}
+
+impl SlackDestination {
+    /// Post a rendered message to the resolved channel, retrying transient
+    /// failures. `label` is only for the debug log.
+    async fn post(&self, rendered: &Rendered, label: &str) -> Result<(), DestinationError> {
         let channel = self.target().await?.to_string();
-        let rendered = render(event);
         let body = json!({
             "channel": channel,
             "text": rendered.text,
@@ -161,13 +172,12 @@ impl Destination for SlackDestination {
             "unfurl_links": false,
         });
 
-        // Retry transient failures (rate limits, 5xx surfaced as delivery errors).
         let mut attempt = 0;
         loop {
             attempt += 1;
             match self.call::<PostMessage>("chat.postMessage", &body).await {
                 Ok(_) => {
-                    debug!(dedup_key = %event.dedup_key, channel, "delivered to slack");
+                    debug!(label, channel, "delivered to slack");
                     return Ok(());
                 }
                 Err(DestinationError::RateLimited { retry_after_secs })

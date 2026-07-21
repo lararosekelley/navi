@@ -102,6 +102,51 @@ impl Destination for EmailDestination {
         debug!(dedup_key = %event.dedup_key, "delivered email");
         Ok(())
     }
+
+    async fn send_digest(&self, events: &[Event]) -> Result<(), DestinationError> {
+        let message = build_digest_message(&self.from, &self.to, events)?;
+        self.mailer
+            .send(message)
+            .await
+            .map_err(|e| DestinationError::Delivery(format!("smtp send: {e}")))?;
+        debug!(count = events.len(), "delivered email digest");
+        Ok(())
+    }
+}
+
+/// Build one email summarizing a batch of events. Assumes `events` is non-empty.
+fn build_digest_message(
+    from: &Mailbox,
+    to: &Mailbox,
+    events: &[Event],
+) -> Result<Message, DestinationError> {
+    let n = events.len();
+    let plural = if n == 1 { "" } else { "s" };
+    let subject = format!("navi digest: {n} update{plural}");
+
+    let mut text = format!("navi digest — {n} update{plural}\n\n");
+    let mut html = format!("<p><strong>navi digest — {n} update{plural}</strong></p>\n<ul>\n");
+    for e in events {
+        let pr = &e.pull_request;
+        let repo_ref = format!("{}#{}", pr.repo.full_name(), pr.number);
+        let link = e.target_url.clone().unwrap_or_else(|| pr.url.clone());
+        let head = headline(e);
+        text.push_str(&format!("- {head} — {repo_ref}\n  {link}\n"));
+        html.push_str(&format!(
+            "<li>{} — <a href=\"{}\">{}</a></li>\n",
+            escape(&head),
+            escape(&link),
+            escape(&repo_ref)
+        ));
+    }
+    html.push_str("</ul>\n<p style=\"color:#888\">sent by navi</p>\n");
+
+    Message::builder()
+        .from(from.clone())
+        .to(to.clone())
+        .subject(subject)
+        .multipart(MultiPart::alternative_plain_html(text, html))
+        .map_err(|e| DestinationError::Delivery(format!("building digest email: {e}")))
 }
 
 /// Build the SMTP message for an event. Pure, so it is unit-testable via

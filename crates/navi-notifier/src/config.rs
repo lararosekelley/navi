@@ -25,6 +25,32 @@ pub struct Config {
     pub rules: RuleConfig,
     /// Source→destination wiring. Empty means "every source to every destination".
     pub routes: Vec<RouteConfig>,
+    pub digest: DigestConfig,
+}
+
+/// Batch low-signal event kinds into a periodic summary instead of alerting on
+/// each one. Off by default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DigestConfig {
+    pub enabled: bool,
+    /// How often to flush the digest, in seconds. The timer resets on daemon
+    /// start, so after a restart a buffered digest waits up to this long before
+    /// the next flush.
+    pub interval_secs: u64,
+    /// Event tags (e.g. `merged`, `closed`, `ready_for_review`) to batch instead
+    /// of alerting immediately. Kinds not listed still alert in real time.
+    pub kinds: Vec<String>,
+}
+
+impl Default for DigestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            interval_secs: 3600,
+            kinds: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
