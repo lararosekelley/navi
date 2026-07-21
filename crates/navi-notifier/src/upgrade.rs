@@ -141,16 +141,14 @@ fn run_installer(version: Option<&str>) -> Result<()> {
                 "-ExecutionPolicy",
                 "Bypass",
                 "-c",
-                &format!("irm {base}.ps1 | iex"),
+                &windows_install_script(&base),
             ])
             .status()
             .context("failed to run the PowerShell installer")?
     } else {
         Command::new("sh")
             .arg("-c")
-            .arg(format!(
-                "curl --proto '=https' --tlsv1.2 -LsSf {base}.sh | sh"
-            ))
+            .arg(unix_install_script(&base))
             .status()
             .context("failed to run the installer; is curl available?")?
     };
@@ -158,6 +156,25 @@ fn run_installer(version: Option<&str>) -> Result<()> {
         bail!("installer exited with status {status}");
     }
     Ok(())
+}
+
+/// POSIX-sh installer command. Downloads the script to a temp file *first* (curl
+/// with `-f` so an HTTP error is a non-zero exit), then runs it, so a failed or
+/// rate-limited download is a hard error instead of an empty pipe into `sh` that
+/// exits 0 and makes a no-op look like a successful upgrade. Not `curl | sh` with
+/// `pipefail` because `/bin/sh` is often dash, which lacks it.
+fn unix_install_script(base: &str) -> String {
+    format!(
+        "t=$(mktemp) || exit 1; \
+         curl --proto '=https' --tlsv1.2 -fLsS \"{base}.sh\" -o \"$t\" && sh \"$t\"; \
+         rc=$?; rm -f \"$t\"; exit $rc"
+    )
+}
+
+/// PowerShell installer command. `$ErrorActionPreference='Stop'` makes a failed
+/// download a terminating error rather than something `iex` shrugs off.
+fn windows_install_script(base: &str) -> String {
+    format!("$ErrorActionPreference = 'Stop'; irm {base}.ps1 | iex")
 }
 
 /// Once a day, after a common command, print one line when a newer release
@@ -299,6 +316,27 @@ fn remote_release_versions() -> Result<Vec<Version3>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unix_install_script_hard_fails_on_download_error() {
+        let s = unix_install_script("https://ex/navi-notifier-installer");
+        // `-f` => curl exits non-zero on an HTTP error (404/403/429)...
+        assert!(s.contains("-fLsS"), "{s}");
+        // ...downloaded to a temp file, and `sh` runs only if the download succeeded.
+        assert!(s.contains("mktemp"), "{s}");
+        assert!(s.contains("-o \"$t\" && sh \"$t\""), "{s}");
+        assert!(s.contains("rm -f \"$t\""), "cleanup: {s}");
+        // The old `curl ... | sh` (which swallows curl's exit) must be gone.
+        assert!(
+            !s.contains(".sh | sh"),
+            "must not pipe curl straight into sh: {s}"
+        );
+    }
+
+    #[test]
+    fn windows_install_script_stops_on_error() {
+        assert!(windows_install_script("https://ex/x").contains("ErrorActionPreference = 'Stop'"));
+    }
 
     #[test]
     fn parse_version_accepts_plain_xyz_only() {
