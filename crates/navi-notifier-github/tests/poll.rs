@@ -212,6 +212,39 @@ async fn mark_read_marks_the_thread_after_commit() {
 }
 
 #[tokio::test]
+async fn mark_read_patches_once_across_repeated_commits() {
+    let server = MockServer::start().await;
+    let notif = json!([{
+        "id": "123456",
+        "reason": "review_requested",
+        "updated_at": "2024-01-02T03:04:05Z",
+        "subject": {
+            "title": "Add gizmo",
+            "url": format!("{}/repos/acme/widgets/pulls/1", server.uri()),
+            "type": "PullRequest"
+        },
+        "repository": { "name": "widgets", "owner": { "login": "acme" }, "html_url": "https://github.com/acme/widgets" }
+    }]);
+    mock_github(&server, notif, open_pr(json!([{ "login": "me" }]))).await;
+    // Exactly one PATCH must fire even if commit() runs twice for the same PR.
+    Mock::given(method("PATCH"))
+        .and(path("/notifications/threads/123456"))
+        .respond_with(ResponseTemplate::new(205))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let source = source_marks_read(&server);
+    let state = MemState::default();
+    let events = source.poll(&state).await.expect("poll");
+    source.commit(&state, &events[0]).await.expect("commit");
+    source
+        .commit(&state, &events[0])
+        .await
+        .expect("second commit is a no-op");
+}
+
+#[tokio::test]
 async fn snapshot_is_deferred_until_commit() {
     let server = MockServer::start().await;
     mock_github(

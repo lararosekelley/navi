@@ -511,7 +511,9 @@ impl Source for GitHubSource {
             return Ok(());
         }
         let scope = event.scope();
-        let thread_id = self.threads.lock().unwrap().get(&scope).cloned();
+        // Take, not clone: a PR that emits several events this pass should PATCH the
+        // thread once, not once per event. Next poll repopulates the map anyway.
+        let thread_id = self.threads.lock().unwrap().remove(&scope);
         // No thread mapped for this scope (e.g. found via search, not a notification).
         let Some(raw) = thread_id else {
             return Ok(());
