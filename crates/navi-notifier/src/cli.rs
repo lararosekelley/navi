@@ -49,6 +49,12 @@ pub enum Command {
     /// Report what each enabled provider can see (identity, visible orgs, creds).
     Doctor,
 
+    /// Read or write config values without hand-editing config.toml.
+    Config {
+        #[command(subcommand)]
+        action: ConfigAction,
+    },
+
     /// Tail the background service's logs (journald / launchd / Task Scheduler).
     Logs {
         /// Follow the log, streaming new lines as they arrive.
@@ -136,4 +142,20 @@ pub enum ServiceAction {
 
     /// Show whether the background service is installed and running.
     Status,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigAction {
+    /// Print a config value by dotted key, e.g. `general.poll_interval_secs`.
+    Get {
+        /// Dotted path into config.toml, e.g. `github.enabled` or `slack.dm_to`.
+        key: String,
+    },
+    /// Set a config value in place (comments and formatting preserved).
+    Set {
+        /// Dotted path, e.g. `github.enabled`.
+        key: String,
+        /// New value; parsed as bool/integer if it looks like one, else a string.
+        value: String,
+    },
 }

@@ -61,16 +61,15 @@ clap_mangen = "0.2"
 directories.workspace = true
 serde.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
 serde_json.workspace = true
 rusqlite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 anyhow.workspace = true
 time.workspace = true
+tempfile = "3"
 
 # e2e-only HTTP helpers for driving providers / asserting delivery.
 reqwest = { workspace = true, optional = true }
 base64 = { version = "0.22", optional = true }
-
-[dev-dependencies]
-tempfile = "3"

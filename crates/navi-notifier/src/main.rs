@@ -5,6 +5,7 @@
 mod cli;
 mod completions;
 mod config;
+mod config_cmd;
 mod doctor;
 mod envfile;
 mod logs;
@@ -28,7 +29,7 @@ use time::OffsetDateTime;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, ServiceAction};
+use crate::cli::{Cli, Command, ConfigAction, ServiceAction};
 use crate::config::{resolve_config_path, resolve_state_path, Config};
 use crate::state::SqliteStore;
 
@@ -68,6 +69,10 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Run => cmd_run(&config_path).await,
         Command::TestSlack => cmd_test_slack(&config_path).await,
         Command::Doctor => cmd_doctor(&config_path).await,
+        Command::Config { action } => match action {
+            ConfigAction::Get { key } => config_cmd::get(&config_path, &key),
+            ConfigAction::Set { key, value } => config_cmd::set(&config_path, &key, &value),
+        },
         Command::Logs { .. } => unreachable!("logs is handled before the runtime in main"),
         Command::Completions { shell } => completions::print(shell),
         Command::Setup { yes, refresh } => setup::setup(yes, refresh),
