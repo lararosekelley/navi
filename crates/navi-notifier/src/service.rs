@@ -23,6 +23,10 @@ const WINDOWS_TASK_NAME: &str = "Navi";
 /// Where the logon task appends navi's output. PowerShell env-expands this in the
 /// task action; the `%VAR%` form is what we print to the user.
 const WINDOWS_LOG_DISPLAY: &str = r"%LOCALAPPDATA%\navi\navi.log";
+/// Roll `navi.log` to `navi.log.1` when it exceeds this, checked each time the task
+/// starts. Caps growth across restarts (upgrades, logon, reboot) - Windows won't
+/// let us rotate the file while the running task holds it open for append.
+const WINDOWS_LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
 
 /// Install and start the background service for the current OS.
 pub fn install(config_path: &Path, yes: bool) -> Result<()> {
@@ -494,7 +498,8 @@ fn schtasks_create_args(exe: &str, config: &Path) -> Vec<String> {
     let exe = ps_single_quote_escape(exe);
     let config = ps_single_quote_escape(&config.display().to_string());
     let action = format!(
-        "powershell -WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; & '{exe}' run --config '{config}' *>> $log\"",
+        "powershell -WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; if ((Test-Path $log) -and ((Get-Item $log).Length -gt {cap})) {{ Move-Item -Force $log ($log + '.1') }}; & '{exe}' run --config '{config}' *>> $log\"",
+        cap = WINDOWS_LOG_MAX_BYTES,
     );
     vec![
         "/Create".into(),
@@ -678,6 +683,12 @@ mod tests {
             action.contains("$env:LOCALAPPDATA"),
             "log must live under LOCALAPPDATA"
         );
+        // Rotates the log when it's over the cap, before appending this session.
+        assert!(
+            action.contains("Move-Item -Force $log ($log + '.1')"),
+            "action must roll the log over the size cap: {action}"
+        );
+        assert!(action.contains(&WINDOWS_LOG_MAX_BYTES.to_string()));
     }
 
     #[test]
