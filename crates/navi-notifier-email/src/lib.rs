@@ -268,5 +268,9 @@ mod tests {
         let mut mine = event(EventKind::Merged, "k");
         mine.viewer.is_author = true;
         assert!(headline(&mine).contains("merged your PR"));
+        // The author acted on their own PR → "their own PR", no repeated name.
+        let mut own = event(EventKind::Merged, "k");
+        own.actor = Actor::new("octo"); // same as the PR author
+        assert!(headline(&own).contains("merged their own PR"));
     }
 }

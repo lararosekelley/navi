@@ -150,5 +150,13 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(d2.contains("merged your PR"), "got {d2}");
+        // The author acted on their own PR → "their own PR", no repeated name.
+        let mut own = event(EventKind::Merged);
+        own.actor = Actor::new("octo"); // same as the PR author
+        let d3 = render(&own).embed["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d3.contains("merged their own PR"), "got {d3}");
     }
 }
