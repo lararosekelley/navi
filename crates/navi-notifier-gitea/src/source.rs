@@ -215,6 +215,8 @@ impl Source for GiteaSource {
                 // Gitea team review requests aren't modelled yet.
                 viewer_teams: std::collections::HashSet::new(),
                 comment_min_age: self.comment_min_age,
+                // Gitea has no involved-PR sweep, so no first-run backfill.
+                first_sight_backfill: None,
             };
             let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
 

@@ -77,6 +77,26 @@ pub enum ReviewState {
     Commented,
 }
 
+/// How much pre-existing activity to surface the first time navi polls (before it
+/// has any stored state). Later polls always diff against stored snapshots, so this
+/// only governs the initial catch-up.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backfill {
+    /// Baseline everything silently: not even outstanding review asks alert. The
+    /// config value stays `"none"`; the variant is `Silent` to avoid colliding with
+    /// `Option::None` in the diff engine's match.
+    #[serde(rename = "none")]
+    Silent,
+    /// Surface only PRs currently awaiting your review (the default; the useful
+    /// minimum, and what navi has always done on first run).
+    #[default]
+    ReviewRequests,
+    /// Surface all derivable activity on every open PR you're involved in. Noisy on
+    /// a busy account; relies on the involved-PR sweep (`track_prs`).
+    AllOpen,
+}
+
 /// The kind of thing that happened. This is the taxonomy the rule layer filters on
 /// and the destination renders. Discriminant-only variants keep matching cheap; payload
 /// detail lives on [`Event`].

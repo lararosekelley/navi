@@ -84,6 +84,7 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
                 track_prs: config.github.track_prs,
                 mark_read: config.github.mark_read,
                 comment_min_age_secs: config.general.comment_min_age_secs,
+                backfill: config.general.backfill,
             })
             .context("initializing GitHub source")?,
         )),

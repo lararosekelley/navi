@@ -62,6 +62,7 @@ fn source_with(server: &MockServer, track_prs: bool) -> GitHubSource {
         track_prs,
         mark_read: false,
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     })
     .expect("build source")
 }
@@ -73,6 +74,7 @@ fn source_marks_read(server: &MockServer) -> GitHubSource {
         track_prs: false,
         mark_read: true,
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     })
     .expect("build source")
 }

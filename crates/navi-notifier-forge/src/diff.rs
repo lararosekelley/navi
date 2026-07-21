@@ -7,7 +7,7 @@
 use std::collections::{HashMap, HashSet};
 
 use navi_notifier_core::model::{
-    Actor, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
+    Actor, Backfill, Event, EventKind, PullRequest, Repo, ReviewState, ViewerRelationship,
 };
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -52,6 +52,12 @@ pub struct DiffContext {
     /// placeholder and edits it in place resolves to its final text before we
     /// notify. `None` disables the hold (emit as soon as seen).
     pub comment_min_age: Option<time::Duration>,
+    /// First-run backfill override for this PR's first sighting. `None` is the
+    /// normal rule (outstanding review asks plus activity at/after
+    /// `first_sight_since`). `Some(mode)` replaces that rule during the initial
+    /// catch-up sweep: `Silent` surfaces nothing, `ReviewRequests` only outstanding
+    /// asks, `AllOpen` everything derivable. Ignored once a PR is initialized.
+    pub first_sight_backfill: Option<Backfill>,
 }
 
 /// Key a team by its org and slug so a "reviewers" team in one org never matches
@@ -341,22 +347,31 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     }
 
     // First sighting: `old` was empty, so every check above fired as if brand new.
-    // Keep the currently-outstanding review ask (so a fresh start still shows what
-    // is waiting on you), but otherwise surface only what happened at/after the
-    // watermark - the triggering notification's moment - instead of back-filling
-    // the PR's entire history.
+    // A backfill override (the initial catch-up sweep) replaces the normal rule;
+    // otherwise keep the currently-outstanding review ask (so a fresh start still
+    // shows what is waiting on you) plus what happened at/after the watermark - the
+    // triggering notification's moment - instead of back-filling the whole history.
     if !old.initialized {
-        events.retain(|e| {
-            // ReReviewRequested is unreachable on first sight (it needs a prior
-            // review in `old`); kept here so the "review ask always survives" rule
-            // reads completely.
+        // ReReviewRequested is unreachable on first sight (it needs a prior review
+        // in `old`); listed alongside ReviewRequested so the "review ask survives"
+        // rule reads completely.
+        let is_review_ask = |e: &Event| {
             matches!(
                 e.kind,
                 EventKind::ReviewRequested | EventKind::ReReviewRequested
-            ) || ctx
-                .first_sight_since
-                .is_some_and(|since| e.occurred_at >= since)
-        });
+            )
+        };
+        match ctx.first_sight_backfill {
+            None => events.retain(|e| {
+                is_review_ask(e)
+                    || ctx
+                        .first_sight_since
+                        .is_some_and(|since| e.occurred_at >= since)
+            }),
+            Some(Backfill::Silent) => events.clear(),
+            Some(Backfill::ReviewRequests) => events.retain(is_review_ask),
+            Some(Backfill::AllOpen) => {}
+        }
     }
 
     (events, new_snapshot)
