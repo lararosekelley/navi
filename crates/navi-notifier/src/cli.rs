@@ -43,8 +43,16 @@ pub enum Command {
         dry_run: bool,
     },
 
-    /// Send a sample Block Kit message to verify Slack credentials and DM target.
-    TestSlack,
+    /// Verify a provider: send a sample to a destination, or poll a source and
+    /// print what it derives (no state is touched). Give at least one.
+    Test {
+        /// Poll this source once and print the derived events, e.g. `github`.
+        #[arg(long)]
+        source: Option<String>,
+        /// Send a sample message to this destination, e.g. `slack`.
+        #[arg(long)]
+        destination: Option<String>,
+    },
 
     /// Report what each enabled provider can see (identity, visible orgs, creds).
     Doctor,
