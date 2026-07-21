@@ -405,6 +405,14 @@ end = "08:00"
 author = true
 reviewer = true
 
+# Per-repo overrides: change event toggles, quiet hours, or merge/close scope for
+# matching repos. Unset fields inherit the global settings; first match wins. e.g.
+# get ready-for-review alerts only in your work repos:
+# [[rules.overrides]]
+# repos = ["higharc/*"]
+# events = { ready_for_review = true }
+# merge_close = { reviewer = false }
+
 # mute_authors is a list of logins whose actions never notify (e.g. bots):
 # [rules]
 # mute_authors = ["dependabot[bot]"]
