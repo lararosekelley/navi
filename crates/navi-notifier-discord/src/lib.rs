@@ -4,6 +4,10 @@
 //! - a webhook URL (`https://discord.com/api/webhooks/...`) posts an embed to that
 //!   channel with no token, the simplest setup;
 //! - a user id (snowflake) opens a DM with the bot token and posts there.
+//!
+//! Bot-DM mode groups a PR's events into a reply chain (each event replies to the
+//! PR's first message), the same idea as Slack threading. Webhook mode has no
+//! reply/thread primitive, so those events post top-level.
 
 mod render;
 
@@ -180,8 +184,25 @@ impl Destination for DiscordDestination {
         "discord"
     }
 
-    async fn send(&self, event: &Event, _state: &dyn StateStore) -> Result<(), DestinationError> {
-        self.post(&render(event), &event.dedup_key).await
+    async fn send(&self, event: &Event, state: &dyn StateStore) -> Result<(), DestinationError> {
+        // Group a PR's events into a reply chain, the same way the Slack destination
+        // threads. Only bot DMs support replies; webhooks have no reply/thread
+        // primitive, so they post top-level. Best-effort: a state error just posts a
+        // standalone message.
+        let key = thread_key(event);
+        let parent = match self.mode {
+            Mode::Dm(_) => state.get_cursor(DISCORD_NS, &key).await.ok().flatten(),
+            Mode::Webhook(_) => None,
+        };
+        let posted = self
+            .post(&render(event), &event.dedup_key, parent.as_deref())
+            .await?;
+        if parent.is_none() {
+            if let Some(id) = posted {
+                let _ = state.put_cursor(DISCORD_NS, &key, &id).await;
+            }
+        }
+        Ok(())
     }
 
     async fn send_digest(
@@ -189,16 +210,40 @@ impl Destination for DiscordDestination {
         events: &[Event],
         _state: &dyn StateStore,
     ) -> Result<(), DestinationError> {
-        self.post(&render_digest(events), "digest").await
+        // A digest spans many PRs, so it posts at the top level, not in any thread.
+        self.post(&render_digest(events), "digest", None).await?;
+        Ok(())
     }
+}
+
+/// Namespace for the Discord destination's own cursors in the shared state store.
+const DISCORD_NS: &str = "discord";
+
+/// Cursor key mapping a PR to the id of the message that opened its reply chain.
+/// Includes the source id so a GitHub and GitLab PR sharing an `owner/repo#number`
+/// don't collapse into one chain.
+fn thread_key(event: &Event) -> String {
+    format!("thread:{}:{}", event.source_id, event.scope())
 }
 
 impl DiscordDestination {
     /// Post a rendered message to the resolved endpoint, retrying transient
-    /// failures. `label` is only for the debug log.
-    async fn post(&self, rendered: &Rendered, label: &str) -> Result<(), DestinationError> {
+    /// failures. When `reply_to` is set (bot mode), the message replies to that one,
+    /// grouping a PR's events. Returns the posted message's id (bot mode; `None` for
+    /// webhooks, which return an empty body). `label` is only for the debug log.
+    async fn post(
+        &self,
+        rendered: &Rendered,
+        label: &str,
+        reply_to: Option<&str>,
+    ) -> Result<Option<String>, DestinationError> {
         let endpoint = self.endpoint().await?;
-        let body = json!({ "content": rendered.content, "embeds": [rendered.embed] });
+        let mut body = json!({ "content": rendered.content, "embeds": [rendered.embed] });
+        if let Some(parent) = reply_to {
+            // fail_if_not_exists=false so a deleted parent posts standalone, not errors.
+            body["message_reference"] =
+                json!({ "message_id": parent, "fail_if_not_exists": false });
+        }
 
         let mut attempt = 0;
         loop {
@@ -207,7 +252,12 @@ impl DiscordDestination {
             match check_status(&resp) {
                 Ok(()) => {
                     debug!(label, "delivered to discord");
-                    return Ok(());
+                    // Bot mode returns the created message (with id); webhooks 204.
+                    let text = resp.text().await.unwrap_or_default();
+                    let id = serde_json::from_str::<MessagePosted>(&text)
+                        .ok()
+                        .and_then(|m| m.id);
+                    return Ok(id);
                 }
                 Err(DestinationError::RateLimited { retry_after_secs })
                     if attempt < MAX_ATTEMPTS =>
@@ -255,6 +305,13 @@ fn check_status(resp: &reqwest::Response) -> Result<(), DestinationError> {
 #[derive(Deserialize)]
 struct Channel {
     id: String,
+}
+
+/// The created message returned by a bot-mode post, for the reply-chain anchor.
+#[derive(Deserialize)]
+struct MessagePosted {
+    #[serde(default)]
+    id: Option<String>,
 }
 
 #[derive(Deserialize)]
