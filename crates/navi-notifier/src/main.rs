@@ -295,7 +295,10 @@ const STARTER_CONFIG: &str = r#"# navi configuration
 [general]
 # Seconds between poll passes when running `navi run`.
 poll_interval_secs = 60
-# Log filter: "info", or e.g. "navi=debug,octocrab=warn".
+# Log filter. At "info" each poll logs a one-line summary of what it examined
+# (notifications, PRs swept, events derived) so `navi logs` shows whether navi saw
+# your activity. For deeper tracing, name the crates, e.g.
+# "info,navi_notifier_core=debug,navi_notifier_github=debug".
 log_level = "info"
 # Offset from UTC in minutes, used only for quiet-hours evaluation.
 # e.g. -420 = US Pacific (PDT), 60 = Central Europe.
