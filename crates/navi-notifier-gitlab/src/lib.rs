@@ -37,6 +37,9 @@ pub struct GitLabSourceConfig {
     pub token: String,
     /// API base, e.g. `https://gitlab.example.com/api/v4` for self-hosted.
     pub api_base: Option<String>,
+    /// Hold a note back until it is at least this many seconds old (0 = off), so
+    /// edit-in-place bots resolve to their final text before we notify.
+    pub comment_min_age_secs: u64,
 }
 
 pub struct GitLabSource {
@@ -47,6 +50,8 @@ pub struct GitLabSource {
     /// scope (`owner/name#iid`) -> serialized MR snapshot, deferred during a poll
     /// and flushed by `commit_snapshots` only for MRs whose delivery didn't fail.
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
+    /// Min note age before notifying (`None` = off), passed through to the diff.
+    comment_min_age: Option<Duration>,
 }
 
 impl GitLabSource {
@@ -68,6 +73,8 @@ impl GitLabSource {
                 .unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
             viewer: OnceCell::new(),
             pending_snapshots: Mutex::new(HashMap::new()),
+            comment_min_age: (config.comment_min_age_secs > 0)
+                .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
         })
     }
 
@@ -242,6 +249,7 @@ impl Source for GitLabSource {
                         viewer: viewer.clone(),
                         repo,
                         now,
+                        comment_min_age: self.comment_min_age,
                     };
                     let (evs, snapshot) = diff_mr(&ctx, &mr, &discussions, &old);
                     let bytes = serde_json::to_vec(&snapshot)

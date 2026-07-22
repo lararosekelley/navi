@@ -92,6 +92,7 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
             GitLabSource::new(GitLabSourceConfig {
                 token: config.gitlab.resolve_token()?,
                 api_base: config.gitlab.api_base.clone(),
+                comment_min_age_secs: config.general.comment_min_age_secs,
             })
             .context("initializing GitLab source")?,
         )),
