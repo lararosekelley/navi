@@ -193,7 +193,13 @@ impl Default for SlackConfig {
             token_env: "NAVI_SLACK_TOKEN".into(),
             token: None,
             dm_to: "self".into(),
-            broadcast: vec!["merged".into(), "closed".into(), "review_dismissed".into()],
+            broadcast: vec![
+                "merged".into(),
+                "closed".into(),
+                "review_dismissed".into(),
+                "review_approved".into(),
+                "review_changes_requested".into(),
+            ],
         }
     }
 }

@@ -357,8 +357,11 @@ dm_to = "self"
 # the top level (Slack reply_broadcast) so high-signal ones aren't buried in-thread.
 # Set to [] for pure threading, or add kinds. Valid tags: review_requested,
 # re_review_requested, review_submitted, review_dismissed, comment_reply, mentioned,
-# merged, closed, ready_for_review, entered_merge_queue, removed_merge_queue.
-broadcast = ["merged", "closed", "review_dismissed"]
+# merged, closed, ready_for_review, entered_merge_queue, removed_merge_queue,
+# review_approved, review_changes_requested, review_commented.
+# review_submitted covers every review; the review_approved / review_changes_requested /
+# review_commented shorthands narrow it to a single state.
+broadcast = ["merged", "closed", "review_dismissed", "review_approved", "review_changes_requested"]
 
 [discord]
 # Off by default. dm_to is either a webhook URL (simplest, no token) or a user id.

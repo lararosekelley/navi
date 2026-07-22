@@ -165,7 +165,12 @@ impl Destination for SlackDestination {
         let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
         // High-signal kinds break out of the thread so they aren't buried. Only
         // meaningful for a reply (a thread-opening message is already top-level).
-        let broadcast = parent.is_some() && self.broadcast.contains(event.kind.tag());
+        let broadcast = parent.is_some()
+            && event
+                .kind
+                .match_tags()
+                .iter()
+                .any(|t| self.broadcast.contains(*t));
         let posted_ts = self
             .post(
                 &render(event),

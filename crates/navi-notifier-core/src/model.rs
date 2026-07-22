@@ -159,6 +159,27 @@ impl EventKind {
             EventKind::RemovedFromMergeQueue { .. } => "removed_merge_queue",
         }
     }
+
+    /// All tags identifying this event for delivery config that needs finer grain
+    /// than `tag()` (e.g. a destination's broadcast set). Most events match only
+    /// their `tag()`. A review submission also matches a per-state tag
+    /// (`review_approved` / `review_changes_requested` / `review_commented`) so a
+    /// config can single out approvals and change requests without also matching
+    /// the noisier plain review comments. Listing the umbrella `review_submitted`
+    /// still matches every state (backward compatible).
+    pub fn match_tags(&self) -> Vec<&'static str> {
+        match self {
+            EventKind::ReviewSubmitted { state } => {
+                let state_tag = match state {
+                    ReviewState::Approved => "review_approved",
+                    ReviewState::ChangesRequested => "review_changes_requested",
+                    ReviewState::Commented => "review_commented",
+                };
+                vec![self.tag(), state_tag]
+            }
+            _ => vec![self.tag()],
+        }
+    }
 }
 
 /// How the person running navi ("the viewer") relates to the PR. The source sets

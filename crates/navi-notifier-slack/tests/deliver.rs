@@ -230,6 +230,125 @@ async fn terminal_events_broadcast_out_of_the_thread() {
 }
 
 #[tokio::test]
+async fn review_broadcast_is_per_state() {
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        "chat.postMessage",
+        json!({ "ok": true, "ts": "111.222" }),
+    )
+    .await;
+
+    // Broadcast approvals and change requests, but not plain review comments.
+    let dest = SlackDestination::new(SlackDestinationConfig {
+        token: "xoxb-test".into(),
+        dm_to: "C0123456789".into(),
+        api_base: Some(format!("{}/api", server.uri())),
+        broadcast: vec!["review_approved".into(), "review_changes_requested".into()],
+    })
+    .expect("build destination");
+
+    let state = MemState::default();
+    // A review request opens the thread (distinct from the review replies below).
+    let mut opener = sample_event();
+    opener.kind = EventKind::ReviewRequested;
+    dest.send(&opener, &state).await.expect("parent");
+    // Approved and changes-requested replies each broadcast via their per-state tag.
+    let mut approved = sample_event();
+    approved.kind = EventKind::ReviewSubmitted {
+        state: ReviewState::Approved,
+    };
+    dest.send(&approved, &state).await.expect("approved");
+    let mut changes = sample_event();
+    changes.kind = EventKind::ReviewSubmitted {
+        state: ReviewState::ChangesRequested,
+    };
+    dest.send(&changes, &state)
+        .await
+        .expect("changes requested");
+    // A plain review comment reply does not (review_commented is not in the set).
+    let mut commented = sample_event();
+    commented.kind = EventKind::ReviewSubmitted {
+        state: ReviewState::Commented,
+    };
+    dest.send(&commented, &state).await.expect("commented");
+
+    let posts: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat.postMessage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 4);
+    assert_eq!(
+        posts[1]["reply_broadcast"], true,
+        "approval should broadcast"
+    );
+    assert_eq!(
+        posts[2]["reply_broadcast"], true,
+        "changes-requested should broadcast"
+    );
+    assert!(
+        posts[3].get("reply_broadcast").is_none(),
+        "a plain review comment must stay thread-only"
+    );
+}
+
+#[tokio::test]
+async fn review_submitted_umbrella_broadcasts_all_states() {
+    // Backward compat: the pre-per-state config value `review_submitted` must still
+    // broadcast every review state (approved, changes-requested, and commented).
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        "chat.postMessage",
+        json!({ "ok": true, "ts": "111.222" }),
+    )
+    .await;
+
+    let dest = SlackDestination::new(SlackDestinationConfig {
+        token: "xoxb-test".into(),
+        dm_to: "C0123456789".into(),
+        api_base: Some(format!("{}/api", server.uri())),
+        broadcast: vec!["review_submitted".into()],
+    })
+    .expect("build destination");
+
+    let state = MemState::default();
+    // A review request opens the thread; each review-state reply should broadcast.
+    let mut opener = sample_event();
+    opener.kind = EventKind::ReviewRequested;
+    dest.send(&opener, &state).await.expect("parent");
+    for st in [
+        ReviewState::Approved,
+        ReviewState::ChangesRequested,
+        ReviewState::Commented,
+    ] {
+        let mut e = sample_event();
+        e.kind = EventKind::ReviewSubmitted { state: st };
+        dest.send(&e, &state).await.expect("review reply");
+    }
+
+    let posts: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat.postMessage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 4);
+    for reply in &posts[1..] {
+        assert_eq!(
+            reply["reply_broadcast"], true,
+            "review_submitted must broadcast every state"
+        );
+    }
+}
+
+#[tokio::test]
 async fn concrete_channel_skips_conversations_open() {
     let server = MockServer::start().await;
     // No conversations.open mounted: if the code calls it, the request 404s and
