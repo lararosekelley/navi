@@ -63,6 +63,9 @@ pub enum Command {
         action: ConfigAction,
     },
 
+    /// Open the `navi.env` secrets file (beside the config) in $VISUAL/$EDITOR.
+    Env,
+
     /// List providers and their status, or print setup steps for one.
     Providers {
         #[command(subcommand)]
@@ -183,4 +186,6 @@ pub enum ConfigAction {
         /// New value; parsed as bool/integer if it looks like one, else a string.
         value: String,
     },
+    /// Open the config file in $VISUAL/$EDITOR.
+    Edit,
 }

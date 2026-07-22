@@ -25,6 +25,22 @@ pub fn set(config_path: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open the config file in the user's editor, then re-parse it so a syntax error
+/// introduced by hand is caught now rather than silently at the next load.
+pub fn edit(config_path: &Path) -> Result<()> {
+    if !config_path.exists() {
+        bail!(
+            "no config at {}; run `navi init` first",
+            config_path.display()
+        );
+    }
+    crate::editor::open(config_path)?;
+    if let Err(e) = read_doc(config_path) {
+        eprintln!("warning: {} no longer parses: {e:#}", config_path.display());
+    }
+    Ok(())
+}
+
 /// Write `bytes` to `path` without a truncate window: fill a temp file in the
 /// same directory, then rename it into place. A crash mid-write leaves the old
 /// config intact rather than an empty or half-written one.
