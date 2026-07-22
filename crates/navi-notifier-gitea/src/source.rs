@@ -10,7 +10,10 @@ use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::SourceError;
 use navi_notifier_forge::model::PrData;
-use navi_notifier_forge::{diff, first_sight_watermark, DiffContext, PrSnapshot};
+use navi_notifier_forge::{
+    diff, first_sight_watermark, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
+};
+use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
@@ -29,6 +32,8 @@ pub struct GiteaSourceConfig {
     pub api_base: Option<String>,
     /// Hold a comment back until it is at least this many seconds old (0 = off).
     pub comment_min_age_secs: u64,
+    /// Poll your involved PRs directly (search), on top of notifications.
+    pub track_prs: bool,
 }
 
 pub struct GiteaSource {
@@ -41,6 +46,8 @@ pub struct GiteaSource {
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
     /// Min comment age before notifying (`None` = off), passed through to the diff.
     comment_min_age: Option<Duration>,
+    /// Whether to also sweep your involved PRs directly (catches self-merges/closes).
+    track_prs: bool,
 }
 
 impl GiteaSource {
@@ -64,6 +71,7 @@ impl GiteaSource {
             pending_snapshots: Mutex::new(HashMap::new()),
             comment_min_age: (config.comment_min_age_secs > 0)
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
+            track_prs: config.track_prs,
         })
     }
 
@@ -157,6 +165,169 @@ impl GiteaSource {
                 .collect(),
         })
     }
+
+    /// Fetch, diff, and stash one PR against its stored snapshot; returns the events.
+    /// Shared by the notification and involved-PR paths so both dedupe through the
+    /// same snapshot key.
+    #[allow(clippy::too_many_arguments)]
+    async fn process_pr(
+        &self,
+        state: &dyn StateStore,
+        owner: &str,
+        repo: &str,
+        index: u64,
+        repo_url: Option<String>,
+        first_sight_since: Option<OffsetDateTime>,
+        viewer: &str,
+        now: OffsetDateTime,
+    ) -> Result<Vec<Event>, SourceError> {
+        let scope = format!("{owner}/{repo}#{index}");
+        let pr_data = match self.fetch_pr(owner, repo, index).await {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(%scope, error = %e, "failed to fetch gitea PR; skipping");
+                return Ok(Vec::new());
+            }
+        };
+        let old: PrSnapshot = match state.get_snapshot(SOURCE_ID, &scope).await? {
+            Some(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|e| SourceError::Parse(format!("snapshot {scope}: {e}")))?,
+            None => PrSnapshot::default(),
+        };
+        let ctx = DiffContext {
+            source_id: SOURCE_ID.to_string(),
+            viewer_login: viewer.to_string(),
+            repo: Repo {
+                owner: owner.to_string(),
+                name: repo.to_string(),
+                url: repo_url,
+            },
+            now,
+            first_sight_since,
+            viewer_teams: std::collections::HashSet::new(),
+            comment_min_age: self.comment_min_age,
+            first_sight_backfill: None,
+        };
+        let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
+        let bytes = serde_json::to_vec(&new_snapshot)
+            .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
+        self.pending_snapshots.lock().unwrap().insert(scope, bytes);
+        Ok(evs)
+    }
+
+    /// Open PRs the viewer is involved in (author, assignee, mentioned, or a
+    /// requested reviewer), via `/repos/issues/search`.
+    async fn involved_open_prs(
+        &self,
+    ) -> Result<Vec<(String, String, u64, String, Option<String>)>, SourceError> {
+        self.search_prs("open", None).await
+    }
+
+    /// Involved PRs closed/merged since `since` (RFC3339). Catches self-merges and
+    /// self-closes, which don't notify you and have left the open sweep.
+    async fn recently_closed_prs(
+        &self,
+        since: &str,
+    ) -> Result<Vec<(String, String, u64, String, Option<String>)>, SourceError> {
+        self.search_prs("closed", Some(since)).await
+    }
+
+    /// Search involved PRs by state, returning `(owner, repo, index, updated_at,
+    /// repo_url)`. The `created`/`assigned`/`mentioned`/`review_requested` flags
+    /// scope results to the authenticated user.
+    async fn search_prs(
+        &self,
+        state_filter: &str,
+        since: Option<&str>,
+    ) -> Result<Vec<(String, String, u64, String, Option<String>)>, SourceError> {
+        #[derive(Deserialize)]
+        struct SearchIssue {
+            number: u64,
+            #[serde(default)]
+            updated_at: Option<String>,
+            repository: SearchRepo,
+        }
+        #[derive(Deserialize)]
+        struct SearchRepo {
+            full_name: String,
+            #[serde(default)]
+            html_url: Option<String>,
+        }
+        let mut out = Vec::new();
+        for page in 1..=MAX_PAGES {
+            let mut query = vec![
+                ("type", "pulls".to_string()),
+                ("state", state_filter.to_string()),
+                ("created", "true".to_string()),
+                ("assigned", "true".to_string()),
+                ("mentioned", "true".to_string()),
+                ("review_requested", "true".to_string()),
+                ("page", page.to_string()),
+                ("limit", "50".to_string()),
+            ];
+            if let Some(s) = since {
+                query.push(("since", s.to_string()));
+            }
+            let batch: Vec<SearchIssue> = self.get("/repos/issues/search", &query).await?;
+            let n = batch.len();
+            for it in batch {
+                if let Some((owner, repo)) = it.repository.full_name.split_once('/') {
+                    out.push((
+                        owner.to_string(),
+                        repo.to_string(),
+                        it.number,
+                        it.updated_at.unwrap_or_default(),
+                        it.repository.html_url,
+                    ));
+                }
+            }
+            if n < 50 {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
+    /// Diff a batch of swept PRs, extending `events` and marking each processed.
+    /// Per-PR gated by the `pr:` cursor so an unchanged PR is skipped.
+    async fn diff_swept_prs(
+        &self,
+        state: &dyn StateStore,
+        prs: Vec<(String, String, u64, String, Option<String>)>,
+        processed: &mut HashSet<String>,
+        events: &mut Vec<Event>,
+        viewer: &str,
+        poll_start: OffsetDateTime,
+    ) -> Result<(), SourceError> {
+        for (owner, repo, index, updated_at, repo_url) in prs {
+            let scope = format!("{owner}/{repo}#{index}");
+            if processed.contains(&scope) {
+                continue;
+            }
+            let seen_key = format!("pr:{scope}");
+            if let Some(seen) = state.get_cursor(SOURCE_ID, &seen_key).await? {
+                if updated_at.as_str() <= seen.as_str() {
+                    continue;
+                }
+            }
+            let evs = self
+                .process_pr(
+                    state,
+                    &owner,
+                    &repo,
+                    index,
+                    repo_url,
+                    Some(poll_start - FIRST_SIGHT_LEEWAY),
+                    viewer,
+                    poll_start,
+                )
+                .await?;
+            state.put_cursor(SOURCE_ID, &seen_key, &updated_at).await?;
+            events.extend(evs);
+            processed.insert(scope);
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -174,6 +345,8 @@ impl Source for GiteaSource {
         let notifs = self.notifications(since.as_deref()).await?;
 
         let mut events = Vec::new();
+        // Scopes handled this poll, so the involved-PR sweep doesn't re-process one.
+        let mut processed: HashSet<String> = HashSet::new();
         for n in &notifs {
             if n.subject.kind != "Pull" {
                 continue;
@@ -186,44 +359,63 @@ impl Source for GiteaSource {
                 continue;
             };
             let scope = format!("{owner}/{repo}#{index}");
-
-            let pr_data = match self.fetch_pr(owner, repo, index).await {
-                Ok(d) => d,
-                Err(e) => {
-                    warn!(%scope, error = %e, "failed to fetch gitea PR; skipping");
-                    continue;
-                }
-            };
-
-            let old: PrSnapshot = match state.get_snapshot(SOURCE_ID, &scope).await? {
-                Some(bytes) => serde_json::from_slice(&bytes)
-                    .map_err(|e| SourceError::Parse(format!("snapshot {scope}: {e}")))?,
-                None => PrSnapshot::default(),
-            };
-
-            let ctx = DiffContext {
-                source_id: SOURCE_ID.to_string(),
-                viewer_login: viewer.clone(),
-                repo: Repo {
-                    owner: owner.to_string(),
-                    name: repo.to_string(),
-                    url: n.repository.html_url.clone(),
-                },
-                now: poll_start,
-                first_sight_since: first_sight_watermark(n.updated_at.as_deref()),
-                // Gitea team review requests aren't modelled yet.
-                viewer_teams: std::collections::HashSet::new(),
-                comment_min_age: self.comment_min_age,
-                // Gitea has no involved-PR sweep, so no first-run backfill.
-                first_sight_backfill: None,
-            };
-            let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
-
-            let bytes = serde_json::to_vec(&new_snapshot)
-                .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
-            // Defer persistence to `commit_snapshots` (after delivery).
-            self.pending_snapshots.lock().unwrap().insert(scope, bytes);
+            let evs = self
+                .process_pr(
+                    state,
+                    owner,
+                    repo,
+                    index,
+                    n.repository.html_url.clone(),
+                    first_sight_watermark(n.updated_at.as_deref()),
+                    &viewer,
+                    poll_start,
+                )
+                .await?;
             events.extend(evs);
+            processed.insert(scope);
+        }
+
+        // Involved-PR sweep: catches self-merges/closes and activity on your own PRs
+        // that Gitea doesn't notify you about. Mirrors the GitHub source.
+        let mut open_swept = 0usize;
+        let mut closed_swept = 0usize;
+        if self.track_prs {
+            match self.involved_open_prs().await {
+                Ok(prs) => {
+                    open_swept = prs.len();
+                    self.diff_swept_prs(
+                        state,
+                        prs,
+                        &mut processed,
+                        &mut events,
+                        &viewer,
+                        poll_start,
+                    )
+                    .await?;
+                }
+                Err(e) => warn!(error = %e, "could not search your involved gitea PRs; skipping"),
+            }
+            // Recently closed/merged sweep, skipped on the first poll (no cursor) so
+            // it baselines forward instead of replaying history.
+            if let Some(closed_since) = state.get_cursor(SOURCE_ID, "pr_closed_since").await? {
+                match self.recently_closed_prs(&closed_since).await {
+                    Ok(prs) => {
+                        closed_swept = prs.len();
+                        self.diff_swept_prs(
+                            state,
+                            prs,
+                            &mut processed,
+                            &mut events,
+                            &viewer,
+                            poll_start,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "could not search your recently-closed gitea PRs; skipping")
+                    }
+                }
+            }
         }
 
         let next_since = (poll_start - SINCE_OVERLAP)
@@ -232,10 +424,22 @@ impl Source for GiteaSource {
         state
             .put_cursor(SOURCE_ID, "notif_since", &next_since)
             .await?;
+        // Advance (and on first run, initialize) the closed-sweep window. Second
+        // precision: some search backends reject subsecond `since` values.
+        let closed_since =
+            OffsetDateTime::from_unix_timestamp((poll_start - SINCE_OVERLAP).unix_timestamp())
+                .map_err(|e| SourceError::Other(Box::new(e)))?
+                .format(&Rfc3339)
+                .map_err(|e| SourceError::Other(Box::new(e)))?;
+        state
+            .put_cursor(SOURCE_ID, "pr_closed_since", &closed_since)
+            .await?;
 
         // One INFO summary of what this poll examined (see the GitHub source).
         info!(
             notifications = notifs.len(),
+            open_found = open_swept,
+            closed_found = closed_swept,
             derived = events.len(),
             "gitea poll"
         );

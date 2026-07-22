@@ -108,6 +108,7 @@ async fn run() -> Result<(), String> {
         token: viewer_token,
         api_base: Some(gitea_api.clone()),
         comment_min_age_secs: 0,
+        track_prs: false,
     })
     .map_err(|e| format!("build gitea source: {e}"))?;
     let email = EmailDestination::new(EmailDestinationConfig {
