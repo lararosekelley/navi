@@ -14,7 +14,7 @@ use navi_notifier_core::model::EventKind;
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use serde_json::json;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Stand up a mock GitHub API with the given notifications payload and empty
@@ -382,6 +382,99 @@ async fn poll_finds_involved_pr_via_search_not_in_notifications() {
     assert_eq!(events[0].kind, EventKind::ReviewRequested);
     assert_eq!(events[0].pull_request.number, 2);
     assert_eq!(events[0].pull_request.repo.full_name(), "acme/widgets");
+}
+
+#[tokio::test]
+async fn self_merged_pr_is_caught_by_the_closed_sweep() {
+    // #86: you merge your own PR. GitHub doesn't notify you, and the merged PR has
+    // left the `is:open` sweep, so only the recently-closed sweep can catch it.
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    // Open sweep finds nothing: the PR already merged and left `is:open`.
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .and(query_param("q", "is:open is:pr involves:me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(&server)
+        .await;
+    // Closed sweep (bounded by the seeded cursor) finds the just-merged PR.
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .and(query_param(
+            "q",
+            "is:closed is:pr involves:me updated:>=2024-01-01T00:00:00Z",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "repository_url": format!("{}/repos/acme/widgets", server.uri()),
+                "number": 1,
+                "updated_at": "2024-02-02T00:00:00Z"
+            }]
+        })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 1,
+            "title": "Add gizmo",
+            "html_url": "https://github.com/acme/widgets/pull/1",
+            "state": "closed",
+            "draft": false,
+            "merged": true,
+            "merged_at": "2024-02-02T00:00:00Z",
+            "updated_at": "2024-02-02T00:00:00Z",
+            "user": { "login": "me" },
+            "requested_reviewers": []
+        })))
+        .mount(&server)
+        .await;
+    for sub in [
+        "/repos/acme/widgets/pulls/1/reviews",
+        "/repos/acme/widgets/pulls/1/comments",
+        "/repos/acme/widgets/issues/1/comments",
+    ] {
+        Mock::given(method("GET"))
+            .and(path(sub))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+    }
+
+    let state = MemState::default();
+    // navi had baselined the PR while open, and the closed-sweep cursor is set (i.e.
+    // this isn't navi's first poll).
+    state
+        .put_snapshot("github", "acme/widgets#1", br#"{"initialized":true}"#)
+        .await
+        .unwrap();
+    state
+        .put_cursor("github", "pr_closed_since", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+
+    let source = source_with(&server, true);
+    let events = source.poll(&state).await.expect("poll");
+    let merges = events
+        .iter()
+        .filter(|e| e.kind == EventKind::Merged)
+        .count();
+    assert_eq!(
+        merges,
+        1,
+        "the self-merge must fire exactly one Merged, got {:?}",
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>()
+    );
+    assert_eq!(events[0].pull_request.number, 1);
 }
 
 #[tokio::test]

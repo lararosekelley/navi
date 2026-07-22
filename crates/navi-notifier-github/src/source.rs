@@ -352,6 +352,56 @@ impl GitHubSource {
         Ok(evs)
     }
 
+    /// Diff a batch of swept PRs (from the open or closed involved-PR search),
+    /// extending `events` and marking each `scope` processed. Per-PR gated by the
+    /// `pr:` cursor so an unchanged PR is skipped. There's no triggering
+    /// notification to anchor first sight, so activity from the last leeway window
+    /// is surfaced and older history baselined; `first_sight_backfill` overrides
+    /// that on the first poll (open sweep only).
+    #[allow(clippy::too_many_arguments)]
+    async fn diff_swept_prs(
+        &self,
+        state: &dyn StateStore,
+        prs: Vec<(String, String, u64, String)>,
+        processed: &mut HashSet<String>,
+        events: &mut Vec<Event>,
+        viewer: &str,
+        viewer_teams: &HashSet<String>,
+        poll_start: OffsetDateTime,
+        first_sight_backfill: Option<Backfill>,
+    ) -> Result<(), SourceError> {
+        for (owner, repo, number, updated_at) in prs {
+            let scope = format!("{owner}/{repo}#{number}");
+            if processed.contains(&scope) {
+                continue;
+            }
+            let seen_key = format!("pr:{scope}");
+            if let Some(seen) = state.get_cursor(SOURCE_ID, &seen_key).await? {
+                if updated_at.as_str() <= seen.as_str() {
+                    continue;
+                }
+            }
+            let evs = self
+                .process_pr(
+                    state,
+                    &owner,
+                    &repo,
+                    number,
+                    Some(format!("https://github.com/{owner}/{repo}")),
+                    Some(poll_start - FIRST_SIGHT_LEEWAY),
+                    first_sight_backfill,
+                    viewer,
+                    viewer_teams,
+                    poll_start,
+                )
+                .await?;
+            state.put_cursor(SOURCE_ID, &seen_key, &updated_at).await?;
+            events.extend(evs);
+            processed.insert(scope);
+        }
+        Ok(())
+    }
+
     /// Detect whether the PR's repo uses a merge queue, and if so diff its queue
     /// state against the last-seen state to build an entered/removed event. Skips
     /// (cheaply, via a cached per-repo verdict) repos without a queue, baselines
@@ -497,6 +547,31 @@ impl GitHubSource {
         &self,
         viewer: &str,
     ) -> Result<Vec<(String, String, u64, String)>, SourceError> {
+        self.search_prs(&format!("is:open is:pr involves:{viewer}"), "open")
+            .await
+    }
+
+    /// Involved PRs closed or merged since `since` (RFC3339). This is what catches a
+    /// merge or close you performed yourself: GitHub never notifies you about your
+    /// own actions, and a closed PR has already left the open sweep, so without this
+    /// the transition is invisible. Bounded by `updated:>=` so it doesn't rescan
+    /// history. Returns `(owner, repo, number, updated_at)`.
+    async fn recently_closed_prs(
+        &self,
+        viewer: &str,
+        since: &str,
+    ) -> Result<Vec<(String, String, u64, String)>, SourceError> {
+        let q = format!("is:closed is:pr involves:{viewer} updated:>={since}");
+        self.search_prs(&q, "closed").await
+    }
+
+    /// Run a `/search/issues` query across pages, returning `(owner, repo, number,
+    /// updated_at)` for each hit. `kind` is only for the page-cap warning.
+    async fn search_prs(
+        &self,
+        q: &str,
+        kind: &str,
+    ) -> Result<Vec<(String, String, u64, String)>, SourceError> {
         #[derive(Serialize)]
         struct Params<'a> {
             q: &'a str,
@@ -514,7 +589,6 @@ impl GitHubSource {
             updated_at: String,
         }
 
-        let q = format!("is:open is:pr involves:{viewer}");
         let mut out = Vec::new();
         for page in 1..=MAX_PAGES {
             let res: SearchPage = self
@@ -522,7 +596,7 @@ impl GitHubSource {
                 .get(
                     "/search/issues",
                     Some(&Params {
-                        q: &q,
+                        q,
                         per_page: 100,
                         page,
                     }),
@@ -540,8 +614,9 @@ impl GitHubSource {
             }
             if page == MAX_PAGES {
                 warn!(
+                    kind,
                     cap = MAX_PAGES as u32 * 100,
-                    "involved-PR search hit the page cap; some open PRs skipped this poll"
+                    "involved-PR search hit the page cap; some PRs skipped this poll"
                 );
             }
         }
@@ -646,45 +721,50 @@ impl Source for GitHubSource {
         // surfaces as a notification. A per-PR cursor keeps it cheap (only PRs
         // whose `updated_at` advanced get fetched).
         if self.track_prs {
+            // Open involved PRs: activity on PRs GitHub may not have notified about.
             match self.involved_open_prs(&viewer).await {
                 Ok(prs) => {
                     debug!(count = prs.len(), "fetched involved open PRs");
-                    for (owner, repo, number, updated_at) in prs {
-                        let scope = format!("{owner}/{repo}#{number}");
-                        if processed.contains(&scope) {
-                            continue;
-                        }
-                        let seen_key = format!("pr:{scope}");
-                        if let Some(seen) = state.get_cursor(SOURCE_ID, &seen_key).await? {
-                            if updated_at.as_str() <= seen.as_str() {
-                                continue;
-                            }
-                        }
-                        // No triggering notification here to anchor first sight, so
-                        // normally surface only activity from the last leeway window;
-                        // older history is baselined silently. On the first poll,
-                        // `sweep_backfill` overrides that per the configured mode.
-                        let evs = self
-                            .process_pr(
-                                state,
-                                &owner,
-                                &repo,
-                                number,
-                                Some(format!("https://github.com/{owner}/{repo}")),
-                                Some(poll_start - FIRST_SIGHT_LEEWAY),
-                                sweep_backfill,
-                                &viewer,
-                                &viewer_teams,
-                                poll_start,
-                            )
-                            .await?;
-                        state.put_cursor(SOURCE_ID, &seen_key, &updated_at).await?;
-                        events.extend(evs);
-                        processed.insert(scope);
-                    }
+                    self.diff_swept_prs(
+                        state,
+                        prs,
+                        &mut processed,
+                        &mut events,
+                        &viewer,
+                        &viewer_teams,
+                        poll_start,
+                        sweep_backfill,
+                    )
+                    .await?;
                 }
                 Err(e) => {
                     warn!(error = %e, "could not search your involved PRs; skipping that pass");
+                }
+            }
+            // Recently closed/merged involved PRs. GitHub never notifies you about a
+            // merge or close you did yourself, and a closed PR has left the open
+            // sweep, so this is the only way navi sees your own self-merge/close.
+            // Skipped on the very first poll (no cursor) so it baselines forward
+            // instead of replaying history.
+            if let Some(since) = state.get_cursor(SOURCE_ID, "pr_closed_since").await? {
+                match self.recently_closed_prs(&viewer, &since).await {
+                    Ok(prs) => {
+                        debug!(count = prs.len(), "fetched recently-closed involved PRs");
+                        self.diff_swept_prs(
+                            state,
+                            prs,
+                            &mut processed,
+                            &mut events,
+                            &viewer,
+                            &viewer_teams,
+                            poll_start,
+                            None,
+                        )
+                        .await?;
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "could not search your recently-closed PRs; skipping that pass");
+                    }
                 }
             }
         }
@@ -696,6 +776,16 @@ impl Source for GitHubSource {
             .map_err(|e| SourceError::Other(Box::new(e)))?;
         state
             .put_cursor(SOURCE_ID, "notif_since", &next_since)
+            .await?;
+        // Advance (and on first run, initialize) the closed-sweep window. Second
+        // precision: GitHub search's `updated:` qualifier rejects subseconds.
+        let closed_since =
+            OffsetDateTime::from_unix_timestamp((poll_start - SINCE_OVERLAP).unix_timestamp())
+                .map_err(|e| SourceError::Other(Box::new(e)))?
+                .format(&Rfc3339)
+                .map_err(|e| SourceError::Other(Box::new(e)))?;
+        state
+            .put_cursor(SOURCE_ID, "pr_closed_since", &closed_since)
             .await?;
         // Mark the initial catch-up done so later polls use normal first-sight.
         if first_run {
