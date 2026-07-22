@@ -2,6 +2,8 @@
 
 mod common;
 
+use std::collections::HashSet;
+
 use common::MemState;
 use navi_notifier_core::model::EventKind;
 use navi_notifier_core::traits::{Source, StateStore};
@@ -164,5 +166,29 @@ async fn self_merged_pr_caught_by_the_closed_sweep() {
     assert_eq!(
         merge.pull_request.repo.url.as_deref(),
         Some("https://gitea.test/acme/widgets")
+    );
+
+    // #98: the `pr:` cursor is deferred until commit, so a failed delivery re-derives
+    // the merge next poll instead of skipping it.
+    assert_eq!(
+        state
+            .get_cursor("gitea", "pr:acme/widgets#3")
+            .await
+            .unwrap(),
+        None,
+        "sweep cursor must be deferred until delivery"
+    );
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .get_cursor("gitea", "pr:acme/widgets#3")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2024-02-02T00:00:00Z"),
+        "commit advances the cursor once delivery is confirmed"
     );
 }

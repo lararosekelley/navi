@@ -52,6 +52,9 @@ pub struct GiteaSource {
     track_prs: bool,
     /// First-run backfill mode, applied to the involved-PR sweep on the first poll.
     backfill: Backfill,
+    /// scope (`owner/repo#n`) -> involved-sweep `pr:` cursor value, deferred until
+    /// `commit_snapshots` so a failed delivery re-derives the PR instead of skipping.
+    pending_pr_cursors: Mutex<HashMap<String, String>>,
 }
 
 impl GiteaSource {
@@ -77,6 +80,7 @@ impl GiteaSource {
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
             track_prs: config.track_prs,
             backfill: config.backfill,
+            pending_pr_cursors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -331,7 +335,11 @@ impl GiteaSource {
                     poll_start,
                 )
                 .await?;
-            state.put_cursor(SOURCE_ID, &seen_key, &updated_at).await?;
+            // Defer the cursor advance to `commit_snapshots` (after delivery).
+            self.pending_pr_cursors
+                .lock()
+                .unwrap()
+                .insert(scope.clone(), updated_at);
             events.extend(evs);
             processed.insert(scope);
         }
@@ -350,6 +358,7 @@ impl Source for GiteaSource {
         let poll_start = OffsetDateTime::now_utc();
         // Fresh stash each pass; deferred snapshots persist via `commit_snapshots`.
         self.pending_snapshots.lock().unwrap().clear();
+        self.pending_pr_cursors.lock().unwrap().clear();
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
         let notifs = self.notifications(since.as_deref()).await?;
 
@@ -493,6 +502,24 @@ impl Source for GiteaSource {
                 .map_err(SourceError::from)
             {
                 warn!(%scope, error = %e, "failed to persist snapshot; it will re-derive next poll");
+                first_err.get_or_insert(e);
+            }
+        }
+
+        // Flush deferred involved-sweep `pr:` cursors, skipping failed scopes so a
+        // dropped delivery re-derives the PR next poll.
+        let pending_cursors: Vec<(String, String)> =
+            self.pending_pr_cursors.lock().unwrap().drain().collect();
+        for (scope, value) in pending_cursors {
+            if failed_scopes.contains(&scope) {
+                continue;
+            }
+            if let Err(e) = state
+                .put_cursor(SOURCE_ID, &format!("pr:{scope}"), &value)
+                .await
+                .map_err(SourceError::from)
+            {
+                warn!(%scope, error = %e, "failed to persist involved-PR cursor; it will re-derive next poll");
                 first_err.get_or_insert(e);
             }
         }
