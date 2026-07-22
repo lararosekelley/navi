@@ -34,6 +34,19 @@ pub fn opt_in(config_path: &Path) -> Result<()> {
         if let Some(text) = providers::setup_text(id) {
             println!("\n{text}\n");
         }
+        // For bot-mode Discord, offer to build the invite link from the app's id.
+        if *id == "discord" {
+            let cid =
+                prompt::input("Discord app Client ID for a ready invite link (blank to skip): ")?;
+            let cid = cid.trim();
+            if !cid.is_empty() {
+                if cid.chars().all(|c| c.is_ascii_digit()) {
+                    println!("  invite: {}", providers::discord_invite_url(cid));
+                } else {
+                    println!("  (skipped: Client ID should be a numeric snowflake)");
+                }
+            }
+        }
         if let Some(env) = secret_env {
             let value = prompt::input(&format!("Paste {env} now (or leave blank to set later): "))?;
             if !value.is_empty() {
