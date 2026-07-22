@@ -92,6 +92,7 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Service { action } => match action {
             ServiceAction::Install { yes } => service::install(&config_path, yes),
             ServiceAction::Uninstall { yes } => service::uninstall(yes),
+            ServiceAction::Restart => service::restart(),
             ServiceAction::Status => service::status(),
         },
         Command::Uninstall { dry_run, yes } => setup::uninstall(dry_run, yes),
