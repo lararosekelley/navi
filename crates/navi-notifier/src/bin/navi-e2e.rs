@@ -74,6 +74,7 @@ async fn run() -> Result<(), String> {
         token: slack_token,
         dm_to,
         api_base: None,
+        broadcast: Vec::new(),
     })
     .map_err(|e| format!("building Slack destination: {e}"))?;
     let who = destination

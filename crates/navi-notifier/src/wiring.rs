@@ -154,6 +154,7 @@ pub fn build_slack(config: &SlackConfig) -> Result<SlackDestination> {
         token,
         dm_to: config.dm_to.clone(),
         api_base: None,
+        broadcast: config.broadcast.clone(),
     })
     .context("initializing Slack destination")
 }

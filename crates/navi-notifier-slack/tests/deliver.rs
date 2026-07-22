@@ -88,6 +88,7 @@ fn destination(server: &MockServer, dm_to: &str) -> SlackDestination {
         token: "xoxb-test".into(),
         dm_to: dm_to.into(),
         api_base: Some(format!("{}/api", server.uri())),
+        broadcast: vec!["merged".into(), "closed".into(), "review_dismissed".into()],
     })
     .expect("build destination")
 }
@@ -180,6 +181,51 @@ async fn second_event_on_a_pr_replies_in_the_first_ones_thread() {
     assert_eq!(
         posts[1]["thread_ts"], "111.222",
         "reply must anchor to the parent"
+    );
+}
+
+#[tokio::test]
+async fn terminal_events_broadcast_out_of_the_thread() {
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        "chat.postMessage",
+        json!({ "ok": true, "ts": "111.222" }),
+    )
+    .await;
+
+    let state = MemState::default();
+    let dest = destination(&server, "C0123456789");
+    // Parent (a review submission) opens the thread.
+    dest.send(&sample_event(), &state).await.expect("parent");
+    // A merge on the same PR replies AND broadcasts (it's in the default set).
+    let mut merged = sample_event();
+    merged.kind = EventKind::Merged;
+    dest.send(&merged, &state).await.expect("merge");
+    // A non-terminal event on the same PR replies but does not broadcast.
+    dest.send(&sample_event(), &state).await.expect("reply");
+
+    let posts: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat.postMessage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 3);
+    assert!(
+        posts[0].get("thread_ts").is_none(),
+        "parent posts top-level"
+    );
+    // Merge: threaded and broadcast to the channel.
+    assert_eq!(posts[1]["thread_ts"], "111.222");
+    assert_eq!(posts[1]["reply_broadcast"], true);
+    // Non-terminal reply: threaded, not broadcast.
+    assert_eq!(posts[2]["thread_ts"], "111.222");
+    assert!(
+        posts[2].get("reply_broadcast").is_none(),
+        "a non-terminal reply must stay thread-only"
     );
 }
 

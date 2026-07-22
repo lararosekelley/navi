@@ -353,6 +353,12 @@ enabled = false
 token_env = "NAVI_SLACK_TOKEN"
 # "self" DMs whoever the token authenticates as; or set a Slack user id like "U0123".
 dm_to = "self"
+# A PR's events are grouped into one Slack thread. These event kinds also surface at
+# the top level (Slack reply_broadcast) so high-signal ones aren't buried in-thread.
+# Set to [] for pure threading, or add kinds. Valid tags: review_requested,
+# re_review_requested, review_submitted, review_dismissed, comment_reply, mentioned,
+# merged, closed, ready_for_review, entered_merge_queue, removed_merge_queue.
+broadcast = ["merged", "closed", "review_dismissed"]
 
 [discord]
 # Off by default. dm_to is either a webhook URL (simplest, no token) or a user id.

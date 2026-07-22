@@ -7,6 +7,7 @@
 
 mod render;
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -29,6 +30,8 @@ pub struct SlackDestinationConfig {
     /// Override the Slack Web API base URL. `None` uses `https://slack.com/api`.
     /// Primarily for pointing tests at a mock server.
     pub api_base: Option<String>,
+    /// Event-kind tags that broadcast out of the thread (also posted top-level).
+    pub broadcast: Vec<String>,
 }
 
 pub struct SlackDestination {
@@ -37,6 +40,8 @@ pub struct SlackDestination {
     dm_to: String,
     api_base: String,
     channel: OnceCell<String>,
+    /// Event-kind tags whose threaded replies also broadcast to the channel.
+    broadcast: HashSet<String>,
 }
 
 impl SlackDestination {
@@ -58,6 +63,7 @@ impl SlackDestination {
                 .api_base
                 .unwrap_or_else(|| DEFAULT_API_BASE.to_string()),
             channel: OnceCell::new(),
+            broadcast: config.broadcast.into_iter().collect(),
         })
     }
 
@@ -157,8 +163,16 @@ impl Destination for SlackDestination {
         // so a state read/write failure just falls back to a top-level message.
         let key = thread_key(event);
         let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
+        // High-signal kinds break out of the thread so they aren't buried. Only
+        // meaningful for a reply (a thread-opening message is already top-level).
+        let broadcast = parent.is_some() && self.broadcast.contains(event.kind.tag());
         let posted_ts = self
-            .post(&render(event), &event.dedup_key, parent.as_deref())
+            .post(
+                &render(event),
+                &event.dedup_key,
+                parent.as_deref(),
+                broadcast,
+            )
             .await?;
         if parent.is_none() {
             if let Some(ts) = posted_ts {
@@ -174,7 +188,7 @@ impl Destination for SlackDestination {
         _state: &dyn StateStore,
     ) -> Result<(), DestinationError> {
         // A digest spans many PRs, so it posts at the top level, not in any thread.
-        self.post(&render_digest(events), "digest", None)
+        self.post(&render_digest(events), "digest", None, false)
             .await
             .map(|_| ())
     }
@@ -200,6 +214,7 @@ impl SlackDestination {
         rendered: &Rendered,
         label: &str,
         thread_ts: Option<&str>,
+        broadcast: bool,
     ) -> Result<Option<String>, DestinationError> {
         let channel = self.target().await?.to_string();
         let mut body = json!({
@@ -210,6 +225,10 @@ impl SlackDestination {
         });
         if let Some(ts) = thread_ts {
             body["thread_ts"] = json!(ts);
+            // Also surface the reply at the top level so it isn't buried in-thread.
+            if broadcast {
+                body["reply_broadcast"] = json!(true);
+            }
         }
 
         let mut attempt = 0;

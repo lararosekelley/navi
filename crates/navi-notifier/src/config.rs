@@ -180,6 +180,10 @@ pub struct SlackConfig {
     /// DM target: a Slack user id (`U…`) or the literal `"self"` to DM the user the
     /// bot token's `auth.test` resolves to.
     pub dm_to: String,
+    /// Event kinds (by tag) that break out of the PR thread: they still post in the
+    /// thread but also surface at the top level (`reply_broadcast`), so high-signal
+    /// events aren't buried. Empty = pure threading, nothing broadcasts.
+    pub broadcast: Vec<String>,
 }
 
 impl Default for SlackConfig {
@@ -189,6 +193,7 @@ impl Default for SlackConfig {
             token_env: "NAVI_SLACK_TOKEN".into(),
             token: None,
             dm_to: "self".into(),
+            broadcast: vec!["merged".into(), "closed".into(), "review_dismissed".into()],
         }
     }
 }
