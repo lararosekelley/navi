@@ -460,6 +460,12 @@ destination = "slack"
 # source = "github"
 # destination = "email"
 # repos = ["me/*"]
+# Set `fallback = true` on a route to catch only events no other route claimed —
+# "everything else". e.g. acme/* to Slack above, and the remainder to email:
+# [[routes]]
+# source = "github"
+# destination = "email"
+# fallback = true
 
 # Digest: batch low-signal event kinds into one periodic summary instead of
 # alerting on each. Off by default. Kinds not listed still alert in real time.
