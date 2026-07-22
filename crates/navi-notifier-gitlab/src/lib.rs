@@ -17,7 +17,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use navi_notifier_core::model::{Actor, Event, EventKind, PullRequest, Repo, ViewerRelationship};
 use navi_notifier_core::traits::{Source, StateStore};
-use navi_notifier_core::SourceError;
+use navi_notifier_core::{Backfill, SourceError};
 use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
@@ -40,6 +40,8 @@ pub struct GitLabSourceConfig {
     /// Hold a note back until it is at least this many seconds old (0 = off), so
     /// edit-in-place bots resolve to their final text before we notify.
     pub comment_min_age_secs: u64,
+    /// How much pre-existing activity to surface on the very first poll.
+    pub backfill: Backfill,
 }
 
 pub struct GitLabSource {
@@ -52,6 +54,8 @@ pub struct GitLabSource {
     pending_snapshots: Mutex<HashMap<String, Vec<u8>>>,
     /// Min note age before notifying (`None` = off), passed through to the diff.
     comment_min_age: Option<Duration>,
+    /// First-run backfill mode, applied to the involved-MR sweep on the first poll.
+    backfill: Backfill,
 }
 
 impl GitLabSource {
@@ -75,6 +79,7 @@ impl GitLabSource {
             pending_snapshots: Mutex::new(HashMap::new()),
             comment_min_age: (config.comment_min_age_secs > 0)
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
+            backfill: config.backfill,
         })
     }
 
@@ -224,6 +229,13 @@ impl Source for GitLabSource {
             .filter_map(|todo| todo_to_event(todo, &viewer, now))
             .collect();
 
+        // On the first poll ever, the note-diff sweep applies the configured backfill
+        // mode instead of baselining silently. Only `all_open` surfaces history;
+        // `review_requests` is already covered by the todos path above.
+        let first_run = state.get_cursor(SOURCE_ID, "backfilled").await?.is_none();
+        let sweep_backfill =
+            (first_run && self.backfill == Backfill::AllOpen).then_some(self.backfill);
+
         // Note-diff path: merges, closes, ready, and replies on involved MRs.
         let since = state.get_cursor(SOURCE_ID, "mr_since").await?;
         let mut mrs_seen = 0usize;
@@ -250,6 +262,7 @@ impl Source for GitLabSource {
                         repo,
                         now,
                         comment_min_age: self.comment_min_age,
+                        first_sight_backfill: sweep_backfill,
                     };
                     let (evs, snapshot) = diff_mr(&ctx, &mr, &discussions, &old);
                     let bytes = serde_json::to_vec(&snapshot)
@@ -269,6 +282,10 @@ impl Source for GitLabSource {
             .format(&Rfc3339)
             .map_err(|e| SourceError::Other(Box::new(e)))?;
         state.put_cursor(SOURCE_ID, "mr_since", &next_since).await?;
+        // Mark the initial catch-up done so later polls use normal first-sight.
+        if first_run {
+            state.put_cursor(SOURCE_ID, "backfilled", "1").await?;
+        }
 
         // One INFO summary of what this poll examined (see the GitHub source).
         info!(

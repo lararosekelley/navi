@@ -307,11 +307,13 @@ utc_offset_minutes = 0
 # a placeholder and edits it in place (e.g. "Claude Code is working…" → the review)
 # settles to its final text first. Costs up to this much delay on comment alerts.
 comment_min_age_secs = 0
-# What to surface on the very first poll, before navi has any stored state:
+# What to surface on the very first poll, before navi has any stored state. Applies
+# to every source (github, gitlab, gitea):
 #   "review_requests" (default) - PRs currently awaiting your review
 #   "none"                      - baseline silently, alert only on new activity
 #   "all_open"                  - backfill every open PR you're involved in (noisy;
-#                                 needs github.track_prs = true)
+#                                 needs the involved-PR sweep: track_prs for github
+#                                 and gitea; gitlab always sweeps)
 backfill = "review_requests"
 
 # Every provider starts disabled. `navi init` walks you through enabling the ones

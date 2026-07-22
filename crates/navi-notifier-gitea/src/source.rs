@@ -8,7 +8,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use navi_notifier_core::model::{Event, Repo};
 use navi_notifier_core::traits::{Source, StateStore};
-use navi_notifier_core::SourceError;
+use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::PrData;
 use navi_notifier_forge::{
     diff, first_sight_watermark, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
@@ -34,6 +34,8 @@ pub struct GiteaSourceConfig {
     pub comment_min_age_secs: u64,
     /// Poll your involved PRs directly (search), on top of notifications.
     pub track_prs: bool,
+    /// How much pre-existing activity to surface on the very first poll.
+    pub backfill: Backfill,
 }
 
 pub struct GiteaSource {
@@ -48,6 +50,8 @@ pub struct GiteaSource {
     comment_min_age: Option<Duration>,
     /// Whether to also sweep your involved PRs directly (catches self-merges/closes).
     track_prs: bool,
+    /// First-run backfill mode, applied to the involved-PR sweep on the first poll.
+    backfill: Backfill,
 }
 
 impl GiteaSource {
@@ -72,6 +76,7 @@ impl GiteaSource {
             comment_min_age: (config.comment_min_age_secs > 0)
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
             track_prs: config.track_prs,
+            backfill: config.backfill,
         })
     }
 
@@ -178,6 +183,7 @@ impl GiteaSource {
         index: u64,
         repo_url: Option<String>,
         first_sight_since: Option<OffsetDateTime>,
+        first_sight_backfill: Option<Backfill>,
         viewer: &str,
         now: OffsetDateTime,
     ) -> Result<Vec<Event>, SourceError> {
@@ -206,7 +212,7 @@ impl GiteaSource {
             first_sight_since,
             viewer_teams: std::collections::HashSet::new(),
             comment_min_age: self.comment_min_age,
-            first_sight_backfill: None,
+            first_sight_backfill,
         };
         let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
         let bytes = serde_json::to_vec(&new_snapshot)
@@ -290,6 +296,7 @@ impl GiteaSource {
 
     /// Diff a batch of swept PRs, extending `events` and marking each processed.
     /// Per-PR gated by the `pr:` cursor so an unchanged PR is skipped.
+    #[allow(clippy::too_many_arguments)]
     async fn diff_swept_prs(
         &self,
         state: &dyn StateStore,
@@ -298,6 +305,7 @@ impl GiteaSource {
         events: &mut Vec<Event>,
         viewer: &str,
         poll_start: OffsetDateTime,
+        first_sight_backfill: Option<Backfill>,
     ) -> Result<(), SourceError> {
         for (owner, repo, index, updated_at, repo_url) in prs {
             let scope = format!("{owner}/{repo}#{index}");
@@ -318,6 +326,7 @@ impl GiteaSource {
                     index,
                     repo_url,
                     Some(poll_start - FIRST_SIGHT_LEEWAY),
+                    first_sight_backfill,
                     viewer,
                     poll_start,
                 )
@@ -344,6 +353,14 @@ impl Source for GiteaSource {
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
         let notifs = self.notifications(since.as_deref()).await?;
 
+        // On the first poll ever, the involved-PR sweep applies the configured
+        // backfill mode instead of the normal recent-only first-sight.
+        // `review_requests` is the established behaviour, so only `none`/`all_open`
+        // need the override.
+        let first_run = state.get_cursor(SOURCE_ID, "backfilled").await?.is_none();
+        let sweep_backfill =
+            (first_run && self.backfill != Backfill::ReviewRequests).then_some(self.backfill);
+
         let mut events = Vec::new();
         // Scopes handled this poll, so the involved-PR sweep doesn't re-process one.
         let mut processed: HashSet<String> = HashSet::new();
@@ -367,6 +384,8 @@ impl Source for GiteaSource {
                     index,
                     n.repository.html_url.clone(),
                     first_sight_watermark(n.updated_at.as_deref()),
+                    // Notifications are always "just happened", never backfill.
+                    None,
                     &viewer,
                     poll_start,
                 )
@@ -390,6 +409,7 @@ impl Source for GiteaSource {
                         &mut events,
                         &viewer,
                         poll_start,
+                        sweep_backfill,
                     )
                     .await?;
                 }
@@ -408,6 +428,7 @@ impl Source for GiteaSource {
                             &mut events,
                             &viewer,
                             poll_start,
+                            None,
                         )
                         .await?;
                     }
@@ -434,6 +455,10 @@ impl Source for GiteaSource {
         state
             .put_cursor(SOURCE_ID, "pr_closed_since", &closed_since)
             .await?;
+        // Mark the initial catch-up done so later polls use normal first-sight.
+        if first_run {
+            state.put_cursor(SOURCE_ID, "backfilled", "1").await?;
+        }
 
         // One INFO summary of what this poll examined (see the GitHub source).
         info!(

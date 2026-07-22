@@ -93,6 +93,7 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
                 token: config.gitlab.resolve_token()?,
                 api_base: config.gitlab.api_base.clone(),
                 comment_min_age_secs: config.general.comment_min_age_secs,
+                backfill: config.general.backfill,
             })
             .context("initializing GitLab source")?,
         )),
@@ -102,6 +103,7 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
                 api_base: config.gitea.api_base.clone(),
                 comment_min_age_secs: config.general.comment_min_age_secs,
                 track_prs: config.gitea.track_prs,
+                backfill: config.general.backfill,
             })
             .context("initializing Gitea source")?,
         )),
