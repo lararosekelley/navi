@@ -42,6 +42,30 @@ pub fn upsert(config_path: &Path, key: &str, value: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open the `navi.env` beside `config_path` in the user's editor, creating it
+/// (chmod 600 on unix) first if it doesn't exist so first-time secret entry works.
+pub fn edit(config_path: &Path) -> Result<()> {
+    let dir = config_path
+        .parent()
+        .ok_or_else(|| anyhow!("config path has no parent directory"))?;
+    std::fs::create_dir_all(dir).ok();
+    let path = dir.join(ENV_FILE);
+    if !path.exists() {
+        // Same owner-only-before-write dance as `upsert`: chmod the temp file
+        // before it holds anything, so the file this user will soon paste tokens
+        // into is never briefly world-readable under a 0644 umask.
+        let seed = "# navi.env: KEY=value per line. Values here override shell variables.\n";
+        let mut tmp = NamedTempFile::new_in(dir)
+            .with_context(|| format!("creating temp file in {}", dir.display()))?;
+        set_owner_only(tmp.path());
+        tmp.write_all(seed.as_bytes())
+            .with_context(|| format!("writing {}", path.display()))?;
+        tmp.persist(&path)
+            .with_context(|| format!("creating {}", path.display()))?;
+    }
+    crate::editor::open(&path)
+}
+
 /// Pure core of [`upsert`]: return the file text with `key=value` updated in
 /// place, or appended if absent.
 fn upsert_line(existing: &str, key: &str, value: &str) -> String {

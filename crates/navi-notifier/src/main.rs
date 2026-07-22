@@ -7,6 +7,7 @@ mod completions;
 mod config;
 mod config_cmd;
 mod doctor;
+mod editor;
 mod envfile;
 mod guided;
 mod logs;
@@ -75,7 +76,9 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
         Command::Config { action } => match action {
             ConfigAction::Get { key } => config_cmd::get(&config_path, &key),
             ConfigAction::Set { key, value } => config_cmd::set(&config_path, &key, &value),
+            ConfigAction::Edit => config_cmd::edit(&config_path),
         },
+        Command::Env => envfile::edit(&config_path),
         Command::Providers { action } => match action.unwrap_or(ProvidersAction::List) {
             ProvidersAction::List => {
                 providers::list(&load_and_init_logging(&config_path)?);
