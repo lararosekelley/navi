@@ -14,7 +14,7 @@ use navi_notifier_forge::{diff, first_sight_watermark, DiffContext, PrSnapshot};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use crate::api::{GiteaIssueComment, GiteaPull, GiteaReview, GiteaUser, Notification};
 
@@ -172,7 +172,6 @@ impl Source for GiteaSource {
         self.pending_snapshots.lock().unwrap().clear();
         let since = state.get_cursor(SOURCE_ID, "notif_since").await?;
         let notifs = self.notifications(since.as_deref()).await?;
-        debug!(count = notifs.len(), "fetched gitea notifications");
 
         let mut events = Vec::new();
         for n in &notifs {
@@ -234,6 +233,12 @@ impl Source for GiteaSource {
             .put_cursor(SOURCE_ID, "notif_since", &next_since)
             .await?;
 
+        // One INFO summary of what this poll examined (see the GitHub source).
+        info!(
+            notifications = notifs.len(),
+            derived = events.len(),
+            "gitea poll"
+        );
         Ok(events)
     }
 

@@ -22,7 +22,7 @@ use serde::Serialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 use api::{Discussion, MergeRequest, Todo, User};
 use mr_diff::{diff_mr, MrContext, MrSnapshot};
@@ -212,7 +212,6 @@ impl Source for GitLabSource {
 
         // Todos path: review requests and mentions.
         let todos = self.todos().await?;
-        debug!(count = todos.len(), "fetched gitlab todos");
         let mut events: Vec<Event> = todos
             .iter()
             .filter_map(|todo| todo_to_event(todo, &viewer, now))
@@ -220,9 +219,10 @@ impl Source for GitLabSource {
 
         // Note-diff path: merges, closes, ready, and replies on involved MRs.
         let since = state.get_cursor(SOURCE_ID, "mr_since").await?;
+        let mut mrs_seen = 0usize;
         match self.involved_mrs(&viewer, since.as_deref()).await {
             Ok(mrs) => {
-                debug!(count = mrs.len(), "fetched involved gitlab MRs");
+                mrs_seen = mrs.len();
                 for mr in mrs {
                     let repo = repo_from_mr(&mr);
                     let scope = format!("{}#{}", repo.full_name(), mr.iid);
@@ -262,6 +262,13 @@ impl Source for GitLabSource {
             .map_err(|e| SourceError::Other(Box::new(e)))?;
         state.put_cursor(SOURCE_ID, "mr_since", &next_since).await?;
 
+        // One INFO summary of what this poll examined (see the GitHub source).
+        info!(
+            todos = todos.len(),
+            mrs = mrs_seen,
+            derived = events.len(),
+            "gitlab poll"
+        );
         Ok(events)
     }
 

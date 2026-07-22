@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
-use tracing::{debug, warn};
+use tracing::{info, warn};
 
 /// A team from `GET /user/teams`, reduced to what we need to match team requests.
 #[derive(Deserialize)]
@@ -657,7 +657,6 @@ impl Source for GitHubSource {
         }
 
         let notifs = self.notifications(since.as_deref()).await?;
-        debug!(count = notifs.len(), "fetched notifications");
 
         let mut events = Vec::new();
         // Scopes handled this poll, so the involved-PR pass doesn't re-process one.
@@ -720,11 +719,13 @@ impl Source for GitHubSource {
         // reviews on your own PRs and activity in muted repos that GitHub never
         // surfaces as a notification. A per-PR cursor keeps it cheap (only PRs
         // whose `updated_at` advanced get fetched).
+        let mut open_swept = 0usize;
+        let mut closed_swept = 0usize;
         if self.track_prs {
             // Open involved PRs: activity on PRs GitHub may not have notified about.
             match self.involved_open_prs(&viewer).await {
                 Ok(prs) => {
-                    debug!(count = prs.len(), "fetched involved open PRs");
+                    open_swept = prs.len();
                     self.diff_swept_prs(
                         state,
                         prs,
@@ -749,7 +750,7 @@ impl Source for GitHubSource {
             if let Some(since) = state.get_cursor(SOURCE_ID, "pr_closed_since").await? {
                 match self.recently_closed_prs(&viewer, &since).await {
                     Ok(prs) => {
-                        debug!(count = prs.len(), "fetched recently-closed involved PRs");
+                        closed_swept = prs.len();
                         self.diff_swept_prs(
                             state,
                             prs,
@@ -792,6 +793,17 @@ impl Source for GitHubSource {
             state.put_cursor(SOURCE_ID, "backfilled", "1").await?;
         }
 
+        // One INFO summary of what this poll examined, so `navi logs` shows whether
+        // navi saw the activity at all - not just how much it delivered.
+        // `*_found` are search-result counts (before the per-PR cursor skip);
+        // `derived` is the events actually produced.
+        info!(
+            notifications = notifs.len(),
+            open_found = open_swept,
+            closed_found = closed_swept,
+            derived = events.len(),
+            "github poll"
+        );
         Ok(events)
     }
 
