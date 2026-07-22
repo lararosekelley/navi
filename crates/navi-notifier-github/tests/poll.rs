@@ -457,3 +457,187 @@ async fn involved_path_catches_a_pr_whose_notification_is_stale() {
     );
     assert_eq!(events[0].kind, EventKind::ReviewRequested);
 }
+
+/// Mount a GraphQL response reporting whether the base uses a queue and the PR's
+/// current entry state (or null).
+async fn mock_merge_queue(server: &MockServer, enabled: bool, state: Option<&str>) {
+    let entry = match state {
+        Some(s) => json!({ "state": s }),
+        None => json!(null),
+    };
+    Mock::given(method("POST"))
+        .and(path("/graphql"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "data": { "repository": { "pullRequest": {
+                "isMergeQueueEnabled": enabled,
+                "mergeQueueEntry": entry
+            } } }
+        })))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn merge_queue_entry_emits_entered_event() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+    mock_merge_queue(&server, true, Some("QUEUED")).await;
+
+    // Seed a prior "not queued" state so this poll sees a transition, not first sight.
+    let state = MemState::default();
+    state
+        .put_cursor("github", "mq:acme/widgets#1", "absent")
+        .await
+        .unwrap();
+
+    let events = source_for(&server).poll(&state).await.expect("poll");
+    let kinds: Vec<&EventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        kinds.contains(&&EventKind::EnteredMergeQueue),
+        "expected an entered-merge-queue event, got {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn merge_queue_state_is_deferred_until_commit() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+    mock_merge_queue(&server, true, Some("QUEUED")).await;
+
+    let state = MemState::default();
+    state
+        .put_cursor("github", "mq:acme/widgets#1", "absent")
+        .await
+        .unwrap();
+
+    // One source instance: it stashes the deferred state during poll and flushes it
+    // on commit.
+    let src = source_for(&server);
+    src.poll(&state).await.expect("poll");
+    // Poll alone must NOT advance the queue cursor, so a delivery failure re-derives
+    // the transition next poll.
+    assert_eq!(
+        cursor(&state, "mq:acme/widgets#1").await.as_deref(),
+        Some("absent"),
+        "queue cursor must not advance before delivery"
+    );
+
+    // Commit with no failed scopes advances it to the observed state.
+    src.commit_snapshots(&state, &HashSet::new()).await.unwrap();
+    assert_eq!(
+        cursor(&state, "mq:acme/widgets#1").await.as_deref(),
+        Some("QUEUED"),
+        "queue cursor advances once its scope's delivery is committed"
+    );
+}
+
+async fn cursor(state: &MemState, key: &str) -> Option<String> {
+    state.get_cursor("github", key).await.unwrap()
+}
+
+#[tokio::test]
+async fn merge_queue_baselines_silently_on_first_sight() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+    mock_merge_queue(&server, true, Some("QUEUED")).await;
+
+    // No seeded cursor: the first sight of the queue state must not fire an event.
+    let events = source_for(&server)
+        .poll(&MemState::default())
+        .await
+        .expect("poll");
+    let kinds: Vec<&EventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        !kinds.contains(&&EventKind::EnteredMergeQueue),
+        "first sight must baseline, got {kinds:?}"
+    );
+}
+
+#[tokio::test]
+async fn no_merge_queue_repo_emits_nothing_and_caches_the_verdict() {
+    let server = MockServer::start().await;
+    mock_github(
+        &server,
+        pr_notification(&server.uri()),
+        open_pr(json!([{ "login": "me" }])),
+    )
+    .await;
+    // The repo has no merge queue; even a seeded prior state must not fire.
+    mock_merge_queue(&server, false, None).await;
+
+    let state = MemState::default();
+    state
+        .put_cursor("github", "mq:acme/widgets#1", "absent")
+        .await
+        .unwrap();
+
+    let events = source_for(&server).poll(&state).await.expect("poll");
+    assert!(
+        !events
+            .iter()
+            .any(|e| matches!(e.kind, EventKind::EnteredMergeQueue)),
+        "a repo without a merge queue must not produce queue events"
+    );
+    // The "no queue" verdict is cached so later polls can skip the GraphQL call.
+    let cached = state
+        .get_cursor("github", "mqcfg:acme/widgets")
+        .await
+        .unwrap()
+        .expect("a cached verdict");
+    assert!(cached.starts_with("no|"), "got {cached}");
+}
+
+#[tokio::test]
+async fn merge_on_a_queued_pr_does_not_double_report_removal() {
+    let server = MockServer::start().await;
+    // The PR is now merged and no longer in the queue (entry gone).
+    let merged_pr = json!({
+        "number": 1,
+        "title": "Add gizmo",
+        "html_url": "https://github.com/acme/widgets/pull/1",
+        "state": "closed",
+        "draft": false,
+        "merged": true,
+        "merged_at": "2024-01-02T03:04:06Z",
+        "updated_at": "2024-01-02T03:04:06Z",
+        "user": { "login": "me" },
+        "requested_reviewers": []
+    });
+    mock_github(&server, pr_notification(&server.uri()), merged_pr).await;
+    mock_merge_queue(&server, true, None).await;
+
+    // Prior state: the PR was queued. Now it's gone because it merged.
+    let state = MemState::default();
+    state
+        .put_cursor("github", "mq:acme/widgets#1", "QUEUED")
+        .await
+        .unwrap();
+
+    let events = source_for(&server).poll(&state).await.expect("poll");
+    let kinds: Vec<&EventKind> = events.iter().map(|e| &e.kind).collect();
+    assert!(
+        kinds.contains(&&EventKind::Merged),
+        "expected the merge event, got {kinds:?}"
+    );
+    assert!(
+        !kinds
+            .iter()
+            .any(|k| matches!(k, EventKind::RemovedFromMergeQueue { .. })),
+        "a merge must not also report removal from the queue, got {kinds:?}"
+    );
+}

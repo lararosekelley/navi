@@ -1,6 +1,6 @@
 //! Render a navi Event into a Discord message (content + one embed).
 
-use navi_notifier_core::model::{Event, EventKind, ReviewState};
+use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
 use serde_json::{json, Value};
 
 pub struct Rendered {
@@ -97,6 +97,23 @@ fn headline(event: &Event, actor: &str) -> (String, u32) {
             format!("🚀 **{actor}** marked a PR ready for review"),
             0x2ecc71,
         ),
+        EventKind::EnteredMergeQueue => (
+            format!("🚆 {} entered the merge queue", event.pr_phrase()),
+            0x3498db,
+        ),
+        EventKind::RemovedFromMergeQueue { reason } => match reason {
+            MergeQueueRemoval::Dequeued => (
+                format!("◀️ {} left the merge queue", event.pr_phrase()),
+                0x95a5a6,
+            ),
+            MergeQueueRemoval::Unmergeable => (
+                format!(
+                    "⚠️ {} was kicked from the merge queue (can't merge)",
+                    event.pr_phrase()
+                ),
+                0xe67e22,
+            ),
+        },
     }
 }
 

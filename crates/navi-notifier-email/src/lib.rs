@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use lettre::message::{Mailbox, MultiPart};
 use lettre::transport::smtp::authentication::Credentials;
 use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
-use navi_notifier_core::model::{Event, EventKind, ReviewState};
+use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
 use navi_notifier_core::traits::{Destination, StateStore};
 use navi_notifier_core::DestinationError;
 use tracing::debug;
@@ -204,6 +204,16 @@ fn headline(event: &Event) -> String {
         EventKind::Merged => format!("{actor} merged {}", event.pr_phrase()),
         EventKind::Closed => format!("{} was closed", event.pr_phrase()),
         EventKind::ReadyForReview => format!("{actor} marked a PR ready for review"),
+        EventKind::EnteredMergeQueue => format!("{} entered the merge queue", event.pr_phrase()),
+        EventKind::RemovedFromMergeQueue { reason } => match reason {
+            MergeQueueRemoval::Dequeued => format!("{} left the merge queue", event.pr_phrase()),
+            MergeQueueRemoval::Unmergeable => {
+                format!(
+                    "{} was kicked from the merge queue (can't merge)",
+                    event.pr_phrase()
+                )
+            }
+        },
     }
 }
 

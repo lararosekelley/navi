@@ -6,7 +6,9 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use navi_notifier_core::model::{Event, Repo};
+use navi_notifier_core::model::{
+    Actor, Event, EventKind, MergeQueueRemoval, Repo, ViewerRelationship,
+};
 use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
@@ -46,6 +48,12 @@ pub struct GitHubDoctor {
 use crate::notification::Notification;
 
 const SOURCE_ID: &str = "github";
+/// Sentinel stored in the merge-queue cursor to mean "not in the queue", so a
+/// missing cursor can be told apart from a known not-queued state (first sight).
+const MQ_ABSENT: &str = "absent";
+/// How long a "this repo has no merge queue" verdict is trusted before re-checking,
+/// so enabling a queue later is picked up without querying every PR every poll.
+const MQ_CONFIG_TTL: Duration = Duration::hours(24);
 /// Safety cap on pagination per endpoint so a pathological PR can't stall a poll.
 const MAX_PAGES: u8 = 10;
 /// Notifications page deeper than per-PR sub-resources: a single poll after a long
@@ -87,6 +95,10 @@ pub struct GitHubSource {
     comment_min_age: Option<Duration>,
     /// First-run backfill mode, applied to the involved-PR sweep on the first poll.
     backfill: Backfill,
+    /// scope (`owner/repo#n`) -> merge-queue state to persist, deferred like the
+    /// snapshots and flushed by `commit_snapshots` only for scopes whose delivery
+    /// didn't fail, so a failed send re-derives the queue transition next poll.
+    pending_mq: Mutex<HashMap<String, String>>,
 }
 
 impl GitHubSource {
@@ -115,6 +127,7 @@ impl GitHubSource {
             comment_min_age: (config.comment_min_age_secs > 0)
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
             backfill: config.backfill,
+            pending_mq: Mutex::new(HashMap::new()),
         })
     }
 
@@ -315,13 +328,165 @@ impl GitHubSource {
             comment_min_age: self.comment_min_age,
             first_sight_backfill,
         };
-        let (evs, new_snapshot) = diff(&ctx, &pr_data, &old);
+        let (mut evs, new_snapshot) = diff(&ctx, &pr_data, &old);
         let bytes = serde_json::to_vec(&new_snapshot)
             .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
         // Defer persistence to `commit_snapshots` (after delivery), so a send failure
         // leaves the prior snapshot in place and this PR's events re-derive next poll.
-        self.pending_snapshots.lock().unwrap().insert(scope, bytes);
+        self.pending_snapshots
+            .lock()
+            .unwrap()
+            .insert(scope.clone(), bytes);
+
+        // Merge-queue transitions. Self-gating: a cheap per-repo cache skips repos
+        // known not to use a queue, and the query itself confirms via
+        // `isMergeQueueEnabled`. Best-effort: a failed query skips this pass.
+        match self
+            .merge_queue_event(state, &ctx.repo, &pr_data, viewer, now)
+            .await
+        {
+            Ok(Some(ev)) => evs.push(ev),
+            Ok(None) => {}
+            Err(e) => warn!(%scope, error = %e, "merge-queue check failed; skipping"),
+        }
         Ok(evs)
+    }
+
+    /// Detect whether the PR's repo uses a merge queue, and if so diff its queue
+    /// state against the last-seen state to build an entered/removed event. Skips
+    /// (cheaply, via a cached per-repo verdict) repos without a queue, baselines
+    /// silently on first sight, and suppresses a "removed" that is really a merge.
+    async fn merge_queue_event(
+        &self,
+        state: &dyn StateStore,
+        repo: &Repo,
+        pr_data: &PrData,
+        viewer: &str,
+        now: OffsetDateTime,
+    ) -> Result<Option<Event>, SourceError> {
+        let pr = &pr_data.pull_request;
+
+        // Fast path: skip repos we recently confirmed have no merge queue.
+        let cfg_key = format!("mqcfg:{}", repo.full_name());
+        if let Some(cached) = state.get_cursor(SOURCE_ID, &cfg_key).await? {
+            if is_fresh_no_queue(&cached, now) {
+                return Ok(None);
+            }
+        }
+
+        let (enabled, current, enqueued_at) = self
+            .merge_queue_status(&repo.owner, &repo.name, pr.number)
+            .await?;
+        let verdict = if enabled { "yes" } else { "no" };
+        let stamp = now.format(&Rfc3339).unwrap_or_default();
+        state
+            .put_cursor(SOURCE_ID, &cfg_key, &format!("{verdict}|{stamp}"))
+            .await?;
+        if !enabled {
+            return Ok(None);
+        }
+
+        let scope = format!("{}#{}", repo.full_name(), pr.number);
+        let prev = state.get_cursor(SOURCE_ID, &format!("mq:{scope}")).await?;
+        let stored = current.as_deref().unwrap_or(MQ_ABSENT);
+        // Defer the state advance to `commit_snapshots` (after delivery), so a failed
+        // send re-derives the transition instead of skipping it.
+        self.pending_mq
+            .lock()
+            .unwrap()
+            .insert(scope, stored.to_string());
+
+        // No prior state means first sight: baseline, don't back-fill a transition.
+        let kind = match prev {
+            Some(prev) => merge_queue_change(Some(prev.as_str()), current.as_deref()),
+            None => None,
+        };
+        let Some(kind) = kind else { return Ok(None) };
+
+        // A PR that leaves the queue because it merged already produces a Merged
+        // event; don't also report it as removed from the queue.
+        if matches!(kind, EventKind::RemovedFromMergeQueue { .. }) && pr.merged {
+            return Ok(None);
+        }
+
+        let author_login = pr
+            .user
+            .as_ref()
+            .map(|u| u.login.as_str())
+            .unwrap_or("ghost");
+        // Prefer the entry's enqueue time as a stable discriminator (GitHub doesn't
+        // always bump the PR's updated_at on a queue change); fall back to it.
+        let disc = match &kind {
+            EventKind::EnteredMergeQueue => format!(
+                "merge_queue_entered:{}",
+                enqueued_at.unwrap_or_else(|| ts_key(pr.updated_at.as_deref()))
+            ),
+            _ => format!("merge_queue_removed:{}", ts_key(pr.updated_at.as_deref())),
+        };
+        Ok(Some(Event {
+            source_id: SOURCE_ID.to_string(),
+            kind,
+            pull_request: navi_notifier_core::model::PullRequest {
+                repo: repo.clone(),
+                number: pr.number,
+                title: pr.title.clone(),
+                url: pr.html_url.clone(),
+                author: Actor::new(author_login),
+                draft: pr.draft,
+            },
+            viewer: ViewerRelationship {
+                is_author: author_login.eq_ignore_ascii_case(viewer),
+                is_reviewer: false,
+                actor_is_viewer: false,
+            },
+            actor: Actor::new(author_login),
+            occurred_at: pr
+                .updated_at
+                .as_deref()
+                .and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
+                .unwrap_or(now),
+            target_url: Some(pr.html_url.clone()),
+            excerpt: None,
+            dedup_key: Event::make_dedup_key(SOURCE_ID, repo, pr.number, &disc),
+        }))
+    }
+
+    /// One GraphQL call returning `(is a merge queue enabled on this PR's base,
+    /// current queue-entry state or None, the entry's enqueue timestamp or None)`.
+    /// REST (octocrab's default) exposes none of these. Values are passed as GraphQL
+    /// variables rather than interpolated into the query string.
+    async fn merge_queue_status(
+        &self,
+        owner: &str,
+        repo: &str,
+        number: u64,
+    ) -> Result<(bool, Option<String>, Option<String>), SourceError> {
+        let query = "query($owner: String!, $name: String!, $number: Int!) { \
+             repository(owner: $owner, name: $name) { \
+             pullRequest(number: $number) { \
+             isMergeQueueEnabled mergeQueueEntry { state enqueuedAt } } } }";
+        let resp: serde_json::Value = self
+            .octo
+            .graphql(&serde_json::json!({
+                "query": query,
+                "variables": { "owner": owner, "name": repo, "number": number },
+            }))
+            .await
+            .map_err(map_err)?;
+        if let Some(errors) = resp.get("errors") {
+            return Err(SourceError::Request(format!("graphql: {errors}")));
+        }
+        let pr = resp.pointer("/data/repository/pullRequest");
+        let enabled = pr
+            .and_then(|p| p.get("isMergeQueueEnabled"))
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let str_at = |field: &str| {
+            pr.and_then(|p| p.pointer(&format!("/mergeQueueEntry/{field}")))
+                .and_then(|s| s.as_str())
+                .map(str::to_string)
+        };
+        Ok((enabled, str_at("state"), str_at("enqueuedAt")))
     }
 
     /// Open PRs the viewer is involved in (author, reviewer, assignee, commenter,
@@ -397,6 +562,7 @@ impl Source for GitHubSource {
         // Fresh stash each pass; a prior pass's deferred snapshots were either
         // flushed by `commit_snapshots` or (on a dry run) are intentionally dropped.
         self.pending_snapshots.lock().unwrap().clear();
+        self.pending_mq.lock().unwrap().clear();
         if self.mark_read {
             self.threads.lock().unwrap().clear();
         }
@@ -594,11 +760,71 @@ impl Source for GitHubSource {
                 first_err.get_or_insert(e);
             }
         }
+
+        // Flush deferred merge-queue state the same way: skip failed scopes so the
+        // transition re-derives, persist the rest.
+        let pending_mq: Vec<(String, String)> = self.pending_mq.lock().unwrap().drain().collect();
+        for (scope, value) in pending_mq {
+            if failed_scopes.contains(&scope) {
+                continue;
+            }
+            if let Err(e) = state
+                .put_cursor(SOURCE_ID, &format!("mq:{scope}"), &value)
+                .await
+                .map_err(SourceError::from)
+            {
+                warn!(%scope, error = %e, "failed to persist merge-queue state; it will re-derive next poll");
+                first_err.get_or_insert(e);
+            }
+        }
         first_err.map_or(Ok(()), Err)
     }
 }
 
 /// Parse `https://api.github.com/repos/{owner}/{repo}/pulls/{number}` into parts.
+/// Stable-enough discriminator fragment from a timestamp string.
+fn ts_key(raw: Option<&str>) -> String {
+    raw.unwrap_or("0").to_string()
+}
+
+/// Whether a cached merge-queue config verdict says "no queue" and is still within
+/// [`MQ_CONFIG_TTL`]. Format is `"yes|<rfc3339>"` / `"no|<rfc3339>"`; anything
+/// unparseable falls through to re-checking.
+fn is_fresh_no_queue(cached: &str, now: OffsetDateTime) -> bool {
+    let Some((verdict, stamp)) = cached.split_once('|') else {
+        return false;
+    };
+    if verdict != "no" {
+        return false;
+    }
+    OffsetDateTime::parse(stamp, &Rfc3339)
+        .map(|checked| now - checked < MQ_CONFIG_TTL)
+        .unwrap_or(false)
+}
+
+/// Derive a merge-queue transition from the previously-stored state and the current
+/// one. A PR counts as *actively queued* when it has an entry in any state other
+/// than `UNMERGEABLE`; `MQ_ABSENT`, `None`, and `UNMERGEABLE` all count as not
+/// queued. Entering fires on inactive -> active; removal on active -> inactive, with
+/// the reason distinguishing a clean dequeue from being kicked as unmergeable.
+fn merge_queue_change(prev: Option<&str>, current: Option<&str>) -> Option<EventKind> {
+    let active = |s: Option<&str>| matches!(s, Some(st) if st != MQ_ABSENT && st != "UNMERGEABLE");
+    let was = active(prev);
+    let now = active(current);
+    match (was, now) {
+        (false, true) => Some(EventKind::EnteredMergeQueue),
+        (true, false) => {
+            let reason = if current == Some("UNMERGEABLE") {
+                MergeQueueRemoval::Unmergeable
+            } else {
+                MergeQueueRemoval::Dequeued
+            };
+            Some(EventKind::RemovedFromMergeQueue { reason })
+        }
+        _ => None,
+    }
+}
+
 fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     let after = url.split("/repos/").nth(1)?;
     let mut parts = after.split('/');
@@ -655,8 +881,45 @@ fn classify_github_error(msg: &str) -> SourceError {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_github_error, parse_pr_url, parse_repo_url};
+    use super::{
+        classify_github_error, merge_queue_change, parse_pr_url, parse_repo_url, MQ_ABSENT,
+    };
+    use navi_notifier_core::model::{EventKind, MergeQueueRemoval};
     use navi_notifier_core::SourceError;
+
+    #[test]
+    fn merge_queue_transitions() {
+        // Not queued -> queued: entered.
+        assert_eq!(
+            merge_queue_change(Some(MQ_ABSENT), Some("QUEUED")),
+            Some(EventKind::EnteredMergeQueue)
+        );
+        // Queued -> gone: a clean dequeue.
+        assert_eq!(
+            merge_queue_change(Some("AWAITING_CHECKS"), None),
+            Some(EventKind::RemovedFromMergeQueue {
+                reason: MergeQueueRemoval::Dequeued
+            })
+        );
+        // Queued -> unmergeable: kicked out.
+        assert_eq!(
+            merge_queue_change(Some("MERGEABLE"), Some("UNMERGEABLE")),
+            Some(EventKind::RemovedFromMergeQueue {
+                reason: MergeQueueRemoval::Unmergeable
+            })
+        );
+        // No change either way.
+        assert_eq!(merge_queue_change(Some(MQ_ABSENT), None), None);
+        assert_eq!(
+            merge_queue_change(Some("QUEUED"), Some("AWAITING_CHECKS")),
+            None
+        );
+        // Unmergeable is treated as not-queued, so it never counts as "entered".
+        assert_eq!(
+            merge_queue_change(Some(MQ_ABSENT), Some("UNMERGEABLE")),
+            None
+        );
+    }
 
     #[test]
     fn parse_repo_url_extracts_owner_and_repo() {

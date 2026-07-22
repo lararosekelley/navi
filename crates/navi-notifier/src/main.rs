@@ -377,6 +377,10 @@ mentioned = true
 merged = true
 closed = true
 ready_for_review = true
+# Merge-queue events. navi auto-detects which repos use a merge queue and only alerts
+# for those, so these are on by default; set either to false to mute it.
+entered_merge_queue = true
+removed_merge_queue = true
 
 [rules.repos]
 # Empty allow = all repos. Patterns: "owner/name", "owner/*" (whole owner),
