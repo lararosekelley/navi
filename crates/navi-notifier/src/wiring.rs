@@ -101,6 +101,7 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
                 token: config.gitea.resolve_token()?,
                 api_base: config.gitea.api_base.clone(),
                 comment_min_age_secs: config.general.comment_min_age_secs,
+                track_prs: config.gitea.track_prs,
             })
             .context("initializing Gitea source")?,
         )),

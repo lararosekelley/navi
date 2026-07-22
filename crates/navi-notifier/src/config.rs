@@ -152,6 +152,10 @@ pub struct GiteaConfig {
     pub token: Option<String>,
     /// API base, e.g. `https://gitea.example.com/api/v1` (Gitea or Forgejo).
     pub api_base: Option<String>,
+    /// Also poll your involved PRs directly (search), on top of notifications, so
+    /// self-merges/closes and activity on your own PRs are caught. Matches
+    /// `github.track_prs`.
+    pub track_prs: bool,
 }
 
 impl Default for GiteaConfig {
@@ -161,6 +165,7 @@ impl Default for GiteaConfig {
             token_env: "NAVI_GITEA_TOKEN".into(),
             token: None,
             api_base: None,
+            track_prs: true,
         }
     }
 }

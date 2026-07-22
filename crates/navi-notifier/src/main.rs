@@ -341,6 +341,9 @@ token_env = "NAVI_GITLAB_TOKEN"
 enabled = false
 token_env = "NAVI_GITEA_TOKEN"
 # For your instance, set api_base = "https://gitea.example.com/api/v1"
+# Also poll your involved PRs directly (search), not just the notifications inbox,
+# so merges/closes you do yourself and activity on your own PRs still reach you.
+track_prs = true
 
 [slack]
 enabled = false
