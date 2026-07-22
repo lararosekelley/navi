@@ -88,6 +88,21 @@ pub fn setup(name: &str) -> Result<()> {
     }
 }
 
+/// Slack setup, with the app manifest embedded (via `include_str!`) so an installed
+/// binary can print it - there's no repo checkout to read `assets/` from.
+const SLACK_SETUP: &str = concat!(
+    "Slack setup:\n\
+     1. Create the app from a manifest: https://api.slack.com/apps -> \"Create New App\"\n\
+     -> \"From an app manifest\" -> pick your workspace -> paste the manifest below.\n\
+     2. Install to your workspace, then copy the bot token (xoxb-...).\n\
+     3. Export it as NAVI_SLACK_TOKEN (or put it in navi.env next to your config).\n\
+     4. Set `slack.dm_to` to \"self\" or your Slack user id (U...).\n\
+     5. `navi config set slack.enabled true`, then `navi test --destination slack`.\n\
+     \n\
+     Manifest (already has the chat:write + im:write scopes):\n",
+    include_str!("../../../assets/slack-manifest.json")
+);
+
 /// Per-provider setup instructions. Reused by the guided init in #12.
 pub fn setup_text(name: &str) -> Option<&'static str> {
     let text = match name {
@@ -111,15 +126,7 @@ pub fn setup_text(name: &str) -> Option<&'static str> {
              2. Export it as NAVI_GITEA_TOKEN, and set `gitea.api_base` (…/api/v1).\n\
              3. `navi config set gitea.enabled true`, then `navi test --source gitea`."
         }
-        "slack" => {
-            "Slack setup:\n\
-             1. Create an app: https://api.slack.com/apps (use the manifest in assets/app-info.yml\n\
-             for the name/description/color).\n\
-             2. Bot token scopes: `chat:write` + `im:write`. Install to your workspace.\n\
-             3. Copy the `xoxb-…` bot token and export it as NAVI_SLACK_TOKEN.\n\
-             4. Set `slack.dm_to` to \"self\" or your Slack user id (U…).\n\
-             5. `navi config set slack.enabled true`, then `navi test --destination slack`."
-        }
+        "slack" => SLACK_SETUP,
         "discord" => {
             "Discord setup (pick one mode):\n\
              • Webhook (simplest, no token): create a channel webhook and set `discord.dm_to`\n\
@@ -149,5 +156,32 @@ mod tests {
             assert!(setup_text(id).is_some(), "missing setup text for {id}");
         }
         assert!(setup_text("nope").is_none());
+    }
+
+    #[test]
+    fn slack_setup_embeds_a_valid_manifest_with_the_scopes() {
+        // Parse the manifest straight out of the setup text (SLACK_SETUP appends it
+        // right after this sentinel line), so there's a single source of truth: no
+        // second `include_str!` that could silently drift from the embedded one.
+        const MANIFEST_SENTINEL: &str = "scopes):\n";
+        let text = setup_text("slack").unwrap();
+        let manifest_json = text
+            .split_once(MANIFEST_SENTINEL)
+            .unwrap_or_else(|| {
+                panic!("slack setup text must contain `{MANIFEST_SENTINEL}` before the manifest")
+            })
+            .1;
+        let manifest: serde_json::Value =
+            serde_json::from_str(manifest_json).expect("embedded manifest is valid JSON");
+        let scopes = &manifest["oauth_config"]["scopes"]["bot"];
+        assert!(scopes.as_array().unwrap().iter().any(|s| s == "chat:write"));
+        assert!(scopes.as_array().unwrap().iter().any(|s| s == "im:write"));
+        // No repo-relative path leaked into any setup text.
+        for id in SOURCES.iter().chain(DESTINATIONS.iter()) {
+            assert!(
+                !setup_text(id).unwrap().contains("assets/"),
+                "{id} setup text references a repo path installed users won't have"
+            );
+        }
     }
 }
