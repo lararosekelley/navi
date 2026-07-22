@@ -19,13 +19,21 @@ use crate::traits::{Destination, Source, StateStore};
 /// Connects a source to a destination, optionally scoped to certain repos. If a
 /// run has no routes at all, the engine falls back to delivering every source's
 /// events to every destination.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct Route {
     pub source: String,
     pub destination: String,
     /// Repo globs this route is limited to (matched via the shared repo matcher).
     /// Empty = every repo from `source`.
     pub repos: Vec<String>,
+    /// When true, this route only acts on events that no normal (non-fallback)
+    /// route claimed — a catch-all for "everything else". Lets a config send some
+    /// repos to one destination and route the remainder to another without listing
+    /// every owner. A fallback route may still set `source`/`repos` to narrow when
+    /// it acts — but note an unclaimed event that doesn't match this route's own
+    /// `source`/`repos` is still suppressed, not caught, so a scoped fallback is not
+    /// a universal safety net.
+    pub fallback: bool,
 }
 
 /// What happened to a single event during a run, captured for logging and
@@ -114,21 +122,30 @@ impl Engine {
 
     /// Destinations that should receive this event, given its source and repo. A
     /// route matches when its source matches and its repo globs are empty or match
-    /// the event's repo; every matching route's destination receives it (fan-out).
-    /// With no routes configured at all, every destination receives everything.
+    /// the event's repo; every matching normal route's destination receives it
+    /// (fan-out). Fallback routes act only when no normal route matched the event —
+    /// so a repo a normal route claims never also reaches the fallback, even if that
+    /// route's destination is disabled. With no routes at all, every destination
+    /// receives everything.
     fn destinations_for(&self, event: &Event) -> Vec<Arc<dyn Destination>> {
         if self.routes.is_empty() {
             return self.destinations.clone();
         }
         let repo = event.pull_request.repo.full_name();
+        let matches = |r: &Route| {
+            r.source == event.source_id
+                && (r.repos.is_empty() || r.repos.iter().any(|p| pattern_matches(p, &repo)))
+        };
+        // A normal route claiming this event locks out the fallback bucket.
+        let claimed = self.routes.iter().any(|r| !r.fallback && matches(r));
         self.destinations
             .iter()
             .filter(|n| {
-                self.routes.iter().any(|r| {
-                    r.source == event.source_id
-                        && r.destination == n.id()
-                        && (r.repos.is_empty() || r.repos.iter().any(|p| pattern_matches(p, &repo)))
-                })
+                self.routes
+                    .iter()
+                    // Normal bucket when claimed, fallback bucket otherwise.
+                    .filter(|r| r.fallback != claimed)
+                    .any(|r| r.destination == n.id() && matches(r))
             })
             .cloned()
             .collect()
@@ -692,11 +709,13 @@ mod tests {
                     source: "mock".into(),
                     destination: "dest-a".into(),
                     repos: vec!["acme/*".into()],
+                    ..Default::default()
                 },
                 Route {
                     source: "mock".into(),
                     destination: "dest-b".into(),
                     repos: vec![],
+                    ..Default::default()
                 },
             ],
             RuleEngine::new(RuleConfig::default()).unwrap(),
@@ -706,6 +725,131 @@ mod tests {
         // dest-a only got the acme event; dest-b got both (fan-out + catch-all).
         assert_eq!(a.sent.lock().unwrap().as_slice(), &["k-acme".to_string()]);
         assert_eq!(b.sent.lock().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn fallback_route_catches_only_unclaimed_events() {
+        // slack is scoped to acme/*; email is the fallback for everything else. An
+        // acme event goes to slack only (never the fallback); an other/* event, which
+        // no normal route claims, goes to email only.
+        let slack = Arc::new(MockDestination {
+            id: "slack".into(),
+            ..Default::default()
+        });
+        let email = Arc::new(MockDestination {
+            id: "email".into(),
+            ..Default::default()
+        });
+        let mut other = ev(EventKind::Mentioned, "k-other");
+        other.pull_request.repo = Repo::new("other", "thing");
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k-acme"), other],
+                ..Default::default()
+            })],
+            vec![slack.clone(), email.clone()],
+            vec![
+                Route {
+                    source: "mock".into(),
+                    destination: "slack".into(),
+                    repos: vec!["acme/*".into()],
+                    ..Default::default()
+                },
+                Route {
+                    source: "mock".into(),
+                    destination: "email".into(),
+                    fallback: true,
+                    ..Default::default()
+                },
+            ],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        assert_eq!(
+            slack.sent.lock().unwrap().as_slice(),
+            &["k-acme".to_string()]
+        );
+        assert_eq!(
+            email.sent.lock().unwrap().as_slice(),
+            &["k-other".to_string()],
+            "fallback must catch the unclaimed event and only that one"
+        );
+    }
+
+    #[tokio::test]
+    async fn fallback_does_not_fire_when_a_normal_route_matched_a_disabled_destination() {
+        // slack claims acme/* but is not among the built destinations. The claim
+        // still locks out the fallback, so the acme event is delivered nowhere rather
+        // than leaking to email.
+        let email = Arc::new(MockDestination {
+            id: "email".into(),
+            ..Default::default()
+        });
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k-acme")],
+                ..Default::default()
+            })],
+            vec![email.clone()],
+            vec![
+                Route {
+                    source: "mock".into(),
+                    destination: "slack".into(),
+                    repos: vec!["acme/*".into()],
+                    ..Default::default()
+                },
+                Route {
+                    source: "mock".into(),
+                    destination: "email".into(),
+                    fallback: true,
+                    ..Default::default()
+                },
+            ],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        assert!(
+            email.sent.lock().unwrap().is_empty(),
+            "a claimed event must not reach the fallback even if its destination is off"
+        );
+    }
+
+    #[tokio::test]
+    async fn scoped_fallback_only_catches_within_its_own_repos() {
+        // A fallback narrowed to billing/* is not a universal net: an unclaimed
+        // acme/* event matches neither the (absent) normal routes nor this fallback's
+        // repo filter, so it's suppressed rather than emailed.
+        let email = Arc::new(MockDestination {
+            id: "email".into(),
+            ..Default::default()
+        });
+        let mut acme = ev(EventKind::Mentioned, "k-acme");
+        acme.pull_request.repo = Repo::new("acme", "thing");
+        let mut billing = ev(EventKind::Mentioned, "k-billing");
+        billing.pull_request.repo = Repo::new("billing", "thing");
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![acme, billing],
+                ..Default::default()
+            })],
+            vec![email.clone()],
+            vec![Route {
+                source: "mock".into(),
+                destination: "email".into(),
+                repos: vec!["billing/*".into()],
+                fallback: true,
+            }],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        engine.run_once(FilterContext::default(), false).await;
+        assert_eq!(
+            email.sent.lock().unwrap().as_slice(),
+            &["k-billing".to_string()],
+            "a scoped fallback catches only repos matching its own filter"
+        );
     }
 
     #[tokio::test]
@@ -730,6 +874,7 @@ mod tests {
                 source: "mock".into(),
                 destination: "dest-a".into(),
                 repos: vec!["acme/*".into()],
+                ..Default::default()
             }],
             RuleEngine::new(RuleConfig::default()).unwrap(),
             Arc::new(MemState::default()),
