@@ -168,6 +168,9 @@ pub enum ServiceAction {
         yes: bool,
     },
 
+    /// Restart the background service so it re-reads config and navi.env.
+    Restart,
+
     /// Show whether the background service is installed and running.
     Status,
 }

@@ -100,14 +100,76 @@ pub fn restart_after_upgrade(do_restart: bool) -> Result<()> {
     }
 }
 
+/// `navi service restart`: restart the installed background service so it re-reads
+/// config and `navi.env`. User-invoked, so a missing service is an error with an
+/// install hint (unlike `restart_after_upgrade`, which silently no-ops). It also
+/// skips the upgrade path's ExecStart-mismatch check: the user asked to restart
+/// whatever is installed, so honor that rather than second-guessing the binary.
+pub fn restart() -> Result<()> {
+    match env::consts::OS {
+        "linux" => {
+            if systemd_unit_path().is_none() {
+                bail!("no navi.service installed; run `navi service install` first");
+            }
+            run(Command::new("systemctl").args(["--user", "restart", "navi.service"]))?;
+            println!("restarted navi.service (re-reads config and navi.env on start)");
+        }
+        "macos" => {
+            let Some(plist) = launchd_plist_path() else {
+                bail!("no launchd agent installed; run `navi service install` first");
+            };
+            let _ = Command::new("launchctl")
+                .args(["unload", "-w"])
+                .arg(&plist)
+                .status();
+            run(Command::new("launchctl").args(["load", "-w"]).arg(&plist))?;
+            println!("restarted the launchd agent (re-reads config and navi.env on start)");
+        }
+        "windows" => {
+            if !task_exists() {
+                bail!("no '{WINDOWS_TASK_NAME}' task installed; run `navi service install` first");
+            }
+            let _ = Command::new("schtasks")
+                .args(["/End", "/TN", WINDOWS_TASK_NAME])
+                .status();
+            run(Command::new("schtasks").args(["/Run", "/TN", WINDOWS_TASK_NAME]))?;
+            println!(
+                "restarted the '{WINDOWS_TASK_NAME}' task (re-reads config and navi.env on start)"
+            );
+        }
+        other => bail!("no background-service integration for {other}"),
+    }
+    Ok(())
+}
+
+/// Path to the installed systemd user unit, if present.
+fn systemd_unit_path() -> Option<PathBuf> {
+    let unit = home_dir().ok()?.join(".config/systemd/user/navi.service");
+    unit.exists().then_some(unit)
+}
+
+/// Path to the installed launchd agent plist, if present.
+fn launchd_plist_path() -> Option<PathBuf> {
+    let plist = home_dir()
+        .ok()?
+        .join("Library/LaunchAgents")
+        .join(format!("{LAUNCHD_LABEL}.plist"));
+    plist.exists().then_some(plist)
+}
+
+/// Whether the Windows logon task is registered.
+fn task_exists() -> bool {
+    Command::new("schtasks")
+        .args(["/Query", "/TN", WINDOWS_TASK_NAME])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 fn restart_systemd(do_restart: bool) -> Result<()> {
-    let Ok(home) = home_dir() else {
+    let Some(unit) = systemd_unit_path() else {
         return Ok(());
     };
-    let unit = home.join(".config/systemd/user/navi.service");
-    if !unit.exists() {
-        return Ok(());
-    }
     if let Some(exec) = systemd_exec_path(&unit) {
         if !exec_is_current(&exec) {
             warn_exec_mismatch(&exec);
@@ -124,15 +186,9 @@ fn restart_systemd(do_restart: bool) -> Result<()> {
 }
 
 fn restart_launchd(do_restart: bool) -> Result<()> {
-    let Ok(home) = home_dir() else {
+    let Some(plist) = launchd_plist_path() else {
         return Ok(());
     };
-    let plist = home
-        .join("Library/LaunchAgents")
-        .join(format!("{LAUNCHD_LABEL}.plist"));
-    if !plist.exists() {
-        return Ok(());
-    }
     if !do_restart {
         println!(
             "agent left as-is; reload it: launchctl unload -w \"{p}\" && launchctl load -w \"{p}\"",
@@ -150,12 +206,7 @@ fn restart_launchd(do_restart: bool) -> Result<()> {
 }
 
 fn restart_task(do_restart: bool) -> Result<()> {
-    let exists = Command::new("schtasks")
-        .args(["/Query", "/TN", WINDOWS_TASK_NAME])
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false);
-    if !exists {
+    if !task_exists() {
         return Ok(());
     }
     if !do_restart {
