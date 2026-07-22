@@ -43,6 +43,9 @@ pub struct MrContext {
     pub repo: Repo,
     /// Fallback timestamp when GitLab omits one.
     pub now: OffsetDateTime,
+    /// Hold a note back until it is at least this old, so an edit-in-place bot
+    /// resolves to its final text before we notify. `None` disables the hold.
+    pub comment_min_age: Option<time::Duration>,
 }
 
 /// Diff a merge request and its discussions against the last-seen snapshot,
@@ -78,10 +81,14 @@ pub fn diff_mr(
     };
 
     let new_snapshot = MrSnapshot {
+        // A held (not-yet-settled) note is left unseen so it is re-evaluated next
+        // poll, by which point its edits have landed.
         seen_notes: discussions
             .iter()
             .flat_map(|d| &d.notes)
-            .filter(|n| !n.system)
+            .filter(|n| {
+                !n.system && is_settled(n.created_at.as_deref(), ctx.now, ctx.comment_min_age)
+            })
             .map(|n| n.id)
             .collect(),
         merged: mr.is_merged(),
@@ -181,6 +188,10 @@ pub fn diff_mr(
             if note.system || old.seen_notes.contains(&note.id) {
                 continue;
             }
+            // Hold a too-fresh note; it stays unseen and re-derives once settled.
+            if !is_settled(note.created_at.as_deref(), ctx.now, ctx.comment_min_age) {
+                continue;
+            }
             let note_author = note.author.as_ref().map(|u| u.username.as_str());
             if note_author.is_some_and(|a| eq(a, viewer)) {
                 continue;
@@ -210,6 +221,23 @@ pub fn diff_mr(
 /// GitLab usernames are case-insensitive.
 fn eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
+}
+
+/// Whether a note is old enough to notify about, given the optional min-age hold. A
+/// missing or unparseable timestamp counts as settled, so bad data never holds a
+/// note back forever. Mirrors the forge diff's `is_settled`.
+fn is_settled(
+    created_at: Option<&str>,
+    now: OffsetDateTime,
+    min_age: Option<time::Duration>,
+) -> bool {
+    let Some(min_age) = min_age else {
+        return true;
+    };
+    let Some(created) = created_at.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()) else {
+        return true;
+    };
+    now - created >= min_age
 }
 
 fn parse_ts(raw: Option<&str>, fallback: OffsetDateTime) -> OffsetDateTime {

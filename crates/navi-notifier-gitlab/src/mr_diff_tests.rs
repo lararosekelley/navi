@@ -13,6 +13,7 @@ fn ctx() -> MrContext {
         viewer: VIEWER.into(),
         repo: Repo::new("acme", "widgets"),
         now: OffsetDateTime::UNIX_EPOCH,
+        comment_min_age: None,
     }
 }
 
@@ -196,4 +197,56 @@ fn reply_in_a_thread_you_never_touched_is_left_to_todos() {
     )];
     let (events, _) = diff_mr(&ctx(), &base_mr(), &d, &initialized());
     assert!(events.is_empty());
+}
+
+#[test]
+fn holds_a_too_fresh_note_until_it_settles() {
+    // Your MR, so any reply reaches you; the note is edited in place after posting.
+    let mut mr = base_mr();
+    mr.author = Some(user(VIEWER));
+    let fresh = Note {
+        created_at: Some("2024-02-02T03:04:05Z".into()),
+        ..note(2, AUTHOR, "working… -> the real reply")
+    };
+    let d = vec![discussion("a", vec![fresh])];
+    let min_age = Some(time::Duration::seconds(60));
+    let held_now = OffsetDateTime::parse("2024-02-02T03:04:35Z", &Rfc3339).unwrap(); // +30s
+    let settled_now = OffsetDateTime::parse("2024-02-02T03:06:05Z", &Rfc3339).unwrap(); // +120s
+
+    // Too fresh: held back, and left unseen so it re-derives once settled.
+    let cx = MrContext {
+        now: held_now,
+        comment_min_age: min_age,
+        ..ctx()
+    };
+    let (events, snap) = diff_mr(&cx, &mr, &d, &initialized());
+    assert!(events.is_empty(), "a fresh note must be held: {:?}", kinds(&events));
+    assert!(
+        !snap.seen_notes.contains(&2),
+        "a held note must stay unseen so it re-derives next poll"
+    );
+
+    // Settled: emitted and now recorded as seen.
+    let cx = MrContext {
+        now: settled_now,
+        comment_min_age: min_age,
+        ..ctx()
+    };
+    let (events, snap) = diff_mr(&cx, &mr, &d, &initialized());
+    assert_eq!(
+        kinds(&events),
+        vec![&EventKind::CommentReply {
+            on_your_comment: false
+        }]
+    );
+    assert!(snap.seen_notes.contains(&2));
+
+    // Disabled (None): emitted even when fresh - matches GitHub/Gitea.
+    let cx = MrContext {
+        now: held_now,
+        comment_min_age: None,
+        ..ctx()
+    };
+    let (events, _) = diff_mr(&cx, &mr, &d, &initialized());
+    assert_eq!(events.len(), 1, "min-age off must not hold anything");
 }
