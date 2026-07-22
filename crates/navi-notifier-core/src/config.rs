@@ -22,6 +22,11 @@ pub struct EventToggles {
     pub merged: bool,
     pub closed: bool,
     pub ready_for_review: bool,
+    /// Merge-queue events. On by default: navi only queries a PR's queue state when
+    /// the repo actually has a merge queue enabled (auto-detected), so these fire
+    /// solely for repos that use one. Mute either here.
+    pub entered_merge_queue: bool,
+    pub removed_merge_queue: bool,
 }
 
 impl Default for EventToggles {
@@ -36,6 +41,8 @@ impl Default for EventToggles {
             merged: true,
             closed: true,
             ready_for_review: true,
+            entered_merge_queue: true,
+            removed_merge_queue: true,
         }
     }
 }
@@ -55,6 +62,8 @@ impl EventToggles {
                 | "merged"
                 | "closed"
                 | "ready_for_review"
+                | "entered_merge_queue"
+                | "removed_merge_queue"
         )
     }
 
@@ -70,6 +79,8 @@ impl EventToggles {
             "merged" => self.merged,
             "closed" => self.closed,
             "ready_for_review" => self.ready_for_review,
+            "entered_merge_queue" => self.entered_merge_queue,
+            "removed_merge_queue" => self.removed_merge_queue,
             // Unknown tags are allowed through so new event kinds aren't silently dropped.
             _ => true,
         }
@@ -244,6 +255,17 @@ pub struct RuleConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_queue_toggles_default_on_and_are_recognized() {
+        let toggles = EventToggles::default();
+        // On by default; auto-detection keeps them quiet for repos without a queue.
+        assert!(toggles.is_enabled("entered_merge_queue"));
+        assert!(toggles.is_enabled("removed_merge_queue"));
+        // Valid override keys (so a typo isn't confused with them).
+        assert!(EventToggles::is_known_tag("entered_merge_queue"));
+        assert!(EventToggles::is_known_tag("removed_merge_queue"));
+    }
 
     #[test]
     fn repo_pattern_exact_and_whole_owner() {

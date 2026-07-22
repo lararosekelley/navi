@@ -1,7 +1,7 @@
 //! Pure rendering of a navi [`Event`] into a Slack message (fallback text + Block
 //! Kit blocks). Kept free of I/O so message shape is unit-testable.
 
-use navi_notifier_core::model::{Event, EventKind, ReviewState};
+use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
 use serde_json::{json, Value};
 
 /// A rendered message: `text` is the notification/fallback string, `blocks` is the
@@ -108,6 +108,24 @@ fn headline(event: &Event, actor: &str) -> String {
         EventKind::Merged => format!(":purple_heart: {a} merged {}", escape(&event.pr_phrase())),
         EventKind::Closed => format!(":no_entry_sign: {} was closed", escape(&event.pr_phrase())),
         EventKind::ReadyForReview => format!(":rocket: {a} marked a PR ready for review"),
+        EventKind::EnteredMergeQueue => {
+            format!(
+                ":train: {} entered the merge queue",
+                escape(&event.pr_phrase())
+            )
+        }
+        EventKind::RemovedFromMergeQueue { reason } => match reason {
+            MergeQueueRemoval::Dequeued => {
+                format!(
+                    ":arrow_backward: {} left the merge queue",
+                    escape(&event.pr_phrase())
+                )
+            }
+            MergeQueueRemoval::Unmergeable => format!(
+                ":warning: {} was kicked from the merge queue (can't merge)",
+                escape(&event.pr_phrase())
+            ),
+        },
     }
 }
 

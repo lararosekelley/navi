@@ -77,6 +77,16 @@ pub enum ReviewState {
     Commented,
 }
 
+/// Why a PR left the merge queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MergeQueueRemoval {
+    /// Removed while still mergeable (manually dequeued, or the queue was cleared).
+    Dequeued,
+    /// Kicked out because it could no longer merge (failed checks or conflicts).
+    Unmergeable,
+}
+
 /// How much pre-existing activity to surface the first time navi polls (before it
 /// has any stored state). Later polls always diff against stored snapshots, so this
 /// only governs the initial catch-up.
@@ -125,6 +135,10 @@ pub enum EventKind {
     Closed,
     /// A draft PR was marked ready for review.
     ReadyForReview,
+    /// The PR entered the merge queue.
+    EnteredMergeQueue,
+    /// The PR was removed from the merge queue (dequeued or became unmergeable).
+    RemovedFromMergeQueue { reason: MergeQueueRemoval },
 }
 
 impl EventKind {
@@ -141,6 +155,8 @@ impl EventKind {
             EventKind::Merged => "merged",
             EventKind::Closed => "closed",
             EventKind::ReadyForReview => "ready_for_review",
+            EventKind::EnteredMergeQueue => "entered_merge_queue",
+            EventKind::RemovedFromMergeQueue { .. } => "removed_merge_queue",
         }
     }
 }

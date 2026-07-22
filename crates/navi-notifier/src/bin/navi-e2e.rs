@@ -82,7 +82,7 @@ async fn run() -> Result<(), String> {
         .map_err(|e| format!("Slack auth.test failed: {e}"))?;
     println!("e2e: Slack authenticated as {who}");
     destination
-        .send(&sample_event())
+        .send(&sample_event(), &state)
         .await
         .map_err(|e| format!("Slack delivery failed: {e}"))?;
     println!("e2e: Slack OK: sample DM delivered");
