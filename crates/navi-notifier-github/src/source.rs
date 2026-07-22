@@ -99,6 +99,10 @@ pub struct GitHubSource {
     /// snapshots and flushed by `commit_snapshots` only for scopes whose delivery
     /// didn't fail, so a failed send re-derives the queue transition next poll.
     pending_mq: Mutex<HashMap<String, String>>,
+    /// scope (`owner/repo#n`) -> involved-sweep `pr:` cursor value, deferred the same
+    /// way: advancing it before delivery would skip a swept PR whose event never
+    /// sent, losing it until the PR next changes.
+    pending_pr_cursors: Mutex<HashMap<String, String>>,
 }
 
 impl GitHubSource {
@@ -128,6 +132,7 @@ impl GitHubSource {
                 .then(|| Duration::seconds(config.comment_min_age_secs as i64)),
             backfill: config.backfill,
             pending_mq: Mutex::new(HashMap::new()),
+            pending_pr_cursors: Mutex::new(HashMap::new()),
         })
     }
 
@@ -395,7 +400,12 @@ impl GitHubSource {
                     poll_start,
                 )
                 .await?;
-            state.put_cursor(SOURCE_ID, &seen_key, &updated_at).await?;
+            // Defer the cursor advance to `commit_snapshots` (after delivery), so a
+            // failed send leaves the cursor in place and this PR re-derives next poll.
+            self.pending_pr_cursors
+                .lock()
+                .unwrap()
+                .insert(scope.clone(), updated_at);
             events.extend(evs);
             processed.insert(scope);
         }
@@ -638,6 +648,7 @@ impl Source for GitHubSource {
         // flushed by `commit_snapshots` or (on a dry run) are intentionally dropped.
         self.pending_snapshots.lock().unwrap().clear();
         self.pending_mq.lock().unwrap().clear();
+        self.pending_pr_cursors.lock().unwrap().clear();
         if self.mark_read {
             self.threads.lock().unwrap().clear();
         }
@@ -876,6 +887,24 @@ impl Source for GitHubSource {
                 .map_err(SourceError::from)
             {
                 warn!(%scope, error = %e, "failed to persist merge-queue state; it will re-derive next poll");
+                first_err.get_or_insert(e);
+            }
+        }
+
+        // Flush deferred involved-sweep `pr:` cursors, skipping failed scopes so a
+        // dropped delivery re-derives the PR next poll.
+        let pending_cursors: Vec<(String, String)> =
+            self.pending_pr_cursors.lock().unwrap().drain().collect();
+        for (scope, value) in pending_cursors {
+            if failed_scopes.contains(&scope) {
+                continue;
+            }
+            if let Err(e) = state
+                .put_cursor(SOURCE_ID, &format!("pr:{scope}"), &value)
+                .await
+                .map_err(SourceError::from)
+            {
+                warn!(%scope, error = %e, "failed to persist involved-PR cursor; it will re-derive next poll");
                 first_err.get_or_insert(e);
             }
         }

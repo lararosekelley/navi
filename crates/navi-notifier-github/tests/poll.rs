@@ -475,6 +475,23 @@ async fn self_merged_pr_is_caught_by_the_closed_sweep() {
         events.iter().map(|e| &e.kind).collect::<Vec<_>>()
     );
     assert_eq!(events[0].pull_request.number, 1);
+
+    // #98: the `pr:` cursor must NOT advance on poll alone (a failed delivery would
+    // otherwise skip the PR next poll and lose the merge). It advances on commit.
+    assert_eq!(
+        cursor(&state, "pr:acme/widgets#1").await,
+        None,
+        "sweep cursor must be deferred until delivery"
+    );
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor(&state, "pr:acme/widgets#1").await.as_deref(),
+        Some("2024-02-02T00:00:00Z"),
+        "commit advances the cursor once the scope's delivery is confirmed"
+    );
 }
 
 #[tokio::test]
