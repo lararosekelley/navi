@@ -117,6 +117,7 @@ async fn poll_maps_review_request_todo_to_event() {
         token: "test-token".into(),
         api_base: Some(server.uri()),
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     })
     .expect("build");
 
@@ -192,6 +193,7 @@ async fn poll_diffs_an_involved_mr_for_merge_and_reply() {
         token: "test-token".into(),
         api_base: Some(server.uri()),
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     })
     .expect("build");
 
@@ -253,6 +255,7 @@ async fn committed_snapshot_stops_the_event_re_firing() {
         token: "test-token".into(),
         api_base: Some(server.uri()),
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     })
     .expect("build");
 
@@ -279,6 +282,7 @@ fn empty_token_is_rejected() {
         token: "  ".into(),
         api_base: None,
         comment_min_age_secs: 0,
+        backfill: Default::default(),
     }) {
         Err(e) => assert!(format!("{e}").contains("empty")),
         Ok(_) => panic!("expected an error for an empty token"),

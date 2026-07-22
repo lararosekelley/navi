@@ -9,7 +9,9 @@
 
 use std::collections::HashSet;
 
-use navi_notifier_core::model::{Actor, Event, EventKind, PullRequest, Repo, ViewerRelationship};
+use navi_notifier_core::model::{
+    Actor, Backfill, Event, EventKind, PullRequest, Repo, ViewerRelationship,
+};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -46,6 +48,10 @@ pub struct MrContext {
     /// Hold a note back until it is at least this old, so an edit-in-place bot
     /// resolves to its final text before we notify. `None` disables the hold.
     pub comment_min_age: Option<time::Duration>,
+    /// First-run backfill override. Only `Some(AllOpen)` surfaces this MR's
+    /// derivable activity on first sight; every other value (including `None`)
+    /// baselines silently. Review-request backfill is the todos path's job.
+    pub first_sight_backfill: Option<Backfill>,
 }
 
 /// Diff a merge request and its discussions against the last-seen snapshot,
@@ -97,8 +103,9 @@ pub fn diff_mr(
         initialized: true,
     };
 
-    // First sight: baseline only, so a freshly-added MR doesn't replay its history.
-    if !old.initialized {
+    // First sight: baseline only, so a freshly-added MR doesn't replay its history -
+    // unless `all_open` backfill asked for the full history on the first poll.
+    if !old.initialized && ctx.first_sight_backfill != Some(Backfill::AllOpen) {
         return (Vec::new(), new_snapshot);
     }
 

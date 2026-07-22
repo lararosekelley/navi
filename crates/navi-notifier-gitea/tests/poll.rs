@@ -65,6 +65,7 @@ async fn poll_emits_outstanding_review_request() {
         api_base: Some(server.uri()),
         comment_min_age_secs: 0,
         track_prs: false,
+        backfill: Default::default(),
     })
     .expect("build");
 
@@ -150,6 +151,7 @@ async fn self_merged_pr_caught_by_the_closed_sweep() {
         api_base: Some(server.uri()),
         comment_min_age_secs: 0,
         track_prs: true,
+        backfill: Default::default(),
     })
     .expect("build");
 

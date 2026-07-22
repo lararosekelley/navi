@@ -14,6 +14,7 @@ fn ctx() -> MrContext {
         repo: Repo::new("acme", "widgets"),
         now: OffsetDateTime::UNIX_EPOCH,
         comment_min_age: None,
+        first_sight_backfill: None,
     }
 }
 
@@ -249,4 +250,20 @@ fn holds_a_too_fresh_note_until_it_settles() {
     };
     let (events, _) = diff_mr(&cx, &mr, &d, &initialized());
     assert_eq!(events.len(), 1, "min-age off must not hold anything");
+}
+
+#[test]
+fn all_open_backfill_surfaces_on_first_sight() {
+    let mut mr = base_mr();
+    mr.state = "merged".into();
+    // Default first sight baselines silently.
+    let (events, _) = diff_mr(&ctx(), &mr, &[], &MrSnapshot::default());
+    assert!(events.is_empty(), "default first-sight must baseline silently");
+    // all_open surfaces the MR's derivable activity on first sight.
+    let cx = MrContext {
+        first_sight_backfill: Some(Backfill::AllOpen),
+        ..ctx()
+    };
+    let (events, _) = diff_mr(&cx, &mr, &[], &MrSnapshot::default());
+    assert_eq!(kinds(&events), vec![&EventKind::Merged]);
 }
