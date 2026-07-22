@@ -103,6 +103,30 @@ const SLACK_SETUP: &str = concat!(
     include_str!("../../../assets/slack-manifest.json")
 );
 
+/// Discord bot permissions navi needs in channel mode: View Channel (0x400) + Send
+/// Messages (0x800) + Embed Links (0x4000) = 19456. DM mode needs none. Kept in sync
+/// with the literal in `DISCORD_SETUP` by a test.
+pub const DISCORD_PERMISSIONS: u32 = 0x400 | 0x800 | 0x4000;
+
+/// The bot-invite URL for a Discord app's `client_id`, prefilled with navi's
+/// permissions so the user doesn't hand-pick checkboxes.
+pub fn discord_invite_url(client_id: &str) -> String {
+    format!(
+        "https://discord.com/api/oauth2/authorize?client_id={client_id}&scope=bot&permissions={DISCORD_PERMISSIONS}"
+    )
+}
+
+const DISCORD_SETUP: &str = "Discord setup (pick one mode):\n\
+     • Webhook (simplest, no token): create a channel webhook and set `discord.dm_to`\n\
+     to its https URL.\n\
+     • Bot (DM or channel): create an app at https://discord.com/developers/applications,\n\
+     add a bot, copy its token as NAVI_DISCORD_TOKEN, then invite it with (replace\n\
+     <CLIENT_ID> with your app's Client ID):\n\
+     https://discord.com/api/oauth2/authorize?client_id=<CLIENT_ID>&scope=bot&permissions=19456\n\
+     Set `discord.dm_to` to your user id (a numeric snowflake) for a DM, or a channel id.\n\
+     (`navi init` fills the Client ID into this link for you.)\n\
+     Then `navi config set discord.enabled true` and `navi test --destination discord`.";
+
 /// Per-provider setup instructions. Reused by the guided init in #12.
 pub fn setup_text(name: &str) -> Option<&'static str> {
     let text = match name {
@@ -127,14 +151,7 @@ pub fn setup_text(name: &str) -> Option<&'static str> {
              3. `navi config set gitea.enabled true`, then `navi test --source gitea`."
         }
         "slack" => SLACK_SETUP,
-        "discord" => {
-            "Discord setup (pick one mode):\n\
-             • Webhook (simplest, no token): create a channel webhook and set `discord.dm_to`\n\
-             to its https URL.\n\
-             • Bot DM: create a bot, export its token as NAVI_DISCORD_TOKEN, and set `discord.dm_to`\n\
-             to your user id (a numeric snowflake).\n\
-             Then `navi config set discord.enabled true` and `navi test --destination discord`."
-        }
+        "discord" => DISCORD_SETUP,
         "email" => {
             "Email (SMTP) setup:\n\
              1. Set `email.smtp_host`, `email.smtp_port`, and `email.tls` (none | starttls | implicit).\n\
@@ -183,5 +200,16 @@ mod tests {
                 "{id} setup text references a repo path installed users won't have"
             );
         }
+    }
+
+    #[test]
+    fn discord_invite_url_matches_the_documented_permissions() {
+        assert_eq!(DISCORD_PERMISSIONS, 19456);
+        let url = discord_invite_url("123");
+        assert!(url.contains("client_id=123"));
+        assert!(url.contains("scope=bot"));
+        assert!(url.contains("permissions=19456"));
+        // The placeholder link in the setup text uses the same permissions integer.
+        assert!(setup_text("discord").unwrap().contains("permissions=19456"));
     }
 }
