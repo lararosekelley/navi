@@ -1,0 +1,1 @@
+{"parents":{"e2e-common-slice":"e2e-discord-slice","e2e-discord-slice":"e2e-slack-slice","e2e-github-slice":"main","e2e-gitlab-slice":"e2e-github-slice","e2e-slack-slice":"e2e-gitlab-slice"},"trunk":"main"}
