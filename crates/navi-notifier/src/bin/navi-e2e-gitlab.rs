@@ -23,17 +23,17 @@
 //!   MAILPIT_SMTP_HOST        Mailpit SMTP host (default localhost)
 //!   MAILPIT_SMTP_PORT        Mailpit SMTP port (default 1025)
 
-use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use async_trait::async_trait;
-use navi_notifier_core::traits::StateStore;
-use navi_notifier_core::{Engine, FilterContext, RuleConfig, RuleEngine, StateError};
+use navi_notifier_core::{Engine, FilterContext, RuleConfig, RuleEngine};
 use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use serde_json::{json, Value};
+
+#[path = "../e2e_common.rs"]
+mod e2e_common;
+use e2e_common::{env, env_or, json_ok, MemState};
 
 #[tokio::main]
 async fn main() {
@@ -362,73 +362,4 @@ async fn delete(http: &reqwest::Client, url: &str, token: &str) -> Result<(), St
             resp.text().await.unwrap_or_default()
         ))
     }
-}
-
-async fn json_ok(resp: reqwest::Response, what: &str) -> Result<Value, String> {
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("{what}: read body: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("{what}: {status}: {text}"));
-    }
-    serde_json::from_str(&text).map_err(|e| format!("{what}: parse: {e}"))
-}
-
-fn env(key: &str) -> Result<String, String> {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("missing env var {key}"))
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// In-memory state so the poll has somewhere to keep snapshots/cursors.
-#[derive(Default)]
-struct MemState {
-    snapshots: Mutex<HashMap<String, Vec<u8>>>,
-    delivered: Mutex<HashMap<String, ()>>,
-    cursors: Mutex<HashMap<String, String>>,
-}
-
-#[async_trait]
-impl StateStore for MemState {
-    async fn get_snapshot(&self, s: &str, scope: &str) -> Result<Option<Vec<u8>>, StateError> {
-        Ok(self.snapshots.lock().unwrap().get(&k(s, scope)).cloned())
-    }
-    async fn put_snapshot(&self, s: &str, scope: &str, b: &[u8]) -> Result<(), StateError> {
-        self.snapshots
-            .lock()
-            .unwrap()
-            .insert(k(s, scope), b.to_vec());
-        Ok(())
-    }
-    async fn was_delivered(&self, key: &str) -> Result<bool, StateError> {
-        Ok(self.delivered.lock().unwrap().contains_key(key))
-    }
-    async fn mark_delivered(&self, key: &str) -> Result<(), StateError> {
-        self.delivered.lock().unwrap().insert(key.to_string(), ());
-        Ok(())
-    }
-    async fn get_cursor(&self, s: &str, key: &str) -> Result<Option<String>, StateError> {
-        Ok(self.cursors.lock().unwrap().get(&k(s, key)).cloned())
-    }
-    async fn put_cursor(&self, s: &str, key: &str, v: &str) -> Result<(), StateError> {
-        self.cursors
-            .lock()
-            .unwrap()
-            .insert(k(s, key), v.to_string());
-        Ok(())
-    }
-}
-
-fn k(a: &str, b: &str) -> String {
-    format!("{a}\u{0}{b}")
 }

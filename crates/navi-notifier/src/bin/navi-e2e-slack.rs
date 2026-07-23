@@ -13,17 +13,17 @@
 //!   E2E_SLACK_DM_TO   DM target: "self" (default), a user id (U…), or a channel (C…/#name)
 //!   E2E_SLACK_API     Slack Web API base (default https://slack.com/api)
 
-use std::collections::HashMap;
-use std::sync::Mutex;
 use std::time::Duration;
 
-use async_trait::async_trait;
 use navi_notifier_core::model::{Actor, Event, EventKind, PullRequest, Repo, ViewerRelationship};
-use navi_notifier_core::traits::{Destination, StateStore};
-use navi_notifier_core::StateError;
+use navi_notifier_core::traits::Destination;
 use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 use serde_json::Value;
 use time::OffsetDateTime;
+
+#[path = "../e2e_common.rs"]
+mod e2e_common;
+use e2e_common::{env, env_or, MemState};
 
 #[tokio::main]
 async fn main() {
@@ -211,56 +211,5 @@ async fn slack_ok(resp: reqwest::Response, method: &str) -> Result<Value, String
             "{method}: {}",
             value["error"].as_str().unwrap_or("unknown_error")
         ))
-    }
-}
-
-fn env(key: &str) -> Result<String, String> {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("missing env var {key}"))
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// In-memory state so the destination has somewhere to keep its thread cursor.
-#[derive(Default)]
-struct MemState {
-    cursors: Mutex<HashMap<String, String>>,
-}
-
-#[async_trait]
-impl StateStore for MemState {
-    async fn get_snapshot(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, StateError> {
-        Ok(None)
-    }
-    async fn put_snapshot(&self, _: &str, _: &str, _: &[u8]) -> Result<(), StateError> {
-        Ok(())
-    }
-    async fn was_delivered(&self, _: &str) -> Result<bool, StateError> {
-        Ok(false)
-    }
-    async fn mark_delivered(&self, _: &str) -> Result<(), StateError> {
-        Ok(())
-    }
-    async fn get_cursor(&self, s: &str, key: &str) -> Result<Option<String>, StateError> {
-        Ok(self
-            .cursors
-            .lock()
-            .unwrap()
-            .get(&format!("{s}:{key}"))
-            .cloned())
-    }
-    async fn put_cursor(&self, s: &str, key: &str, v: &str) -> Result<(), StateError> {
-        self.cursors
-            .lock()
-            .unwrap()
-            .insert(format!("{s}:{key}"), v.to_string());
-        Ok(())
     }
 }

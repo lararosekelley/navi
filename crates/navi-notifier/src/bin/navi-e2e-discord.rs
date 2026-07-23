@@ -16,11 +16,14 @@
 use std::time::Duration;
 
 use navi_notifier_core::model::{Actor, Event, EventKind, PullRequest, Repo, ViewerRelationship};
-use navi_notifier_core::traits::{Destination, StateStore};
-use navi_notifier_core::StateError;
+use navi_notifier_core::traits::Destination;
 use navi_notifier_discord::{DiscordDestination, DiscordDestinationConfig};
 use serde_json::{json, Value};
 use time::OffsetDateTime;
+
+#[path = "../e2e_common.rs"]
+mod e2e_common;
+use e2e_common::{env, env_or, json_ok, MemState};
 
 #[tokio::main]
 async fn main() {
@@ -60,7 +63,7 @@ async fn run() -> Result<(), String> {
     })
     .map_err(|e| format!("build discord destination: {e}"))?;
     destination
-        .send(&sample_event(&marker), &NoState)
+        .send(&sample_event(&marker), &MemState::default())
         .await
         .map_err(|e| format!("discord send failed: {e}"))?;
 
@@ -233,56 +236,4 @@ async fn post(
         .await
         .map_err(|e| format!("POST {url}: {e}"))?;
     json_ok(resp, &format!("POST {url}")).await
-}
-
-async fn json_ok(resp: reqwest::Response, what: &str) -> Result<Value, String> {
-    let status = resp.status();
-    let text = resp
-        .text()
-        .await
-        .map_err(|e| format!("{what}: read body: {e}"))?;
-    if !status.is_success() {
-        return Err(format!("{what}: {status}: {text}"));
-    }
-    serde_json::from_str(&text).map_err(|e| format!("{what}: parse: {e}"))
-}
-
-fn env(key: &str) -> Result<String, String> {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| format!("missing env var {key}"))
-}
-
-fn env_or(key: &str, default: &str) -> String {
-    std::env::var(key)
-        .ok()
-        .filter(|v| !v.trim().is_empty())
-        .unwrap_or_else(|| default.to_string())
-}
-
-/// Bot mode reads/writes a cursor to group replies, but for a single one-off message
-/// a no-op store (never a parent) is fine — it just posts a fresh message.
-struct NoState;
-
-#[async_trait::async_trait]
-impl StateStore for NoState {
-    async fn get_snapshot(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, StateError> {
-        Ok(None)
-    }
-    async fn put_snapshot(&self, _: &str, _: &str, _: &[u8]) -> Result<(), StateError> {
-        Ok(())
-    }
-    async fn was_delivered(&self, _: &str) -> Result<bool, StateError> {
-        Ok(false)
-    }
-    async fn mark_delivered(&self, _: &str) -> Result<(), StateError> {
-        Ok(())
-    }
-    async fn get_cursor(&self, _: &str, _: &str) -> Result<Option<String>, StateError> {
-        Ok(None)
-    }
-    async fn put_cursor(&self, _: &str, _: &str, _: &str) -> Result<(), StateError> {
-        Ok(())
-    }
 }
