@@ -46,6 +46,12 @@ name = "navi-e2e-github"
 path = "src/bin/navi-e2e-github.rs"
 required-features = ["e2e"]
 
+# Live GitLab source e2e: a second member drives a review request; sink is Mailpit.
+[[bin]]
+name = "navi-e2e-gitlab"
+path = "src/bin/navi-e2e-gitlab.rs"
+required-features = ["e2e"]
+
 [features]
 # End-to-end harnesses. Pulls the HTTP helpers they need to drive the providers.
 e2e = ["dep:reqwest", "dep:base64"]
