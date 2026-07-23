@@ -54,6 +54,12 @@ name = "navi-e2e-slack"
 path = "src/bin/navi-e2e-slack.rs"
 required-features = ["e2e"]
 
+# Live Discord destination e2e: bot-DM a synthetic event, read it back via history.
+[[bin]]
+name = "navi-e2e-discord"
+path = "src/bin/navi-e2e-discord.rs"
+required-features = ["e2e"]
+
 [features]
 # End-to-end harnesses. Pulls the HTTP helpers they need to drive the providers.
 e2e = ["dep:reqwest", "dep:base64"]
