@@ -27,12 +27,8 @@ exclude = [
 name = "navi"
 path = "src/main.rs"
 
-# Live end-to-end smoke harness. Gated so it never ships in the release binary
-# or the published crate; only the e2e workflow builds it.
-[[bin]]
-name = "navi-e2e"
-path = "src/bin/navi-e2e.rs"
-required-features = ["e2e"]
+# All e2e harnesses are gated behind the `e2e` feature so they never ship in the
+# release binary or the published crate; only the e2e workflow builds them.
 
 # Hermetic Gitea -> Mailpit e2e (Dockerized, no external accounts).
 [[bin]]
@@ -50,6 +46,12 @@ required-features = ["e2e"]
 [[bin]]
 name = "navi-e2e-gitlab"
 path = "src/bin/navi-e2e-gitlab.rs"
+required-features = ["e2e"]
+
+# Live Slack destination e2e: post a synthetic event, read it back via history.
+[[bin]]
+name = "navi-e2e-slack"
+path = "src/bin/navi-e2e-slack.rs"
 required-features = ["e2e"]
 
 [features]

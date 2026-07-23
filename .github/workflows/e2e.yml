@@ -2,10 +2,10 @@
 #
 #   gitea-mailpit  Hermetic: Dockerized Gitea + Mailpit, no secrets. Proves a real
 #                  navi loop (Gitea source -> email destination) end to end.
-#   live           Live: real GitHub + Slack credentials. Proves the two things the
-#                  mock tests structurally can't - that real creds authenticate and
-#                  that today's live payload shapes still parse (one notifications
-#                  poll + one Slack DM). See src/bin/navi-e2e.rs.
+#   slack-live     Live Slack *destination*: post a synthetic event through navi's
+#                  real Slack destination, then read it back via conversations.history
+#                  to prove delivery (not just a non-erroring send).
+#                  See src/bin/navi-e2e-slack.rs.
 #   github-live    Live GitHub *source*: a second account opens a PR and requests the
 #                  viewer's review; navi derives it and delivers to a local Mailpit
 #                  (no destination secrets). Proves the full directed-at-you loop.
@@ -22,14 +22,13 @@
 #
 # Per-job `if` keeps each job's cadence tight:
 #   - hermetic skips the release-tag path (it already ran on the push to main).
-#   - live runs only on manual dispatch and the release gate (never on push/PR:
-#     a DM per merge is noise, and fork PRs can't see secrets).
+#   - the live jobs run only on manual dispatch and the release gate (never on
+#     push/PR: real DMs/PRs per merge are noise, and fork PRs can't see secrets).
 # PRs still exercise the hermetic job because release.yml also triggers on
 # pull_request and calls this workflow via `custom-e2e`.
 #
 # Live secrets (Settings -> Secrets and variables -> Actions):
-#   NAVI_GITHUB_TOKEN         GitHub PAT (notifications + repo read)
-#   NAVI_SLACK_TOKEN          Slack bot token (chat:write + im:write)
+#   NAVI_SLACK_TOKEN          Slack bot token (chat:write + im:write + im:history)
 #   E2E_GITHUB_VIEWER_TOKEN   PAT navi authenticates as (notifications + repo read)
 #   E2E_GITHUB_ACTOR_TOKEN    PAT for a second account with push access to the repo
 #   E2E_GITLAB_VIEWER_TOKEN   GitLab PAT navi authenticates as (read_api)
@@ -108,8 +107,10 @@ jobs:
         if: failure()
         run: docker logs navi-gitea | tail -50
 
-  live:
-    # Real credentials: manual dispatch and the release gate only.
+  slack-live:
+    # Live Slack *destination*: post a synthetic event and read it back via
+    # conversations.history. Dispatch + release gate. Reuses the existing Slack bot
+    # secret/var; the bot also needs im:history to read the DM back.
     if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     steps:
@@ -122,12 +123,11 @@ jobs:
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2
 
-      - name: Run the live e2e smoke test
+      - name: Run the live Slack read-back e2e
         env:
-          NAVI_GITHUB_TOKEN: ${{ secrets.NAVI_GITHUB_TOKEN }}
-          NAVI_SLACK_TOKEN: ${{ secrets.NAVI_SLACK_TOKEN }}
-          NAVI_SLACK_DM_TO: ${{ vars.NAVI_SLACK_DM_TO || 'self' }}
-        run: cargo run -p navi-notifier --features e2e --bin navi-e2e
+          E2E_SLACK_TOKEN: ${{ secrets.NAVI_SLACK_TOKEN }}
+          E2E_SLACK_DM_TO: ${{ vars.NAVI_SLACK_DM_TO || 'self' }}
+        run: cargo run -p navi-notifier --features e2e --bin navi-e2e-slack
 
   github-live:
     # Live GitHub *source*: a second account drives a review request; navi derives it
