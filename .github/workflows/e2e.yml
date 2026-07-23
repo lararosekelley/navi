@@ -12,6 +12,8 @@
 #                  See src/bin/navi-e2e-github.rs.
 #   gitlab-live    Live GitLab *source*: same shape via the Todos API, sinking to a
 #                  local Mailpit. See src/bin/navi-e2e-gitlab.rs.
+#   discord-live   Live Discord *destination*: bot-DM a synthetic event, read it back
+#                  via GET /channels/{id}/messages. See src/bin/navi-e2e-discord.rs.
 #
 # Triggers and gating:
 #   - push to main:      runs the hermetic job (live would be a real DM per merge).
@@ -33,10 +35,12 @@
 #   E2E_GITHUB_ACTOR_TOKEN    PAT for a second account with push access to the repo
 #   E2E_GITLAB_VIEWER_TOKEN   GitLab PAT navi authenticates as (read_api)
 #   E2E_GITLAB_ACTOR_TOKEN    token for a second member with `api` scope + Developer role
+#   E2E_DISCORD_TOKEN         Discord bot token (shares a server with the DM recipient)
 # Repo variables:
 #   NAVI_SLACK_DM_TO          DM target (defaults to "self")
 #   E2E_GITHUB_REPO           fixed test repo as `owner/name` (e.g. you/navi-e2e)
 #   E2E_GITLAB_PROJECT        fixed test project as `namespace/name` (e.g. you/navi-e2e)
+#   E2E_DISCORD_DM_TO         Discord user id (numeric snowflake) to DM
 name: E2E
 
 on:
@@ -194,3 +198,24 @@ jobs:
           MAILPIT_SMTP_HOST: localhost
           MAILPIT_SMTP_PORT: "1025"
         run: cargo run -p navi-notifier --features e2e --bin navi-e2e-gitlab
+
+  discord-live:
+    # Live Discord *destination*: bot-DM a synthetic event and read it back via
+    # GET /channels/{id}/messages. Dispatch + release gate.
+    if: ${{ github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run the live Discord read-back e2e
+        env:
+          E2E_DISCORD_TOKEN: ${{ secrets.E2E_DISCORD_TOKEN }}
+          E2E_DISCORD_DM_TO: ${{ vars.E2E_DISCORD_DM_TO }}
+        run: cargo run -p navi-notifier --features e2e --bin navi-e2e-discord
