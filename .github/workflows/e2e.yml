@@ -1,5 +1,8 @@
 # End-to-end tests, in one workflow with two jobs:
 #
+#   service-matrix Cross-OS: install/status/restart/uninstall the background service
+#                  against the real systemd/launchd/Task Scheduler on ubuntu, macOS,
+#                  and Windows. No Docker or secrets.
 #   gitea-mailpit  Hermetic: Dockerized Gitea + Mailpit, no secrets. Proves a real
 #                  navi loop (Gitea source -> email destination) end to end.
 #   slack-live     Live Slack *destination*: post a synthetic event through navi's
@@ -62,6 +65,63 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  service-matrix:
+    # Exercise the real background-service lifecycle (install -> status -> restart ->
+    # uninstall) against the actual systemd / launchd / Task Scheduler on each OS. No
+    # Docker or secrets, so it runs everywhere except the release-tag path. This is the
+    # cross-platform coverage the live provider slices (ubuntu-only) don't give.
+    if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # A credential-less but buildable config so `navi run` starts and idles: a bad
+      # token only makes the first poll fail, which is non-fatal, rather than exiting
+      # (which would fail systemd's `enable --now`).
+      NAVI_GITHUB_TOKEN: dummy-e2e-token
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@1.96.1
+
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Give the runner a user systemd session (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo loginctl enable-linger "$USER"
+          echo "XDG_RUNTIME_DIR=/run/user/$(id -u)" >> "$GITHUB_ENV"
+
+      - name: Build navi
+        run: cargo build -q -p navi-notifier
+
+      - name: Write a minimal idling config
+        run: |
+          cargo run -q -p navi-notifier -- init
+          cargo run -q -p navi-notifier -- config set github.enabled true
+          cargo run -q -p navi-notifier -- config set email.enabled true
+          cargo run -q -p navi-notifier -- config set email.smtp_host localhost
+          cargo run -q -p navi-notifier -- config set email.tls none
+          cargo run -q -p navi-notifier -- config set email.from navi@localhost
+          cargo run -q -p navi-notifier -- config set email.to you@localhost
+
+      - name: Install the background service
+        run: cargo run -q -p navi-notifier -- service install -y
+
+      - name: Query service status (informational)
+        run: cargo run -q -p navi-notifier -- service status
+
+      - name: Restart it
+        run: cargo run -q -p navi-notifier -- service restart
+
+      - name: Uninstall it
+        run: cargo run -q -p navi-notifier -- service uninstall -y
+
   gitea-mailpit:
     # Hermetic and secret-free, so it runs everywhere except the release tag path.
     if: ${{ !startsWith(github.ref, 'refs/tags/') }}
