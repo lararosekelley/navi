@@ -76,9 +76,6 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
-    # Windows install currently overflows schtasks' 261-char /TR limit (#125); keep it
-    # running (so we see the fix land / catch regressions) but non-blocking until then.
-    continue-on-error: ${{ matrix.os == 'windows-latest' }}
     env:
       # A credential-less but buildable config so `navi run` starts and idles: a bad
       # token only makes the first poll fail, which is non-fatal, rather than exiting
