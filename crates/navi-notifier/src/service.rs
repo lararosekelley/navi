@@ -9,11 +9,12 @@
 
 use std::env;
 use std::fs;
-use std::io::IsTerminal;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
+use tempfile::NamedTempFile;
 
 use crate::prompt::confirm;
 
@@ -497,7 +498,19 @@ fn install_task(exe: &str, config: &Path, yes: bool) -> Result<()> {
     )? {
         return Ok(());
     }
-    run(Command::new("schtasks").args(schtasks_create_args(exe, config)))?;
+    // Register from an XML file rather than `/TR`: schtasks caps `/TR` at 261 chars,
+    // which navi's log-wrapper command overflows (#125). Write UTF-16 so schtasks
+    // accepts it, then hand it the path.
+    let mut xml = NamedTempFile::new().context("creating the task definition file")?;
+    xml.write_all(&utf16le_with_bom(&task_xml(exe, config)))
+        .context("writing the task definition")?;
+    // Close our handle (keeping the file on disk) before schtasks opens it: Windows
+    // won't let schtasks read a file this process still holds open.
+    let xml_path = xml.into_temp_path();
+    run(Command::new("schtasks")
+        .args(["/Create", "/TN", WINDOWS_TASK_NAME, "/XML"])
+        .arg(&xml_path)
+        .arg("/F"))?;
 
     println!("registered the '{WINDOWS_TASK_NAME}' task; navi will start at your next sign-in");
     println!("navi runs hidden (no console window); output goes to {WINDOWS_LOG_DISPLAY}");
@@ -539,31 +552,65 @@ fn status_task() -> Result<()> {
     Ok(())
 }
 
-/// Arguments to `schtasks` that register the logon task. The action runs navi
-/// through a hidden-window PowerShell so no console appears at sign-in, and
-/// redirects all output to a per-user log file (creating its directory first),
-/// since a hidden task otherwise has nowhere to log.
-fn schtasks_create_args(exe: &str, config: &Path) -> Vec<String> {
+/// The PowerShell arguments that run navi through a hidden window (so no console
+/// appears at sign-in) and append all output to a per-user log file, rotating it
+/// past a size cap and creating its directory first — a hidden task otherwise has
+/// nowhere to log.
+fn ps_run_arguments(exe: &str, config: &Path) -> String {
     // Double any single quote so a path like C:\Users\O'Brien\... can't break out
     // of the PowerShell single-quoted string it sits in.
     let exe = ps_single_quote_escape(exe);
     let config = ps_single_quote_escape(&config.display().to_string());
-    let action = format!(
-        "powershell -WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; if ((Test-Path $log) -and ((Get-Item $log).Length -gt {cap})) {{ Move-Item -Force $log ($log + '.1') }}; & '{exe}' run --config '{config}' *>> $log\"",
+    format!(
+        "-WindowStyle Hidden -NoProfile -Command \"$log = Join-Path $env:LOCALAPPDATA 'navi\\navi.log'; New-Item -ItemType Directory -Force -Path (Split-Path $log) | Out-Null; if ((Test-Path $log) -and ((Get-Item $log).Length -gt {cap})) {{ Move-Item -Force $log ($log + '.1') }}; & '{exe}' run --config '{config}' *>> $log\"",
         cap = WINDOWS_LOG_MAX_BYTES,
-    );
-    vec![
-        "/Create".into(),
-        "/TN".into(),
-        WINDOWS_TASK_NAME.into(),
-        "/SC".into(),
-        "ONLOGON".into(),
-        "/RL".into(),
-        "LIMITED".into(),
-        "/F".into(),
-        "/TR".into(),
-        action,
-    ]
+    )
+}
+
+/// A Task Scheduler XML definition for the logon task. Registered via `schtasks
+/// /XML`, which — unlike `/TR` — imposes no 261-char command limit, so navi's hidden
+/// PowerShell log-wrapper plus long install/config paths can't overflow it (#125).
+fn task_xml(exe: &str, config: &Path) -> String {
+    let args = xml_escape(&ps_run_arguments(exe, config));
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <LogonTrigger>
+      <Enabled>true</Enabled>
+    </LogonTrigger>
+  </Triggers>
+  <Principals>
+    <Principal id="Author">
+      <LogonType>InteractiveToken</LogonType>
+      <RunLevel>LeastPrivilege</RunLevel>
+    </Principal>
+  </Principals>
+  <Settings>
+    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
+    <StartWhenAvailable>true</StartWhenAvailable>
+    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
+    <Enabled>true</Enabled>
+  </Settings>
+  <Actions Context="Author">
+    <Exec>
+      <Command>powershell</Command>
+      <Arguments>{args}</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#
+    )
+}
+
+/// Encode as UTF-16LE with a BOM, matching the XML declaration — schtasks rejects a
+/// task file whose bytes don't match its declared encoding.
+fn utf16le_with_bom(s: &str) -> Vec<u8> {
+    let mut bytes = vec![0xFF, 0xFE];
+    for unit in s.encode_utf16() {
+        bytes.extend_from_slice(&unit.to_le_bytes());
+    }
+    bytes
 }
 
 // ---------------------------------------------------------------------------
@@ -705,41 +752,50 @@ mod tests {
     }
 
     #[test]
-    fn schtasks_escapes_single_quotes_in_paths() {
-        let args = schtasks_create_args(
+    fn ps_run_arguments_escape_single_quotes_in_paths() {
+        let args = ps_run_arguments(
             "C:\\Users\\O'Brien\\navi.exe",
             Path::new("C:\\Users\\O'Brien\\config.toml"),
         );
-        let action = args.last().unwrap();
         // Doubled quotes keep the path inside its single-quoted PowerShell string.
-        assert!(action.contains("'C:\\Users\\O''Brien\\navi.exe'"));
-        assert!(action.contains("'C:\\Users\\O''Brien\\config.toml'"));
+        assert!(args.contains("'C:\\Users\\O''Brien\\navi.exe'"));
+        assert!(args.contains("'C:\\Users\\O''Brien\\config.toml'"));
     }
 
     #[test]
-    fn schtasks_args_register_a_hidden_logon_task() {
-        let args = schtasks_create_args(
+    fn task_xml_embeds_the_hidden_logon_action() {
+        let xml = task_xml(
             "C:\\navi.exe",
             Path::new("C:\\Users\\me\\navi\\config.toml"),
         );
-        assert_eq!(args[0], "/Create");
-        assert!(args.iter().any(|a| a == "ONLOGON"));
-        assert!(args.iter().any(|a| a == WINDOWS_TASK_NAME));
-        let action = args.last().unwrap();
-        assert!(action.contains("WindowStyle Hidden"));
-        assert!(action.contains("C:\\navi.exe"));
-        assert!(action.contains("*>>"), "output must be redirected to a log");
-        assert!(action.contains("navi.log"));
+        // A logon-triggered, least-privilege task running navi through hidden PowerShell.
+        assert!(xml.contains("<LogonTrigger>"));
+        assert!(xml.contains("<RunLevel>LeastPrivilege</RunLevel>"));
+        assert!(xml.contains("<Command>powershell</Command>"));
+        assert!(xml.contains("WindowStyle Hidden"));
+        assert!(xml.contains("C:\\navi.exe"));
+        assert!(xml.contains("navi.log"));
         assert!(
-            action.contains("$env:LOCALAPPDATA"),
+            xml.contains("$env:LOCALAPPDATA"),
             "log must live under LOCALAPPDATA"
         );
-        // Rotates the log when it's over the cap, before appending this session.
+        assert!(xml.contains(&WINDOWS_LOG_MAX_BYTES.to_string()));
+        // The `*>>` redirect's angle brackets are XML-escaped, not raw.
         assert!(
-            action.contains("Move-Item -Force $log ($log + '.1')"),
-            "action must roll the log over the size cap: {action}"
+            xml.contains("*&gt;&gt;"),
+            "redirect must be XML-escaped: {xml}"
         );
-        assert!(action.contains(&WINDOWS_LOG_MAX_BYTES.to_string()));
+        assert!(
+            !xml.contains("*>>"),
+            "no unescaped redirect should leak into the XML"
+        );
+    }
+
+    #[test]
+    fn utf16le_with_bom_starts_with_the_bom() {
+        let bytes = utf16le_with_bom("Ab");
+        assert_eq!(&bytes[..2], &[0xFF, 0xFE], "UTF-16LE BOM");
+        assert_eq!(&bytes[2..], &[b'A', 0x00, b'b', 0x00]);
     }
 
     #[test]
