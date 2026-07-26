@@ -111,19 +111,19 @@ fn headline(event: &Event, actor: &str) -> String {
         EventKind::EnteredMergeQueue => {
             format!(
                 ":train: {} entered the merge queue",
-                escape(&event.pr_phrase())
+                escape(&event.pr_owner_phrase())
             )
         }
         EventKind::RemovedFromMergeQueue { reason } => match reason {
             MergeQueueRemoval::Dequeued => {
                 format!(
                     ":arrow_backward: {} left the merge queue",
-                    escape(&event.pr_phrase())
+                    escape(&event.pr_owner_phrase())
                 )
             }
             MergeQueueRemoval::Unmergeable => format!(
                 ":warning: {} was kicked from the merge queue (can't merge)",
-                escape(&event.pr_phrase())
+                escape(&event.pr_owner_phrase())
             ),
         },
     }
