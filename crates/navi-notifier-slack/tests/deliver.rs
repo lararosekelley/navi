@@ -297,6 +297,53 @@ async fn review_broadcast_is_per_state() {
 }
 
 #[tokio::test]
+async fn review_on_someone_elses_pr_stays_in_thread() {
+    // Even with `review_approved` in the broadcast set, an approval on a PR you only
+    // review (not authored) must not break out of the thread.
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        "chat.postMessage",
+        json!({ "ok": true, "ts": "111.222" }),
+    )
+    .await;
+
+    let dest = SlackDestination::new(SlackDestinationConfig {
+        token: "xoxb-test".into(),
+        dm_to: "C0123456789".into(),
+        api_base: Some(format!("{}/api", server.uri())),
+        broadcast: vec!["review_approved".into()],
+    })
+    .expect("build destination");
+
+    let state = MemState::default();
+    let mut opener = sample_event();
+    opener.kind = EventKind::ReviewRequested;
+    opener.viewer.is_author = false;
+    dest.send(&opener, &state).await.expect("parent");
+    let mut approved = sample_event();
+    approved.kind = EventKind::ReviewSubmitted {
+        state: ReviewState::Approved,
+    };
+    approved.viewer.is_author = false;
+    dest.send(&approved, &state).await.expect("approved");
+
+    let posts: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat.postMessage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    assert_eq!(posts.len(), 2);
+    assert!(
+        posts[1].get("reply_broadcast").is_none(),
+        "an approval on someone else's PR must stay thread-only"
+    );
+}
+
+#[tokio::test]
 async fn review_submitted_umbrella_broadcasts_all_states() {
     // Backward compat: the pre-per-state config value `review_submitted` must still
     // broadcast every review state (approved, changes-requested, and commented).

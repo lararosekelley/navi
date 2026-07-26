@@ -11,6 +11,7 @@ use std::collections::HashSet;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use navi_notifier_core::model::EventKind;
 use navi_notifier_core::traits::{Destination, StateStore};
 use navi_notifier_core::{DestinationError, Event};
 use serde::Deserialize;
@@ -165,7 +166,14 @@ impl Destination for SlackDestination {
         let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
         // High-signal kinds break out of the thread so they aren't buried. Only
         // meaningful for a reply (a thread-opening message is already top-level).
+        // A review *submission* (approved/changes-requested/commented) on a PR you
+        // only review isn't worth surfacing channel-wide, so it stays in-thread —
+        // only your own PRs' review submissions break out. (This is submissions only:
+        // `review_dismissed` is *your* review being dismissed, relevant on any PR.)
+        let review_on_others_pr =
+            matches!(event.kind, EventKind::ReviewSubmitted { .. }) && !event.viewer.is_author;
         let broadcast = parent.is_some()
+            && !review_on_others_pr
             && event
                 .kind
                 .match_tags()
