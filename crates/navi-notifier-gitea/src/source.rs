@@ -127,6 +127,13 @@ impl GiteaSource {
             if n < 50 {
                 break;
             }
+            if page == MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap = MAX_PAGES,
+                    "gitea list truncated at the page cap; newer items may be missed this poll"
+                );
+            }
         }
         Ok(out)
     }
@@ -147,6 +154,13 @@ impl GiteaSource {
             out.extend(batch);
             if n < 50 {
                 break;
+            }
+            if page == MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap = MAX_PAGES,
+                    "gitea list truncated at the page cap; newer items may be missed this poll"
+                );
             }
         }
         Ok(out)
@@ -293,6 +307,13 @@ impl GiteaSource {
             }
             if n < 50 {
                 break;
+            }
+            if page == MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap = MAX_PAGES,
+                    "gitea list truncated at the page cap; newer items may be missed this poll"
+                );
             }
         }
         Ok(out)

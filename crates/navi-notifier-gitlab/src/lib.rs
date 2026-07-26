@@ -130,6 +130,13 @@ impl GitLabSource {
             if n < 100 {
                 break;
             }
+            if page == MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap = MAX_PAGES,
+                    "gitlab list truncated at the page cap; newer items may be missed this poll"
+                );
+            }
         }
         Ok(out)
     }
@@ -163,6 +170,9 @@ impl GitLabSource {
                 if n < 100 {
                     break;
                 }
+                if page == MAX_PAGES {
+                    warn!(role, fetched = out.len(), cap = MAX_PAGES, "gitlab involved-MR list truncated at the page cap; newer items may be missed this poll");
+                }
             }
         }
         Ok(out)
@@ -178,6 +188,13 @@ impl GitLabSource {
             out.extend(batch);
             if n < 100 {
                 break;
+            }
+            if page == MAX_PAGES {
+                warn!(
+                    fetched = out.len(),
+                    cap = MAX_PAGES,
+                    "gitlab list truncated at the page cap; newer items may be missed this poll"
+                );
             }
         }
         Ok(out)
