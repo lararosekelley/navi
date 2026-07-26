@@ -424,3 +424,36 @@ fn map_status(resp: &reqwest::Response) -> Result<(), SourceError> {
 mod tests {
     include!("todo_tests.rs");
 }
+
+#[cfg(test)]
+mod repo_tests {
+    use super::*;
+
+    fn mr(web_url: &str) -> MergeRequest {
+        serde_json::from_value(serde_json::json!({
+            "iid": 1, "project_id": 1, "web_url": web_url
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn repo_from_mr_parses_paths_including_nested_groups() {
+        assert_eq!(
+            repo_from_mr(&mr("https://gitlab.com/group/proj/-/merge_requests/3")).full_name(),
+            "group/proj"
+        );
+        // Nested subgroups collapse into the owner side of `owner/name`.
+        assert_eq!(
+            repo_from_mr(&mr("https://gitlab.com/group/sub/proj/-/merge_requests/7")).full_name(),
+            "group/sub/proj"
+        );
+    }
+
+    #[test]
+    fn repo_from_mr_without_a_url_is_empty() {
+        let m: MergeRequest =
+            serde_json::from_value(serde_json::json!({ "iid": 1, "project_id": 1 })).unwrap();
+        let r = repo_from_mr(&m);
+        assert!(r.owner.is_empty() && r.name.is_empty());
+    }
+}

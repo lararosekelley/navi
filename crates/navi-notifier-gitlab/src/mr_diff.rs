@@ -12,6 +12,7 @@ use std::collections::HashSet;
 use navi_notifier_core::model::{
     Actor, Backfill, Event, EventKind, PullRequest, Repo, ViewerRelationship,
 };
+use navi_notifier_forge::{excerpt, is_settled, ts_key};
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
@@ -230,41 +231,9 @@ fn eq(a: &str, b: &str) -> bool {
     a.eq_ignore_ascii_case(b)
 }
 
-/// Whether a note is old enough to notify about, given the optional min-age hold. A
-/// missing or unparseable timestamp counts as settled, so bad data never holds a
-/// note back forever. Mirrors the forge diff's `is_settled`.
-fn is_settled(
-    created_at: Option<&str>,
-    now: OffsetDateTime,
-    min_age: Option<time::Duration>,
-) -> bool {
-    let Some(min_age) = min_age else {
-        return true;
-    };
-    let Some(created) = created_at.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok()) else {
-        return true;
-    };
-    now - created >= min_age
-}
-
 fn parse_ts(raw: Option<&str>, fallback: OffsetDateTime) -> OffsetDateTime {
     raw.and_then(|s| OffsetDateTime::parse(s, &Rfc3339).ok())
         .unwrap_or(fallback)
-}
-
-fn ts_key(raw: Option<&str>) -> String {
-    raw.unwrap_or("0").to_string()
-}
-
-/// First non-empty line of a note body, trimmed to a readable length.
-fn excerpt(body: &str) -> Option<String> {
-    let line = body.lines().map(str::trim).find(|l| !l.is_empty())?;
-    const MAX: usize = 140;
-    if line.chars().count() > MAX {
-        Some(format!("{}…", line.chars().take(MAX).collect::<String>()))
-    } else {
-        Some(line.to_string())
-    }
 }
 
 #[cfg(test)]

@@ -481,3 +481,17 @@ fn first_run_backfill_modes_gate_what_surfaces() {
         ]
     );
 }
+
+#[test]
+fn excerpt_takes_first_nonempty_line_and_truncates() {
+    use super::excerpt;
+    // Leading blanks skipped, the line is trimmed.
+    assert_eq!(excerpt("\n\n  hello  \nworld"), Some("hello".to_string()));
+    // Nothing but whitespace yields no excerpt.
+    assert_eq!(excerpt("   \n \n"), None);
+    // Over-long lines are cut to 140 chars plus an ellipsis.
+    let long = "x".repeat(200);
+    let e = excerpt(&long).unwrap();
+    assert_eq!(e.chars().count(), 141);
+    assert!(e.ends_with('…'));
+}

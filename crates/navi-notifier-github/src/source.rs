@@ -13,7 +13,7 @@ use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
 use navi_notifier_forge::{
-    diff, first_sight_watermark, team_key, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
+    diff, first_sight_watermark, team_key, ts_key, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
 };
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
@@ -912,12 +912,6 @@ impl Source for GitHubSource {
     }
 }
 
-/// Parse `https://api.github.com/repos/{owner}/{repo}/pulls/{number}` into parts.
-/// Stable-enough discriminator fragment from a timestamp string.
-fn ts_key(raw: Option<&str>) -> String {
-    raw.unwrap_or("0").to_string()
-}
-
 /// Whether a cached merge-queue config verdict says "no queue" and is still within
 /// [`MQ_CONFIG_TTL`]. Format is `"yes|<rfc3339>"` / `"no|<rfc3339>"`; anything
 /// unparseable falls through to re-checking.
@@ -956,6 +950,7 @@ fn merge_queue_change(prev: Option<&str>, current: Option<&str>) -> Option<Event
     }
 }
 
+/// Parse `https://api.github.com/repos/{owner}/{repo}/pulls/{number}` into parts.
 fn parse_pr_url(url: &str) -> Option<(String, String, u64)> {
     let after = url.split("/repos/").nth(1)?;
     let mut parts = after.split('/');
@@ -1013,10 +1008,34 @@ fn classify_github_error(msg: &str) -> SourceError {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_github_error, merge_queue_change, parse_pr_url, parse_repo_url, MQ_ABSENT,
+        classify_github_error, is_fresh_no_queue, merge_queue_change, parse_pr_url, parse_repo_url,
+        MQ_ABSENT,
     };
     use navi_notifier_core::model::{EventKind, MergeQueueRemoval};
     use navi_notifier_core::SourceError;
+    use time::format_description::well_known::Rfc3339;
+    use time::{Duration, OffsetDateTime};
+
+    #[test]
+    fn is_fresh_no_queue_respects_verdict_ttl_and_bad_data() {
+        let base = OffsetDateTime::UNIX_EPOCH;
+        let stamp = base.format(&Rfc3339).unwrap();
+        // "no" + a stamp within the TTL is fresh.
+        assert!(is_fresh_no_queue(
+            &format!("no|{stamp}"),
+            base + Duration::hours(1)
+        ));
+        // "no" but older than the 24h TTL is stale.
+        assert!(!is_fresh_no_queue(
+            &format!("no|{stamp}"),
+            base + Duration::hours(25)
+        ));
+        // A "yes" verdict is never a cached no-queue.
+        assert!(!is_fresh_no_queue(&format!("yes|{stamp}"), base));
+        // Malformed entries (no separator / unparseable time) count as stale.
+        assert!(!is_fresh_no_queue("garbage", base));
+        assert!(!is_fresh_no_queue("no|not-a-date", base));
+    }
 
     #[test]
     fn merge_queue_transitions() {
