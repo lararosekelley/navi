@@ -366,6 +366,234 @@ impl Config {
     }
 }
 
+/// Severity of a [`Finding`] from [`validate`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Severity {
+    /// A misconfiguration that will misbehave or drop events; `doctor` exits non-zero.
+    Error,
+    /// Legal but probably-not-intended; reported, doesn't fail.
+    Warning,
+}
+
+/// One static-validation result: a severity and a human-facing message.
+#[derive(Debug, Clone)]
+pub struct Finding {
+    pub severity: Severity,
+    pub message: String,
+}
+
+impl Finding {
+    fn error(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Error,
+            message: message.into(),
+        }
+    }
+    fn warning(message: impl Into<String>) -> Self {
+        Self {
+            severity: Severity::Warning,
+            message: message.into(),
+        }
+    }
+}
+
+const SOURCE_IDS: [&str; 3] = ["github", "gitlab", "gitea"];
+const DESTINATION_IDS: [&str; 3] = ["slack", "discord", "email"];
+/// Event tags accepted in `slack.broadcast` and `digest.kinds`: the `EventKind`
+/// tags plus the per-state review shorthands. Kept in sync with the model by the
+/// `broadcast_tags_are_all_known` test.
+const KNOWN_TAGS: [&str; 14] = [
+    "review_requested",
+    "re_review_requested",
+    "review_submitted",
+    "review_dismissed",
+    "comment_reply",
+    "mentioned",
+    "merged",
+    "closed",
+    "ready_for_review",
+    "entered_merge_queue",
+    "removed_merge_queue",
+    "review_approved",
+    "review_changes_requested",
+    "review_commented",
+];
+
+/// Statically validate a loaded config with no network or credentials: catch route
+/// wiring mistakes, missing required fields, and malformed globs/tags before they
+/// silently drop events at runtime. Complements `doctor`'s live credential checks.
+pub fn validate(config: &Config) -> Vec<Finding> {
+    let mut out = Vec::new();
+
+    for r in &config.routes {
+        if !SOURCE_IDS.contains(&r.source.as_str()) {
+            out.push(Finding::error(format!(
+                "route source `{}` is not a known source (github|gitlab|gitea)",
+                r.source
+            )));
+        } else if !source_enabled(config, &r.source) {
+            out.push(Finding::warning(format!(
+                "route source `{}` is disabled; the route stays inert until you enable it",
+                r.source
+            )));
+        }
+        if !DESTINATION_IDS.contains(&r.destination.as_str()) {
+            out.push(Finding::error(format!(
+                "route destination `{}` is not a known destination (slack|discord|email)",
+                r.destination
+            )));
+        } else if !dest_enabled(config, &r.destination) {
+            out.push(Finding::warning(format!(
+                "route sends to `{}`, which is disabled; those events are dropped",
+                r.destination
+            )));
+        }
+        for pat in &r.repos {
+            if !is_valid_repo_glob(pat) {
+                out.push(Finding::error(format!(
+                    "route repo glob `{pat}` is malformed (expected owner/name, e.g. acme/*)"
+                )));
+            }
+        }
+    }
+
+    // With routes present, an enabled source no route references delivers nowhere.
+    if !config.routes.is_empty() {
+        for id in SOURCE_IDS {
+            if source_enabled(config, id) && !config.routes.iter().any(|r| r.source == id) {
+                out.push(Finding::warning(format!(
+                    "source `{id}` is enabled but no route sends its events anywhere"
+                )));
+            }
+        }
+    }
+
+    // Required fields for enabled providers.
+    if config.email.enabled {
+        for (field, val) in [
+            ("smtp_host", &config.email.smtp_host),
+            ("from", &config.email.from),
+            ("to", &config.email.to),
+        ] {
+            if val.trim().is_empty() {
+                out.push(Finding::error(format!(
+                    "email is enabled but email.{field} is empty"
+                )));
+            }
+        }
+    }
+    if config.slack.enabled && config.slack.dm_to.trim().is_empty() {
+        out.push(Finding::error(
+            "slack is enabled but slack.dm_to is empty".to_string(),
+        ));
+    }
+    if config.discord.enabled && config.discord.dm_to.trim().is_empty() {
+        out.push(Finding::error(
+            "discord is enabled but discord.dm_to is empty (set a webhook URL or user id)"
+                .to_string(),
+        ));
+    }
+    if config.gitea.enabled
+        && config
+            .gitea
+            .api_base
+            .as_deref()
+            .unwrap_or("")
+            .trim()
+            .is_empty()
+    {
+        out.push(Finding::error(
+            "gitea is enabled but gitea.api_base is unset (needs …/api/v1)".to_string(),
+        ));
+    }
+
+    // Repo-filter globs.
+    for pat in config
+        .rules
+        .repos
+        .allow
+        .iter()
+        .chain(&config.rules.repos.deny)
+    {
+        if !is_valid_repo_glob(pat) {
+            out.push(Finding::error(format!(
+                "rules.repos glob `{pat}` is malformed (expected owner/name)"
+            )));
+        }
+    }
+
+    // Quiet-hours clock format.
+    if config.rules.quiet_hours.enabled {
+        for (field, val) in [
+            ("start", &config.rules.quiet_hours.start),
+            ("end", &config.rules.quiet_hours.end),
+        ] {
+            if !is_hhmm(val) {
+                out.push(Finding::error(format!(
+                    "rules.quiet_hours.{field} `{val}` is not a HH:MM time"
+                )));
+            }
+        }
+    }
+
+    // Broadcast / digest event tags.
+    for tag in &config.slack.broadcast {
+        if !KNOWN_TAGS.contains(&tag.as_str()) {
+            out.push(Finding::warning(format!(
+                "slack.broadcast has unknown tag `{tag}`; it will never match"
+            )));
+        }
+    }
+    if config.digest.enabled {
+        for tag in &config.digest.kinds {
+            if !KNOWN_TAGS.contains(&tag.as_str()) {
+                out.push(Finding::warning(format!(
+                    "digest.kinds has unknown tag `{tag}`"
+                )));
+            }
+        }
+    }
+
+    out
+}
+
+fn source_enabled(config: &Config, id: &str) -> bool {
+    match id {
+        "github" => config.github.enabled,
+        "gitlab" => config.gitlab.enabled,
+        "gitea" => config.gitea.enabled,
+        _ => false,
+    }
+}
+
+fn dest_enabled(config: &Config, id: &str) -> bool {
+    match id {
+        "slack" => config.slack.enabled,
+        "discord" => config.discord.enabled,
+        "email" => config.email.enabled,
+        _ => false,
+    }
+}
+
+/// An `owner/name` glob: one `/`, both sides non-empty (either may be/contain `*`).
+fn is_valid_repo_glob(pattern: &str) -> bool {
+    // Exactly one `/`, both sides non-empty: a real repo full name is `owner/name`,
+    // so a multi-slash pattern like `acme/repo/sub` could never match anything.
+    let mut parts = pattern.split('/');
+    matches!(
+        (parts.next(), parts.next(), parts.next()),
+        (Some(owner), Some(name), None) if !owner.is_empty() && !name.is_empty()
+    )
+}
+
+/// A 24-hour `HH:MM` clock time.
+fn is_hhmm(s: &str) -> bool {
+    matches!(s.split_once(':'), Some((h, m))
+        if h.len() == 2 && m.len() == 2
+        && h.parse::<u8>().is_ok_and(|h| h < 24)
+        && m.parse::<u8>().is_ok_and(|m| m < 60))
+}
+
 /// Resolve the config file path: explicit `--config`, else the platform config dir
 /// (`~/.config/navi/config.toml` on Linux).
 pub fn resolve_config_path(explicit: Option<PathBuf>) -> Result<PathBuf> {
@@ -397,5 +625,91 @@ mod tests {
         assert!(!SlackConfig::default().enabled);
         assert!(!DiscordConfig::default().enabled);
         assert!(!EmailConfig::default().enabled);
+    }
+
+    fn route(source: &str, destination: &str, repos: Vec<String>) -> RouteConfig {
+        RouteConfig {
+            source: source.into(),
+            destination: destination.into(),
+            repos,
+            fallback: false,
+        }
+    }
+
+    fn errors(findings: &[Finding]) -> usize {
+        findings
+            .iter()
+            .filter(|f| f.severity == Severity::Error)
+            .count()
+    }
+
+    #[test]
+    fn default_config_validates_clean() {
+        // The default (all off, default broadcast tags) has nothing to flag.
+        assert!(validate(&Config::default()).is_empty());
+    }
+
+    #[test]
+    fn flags_unknown_and_disabled_route_targets() {
+        let mut c = Config::default();
+        c.github.enabled = true;
+        c.routes = vec![
+            route("github", "bogus", vec![]), // unknown destination -> error
+            route("github", "slack", vec![]), // known but disabled -> warning
+        ];
+        let f = validate(&c);
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("bogus")));
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Warning && x.message.contains("slack")));
+    }
+
+    #[test]
+    fn flags_missing_required_fields_and_bad_glob() {
+        let mut c = Config::default();
+        c.email.enabled = true; // smtp_host/from/to all empty by default
+        c.rules.repos.deny = vec!["not-a-glob".into()];
+        let f = validate(&c);
+        // 3 empty email fields + 1 malformed glob.
+        assert_eq!(errors(&f), 4);
+        assert!(f.iter().any(|x| x.message.contains("email.smtp_host")));
+        assert!(f.iter().any(|x| x.message.contains("not-a-glob")));
+    }
+
+    #[test]
+    fn flags_empty_discord_dm_to_and_multislash_glob() {
+        let mut c = Config::default();
+        c.discord.enabled = true; // dm_to defaults to ""
+        c.rules.repos.allow = vec!["acme/repo/sub".into()]; // more than one `/`
+        let f = validate(&c);
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("discord.dm_to")));
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("acme/repo/sub")));
+    }
+
+    #[test]
+    fn flags_bad_quiet_hours_time() {
+        let mut c = Config::default();
+        c.rules.quiet_hours.enabled = true;
+        c.rules.quiet_hours.start = "9am".into();
+        c.rules.quiet_hours.end = "08:00".into();
+        let f = validate(&c);
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("quiet_hours.start")));
+        assert!(!f.iter().any(|x| x.message.contains("quiet_hours.end")));
+    }
+
+    #[test]
+    fn default_broadcast_tags_are_all_known() {
+        // If a new default broadcast tag isn't added to KNOWN_TAGS, this warns.
+        let c = Config::default();
+        let f = validate(&c);
+        assert!(!f.iter().any(|x| x.message.contains("unknown tag")));
     }
 }

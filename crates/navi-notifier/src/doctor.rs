@@ -3,14 +3,32 @@
 //! SSO, or a destination with no credentials) is visible instead of looking like
 //! navi being broken.
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 
-use crate::config::Config;
+use crate::config::{self, Config, Severity};
 
-pub async fn doctor(config: &Config) -> Result<()> {
-    println!("sources:");
-    check_github(config).await;
+/// `navi doctor`: static config validation followed by live provider probes. With
+/// `offline`, only the static pass runs (no network). Exits non-zero if the static
+/// pass found any errors.
+pub async fn doctor(config: &Config, offline: bool) -> Result<()> {
+    let findings = config::validate(config);
+    print_findings(&findings);
+    let errors = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .count();
+
+    println!("\nsources:");
+    if offline {
+        report(
+            "github",
+            config.github.enabled,
+            config.github.resolve_token().is_ok(),
+        );
+    } else {
+        check_github(config).await;
+    }
     report(
         "gitlab",
         config.gitlab.enabled,
@@ -40,7 +58,27 @@ pub async fn doctor(config: &Config) -> Result<()> {
         config.email.enabled,
         config.email.resolve_password().is_some(),
     );
+
+    if errors > 0 {
+        bail!("config has {errors} error(s) above; fix them before running navi");
+    }
     Ok(())
+}
+
+/// Print the static-validation findings under a `config:` header (or a clean line).
+fn print_findings(findings: &[crate::config::Finding]) {
+    println!("config:");
+    if findings.is_empty() {
+        println!("  no problems found");
+        return;
+    }
+    for f in findings {
+        let label = match f.severity {
+            Severity::Error => "error",
+            Severity::Warning => "warn",
+        };
+        println!("  {label}: {}", f.message);
+    }
 }
 
 /// A config-level line: enabled, and whether credentials resolve. No network.

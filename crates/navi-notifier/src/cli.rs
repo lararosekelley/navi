@@ -54,8 +54,12 @@ pub enum Command {
         destination: Option<String>,
     },
 
-    /// Report what each enabled provider can see (identity, visible orgs, creds).
-    Doctor,
+    /// Validate the config and report what each enabled provider can see.
+    Doctor {
+        /// Only run the offline config checks; skip the live provider probes.
+        #[arg(long)]
+        offline: bool,
+    },
 
     /// Read or write config values without hand-editing config.toml.
     Config {
