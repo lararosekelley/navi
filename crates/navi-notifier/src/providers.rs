@@ -3,22 +3,27 @@
 
 use anyhow::{bail, Result};
 
-use crate::config::Config;
-
-const SOURCES: [&str; 3] = ["github", "gitlab", "gitea"];
-const DESTINATIONS: [&str; 3] = ["slack", "discord", "email"];
+use crate::config::{self, Config, DESTINATION_IDS, SOURCE_IDS};
 
 /// Print each source and destination with its on/off state and whether its
 /// credentials resolve from config/env. Config-level only; no network (use
 /// `navi doctor` for a live check).
 pub fn list(config: &Config) {
     println!("sources:");
-    for id in SOURCES {
-        row(id, source_enabled(config, id), source_creds(config, id));
+    for id in SOURCE_IDS {
+        row(
+            id,
+            config::source_enabled(config, id),
+            config::source_creds(config, id),
+        );
     }
     println!("\ndestinations:");
-    for id in DESTINATIONS {
-        row(id, dest_enabled(config, id), dest_creds(config, id));
+    for id in DESTINATION_IDS {
+        row(
+            id,
+            config::dest_enabled(config, id),
+            config::dest_creds(config, id),
+        );
     }
     println!("\nrun `navi providers setup <name>` for setup steps.");
 }
@@ -31,48 +36,6 @@ fn row(name: &str, enabled: bool, creds: bool) {
         "no credentials"
     };
     println!("  {name:<8} {state:<3}  {creds}");
-}
-
-// The `_` arms below only ever see ids from SOURCES/DESTINATIONS, so a fall-through
-// means a const gained a provider whose arm was never added: panic loudly here
-// rather than silently reporting it "off / no credentials".
-fn source_enabled(config: &Config, id: &str) -> bool {
-    match id {
-        "github" => config.github.enabled,
-        "gitlab" => config.gitlab.enabled,
-        "gitea" => config.gitea.enabled,
-        _ => unreachable!("no source_enabled arm for `{id}`"),
-    }
-}
-
-fn source_creds(config: &Config, id: &str) -> bool {
-    match id {
-        "github" => config.github.resolve_token().is_ok(),
-        "gitlab" => config.gitlab.resolve_token().is_ok(),
-        "gitea" => config.gitea.resolve_token().is_ok(),
-        _ => unreachable!("no source_creds arm for `{id}`"),
-    }
-}
-
-fn dest_enabled(config: &Config, id: &str) -> bool {
-    match id {
-        "slack" => config.slack.enabled,
-        "discord" => config.discord.enabled,
-        "email" => config.email.enabled,
-        _ => unreachable!("no dest_enabled arm for `{id}`"),
-    }
-}
-
-fn dest_creds(config: &Config, id: &str) -> bool {
-    match id {
-        "slack" => config.slack.resolve_token().is_ok(),
-        // Webhook mode (a URL in dm_to) needs no token; DM mode does.
-        "discord" => {
-            config.discord.dm_to.contains("://") || config.discord.resolve_token().is_some()
-        }
-        "email" => config.email.resolve_password().is_some(),
-        _ => unreachable!("no dest_creds arm for `{id}`"),
-    }
 }
 
 /// Print setup steps for a provider.
@@ -169,7 +132,7 @@ mod tests {
 
     #[test]
     fn setup_text_covers_every_provider() {
-        for id in SOURCES.iter().chain(DESTINATIONS.iter()) {
+        for id in SOURCE_IDS.iter().chain(DESTINATION_IDS.iter()) {
             assert!(setup_text(id).is_some(), "missing setup text for {id}");
         }
         assert!(setup_text("nope").is_none());
@@ -194,7 +157,7 @@ mod tests {
         assert!(scopes.as_array().unwrap().iter().any(|s| s == "chat:write"));
         assert!(scopes.as_array().unwrap().iter().any(|s| s == "im:write"));
         // No repo-relative path leaked into any setup text.
-        for id in SOURCES.iter().chain(DESTINATIONS.iter()) {
+        for id in SOURCE_IDS.iter().chain(DESTINATION_IDS.iter()) {
             assert!(
                 !setup_text(id).unwrap().contains("assets/"),
                 "{id} setup text references a repo path installed users won't have"

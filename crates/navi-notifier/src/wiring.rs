@@ -1,10 +1,13 @@
 //! Config-driven construction of the engine's sources and destinations, the "plugin
-//! registry" seam. Adding a provider means adding a branch here plus its crate.
-//!
-//! A new provider touches five spots that must stay in sync: the id list in
-//! `build_engine`, its `*_enabled` arm, and its `build_source`/`build_destination`
-//! arm. The catch-all arms return `false`/`bail!`, so a half-done addition
-//! misbehaves quietly rather than failing to compile - keep them together.
+//! registry" seam. Adding a provider means: its id in `config::SOURCE_IDS` /
+//! `DESTINATION_IDS`, its arms in `config`'s `*_enabled`/`*_creds`, its arm in
+//! `build_source`/`build_destination` here, and - for a source - a line in
+//! `doctor.rs`'s sources section (destinations there loop over `DESTINATION_IDS`,
+//! but sources can't: GitHub takes an async live-check branch, so gitlab/gitea are
+//! listed by hand). Keep all four in sync. The catch-all arms here `bail!`, so a
+//! half-done wiring fails at runtime rather than compile time; the `*_enabled` arms
+//! in `config` instead `unreachable!()`, since they're only ever called with a known
+//! id (`*_creds` returns `false` for the same reason - a missing arm can't be hit).
 
 use std::sync::Arc;
 
@@ -19,20 +22,20 @@ use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 
-use crate::config::{Config, SlackConfig};
+use crate::config::{self, Config, SlackConfig, DESTINATION_IDS, SOURCE_IDS};
 
 /// Build the fully-wired engine from config and a state store.
 pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engine> {
     let mut sources: Vec<Arc<dyn Source>> = Vec::new();
-    for id in ["github", "gitlab", "gitea"] {
-        if source_enabled(config, id) {
+    for id in SOURCE_IDS {
+        if config::source_enabled(config, id) {
             sources.push(build_source(config, id)?);
         }
     }
 
     let mut destinations: Vec<Arc<dyn Destination>> = Vec::new();
-    for id in ["slack", "discord", "email"] {
-        if destination_enabled(config, id) {
+    for id in DESTINATION_IDS {
+        if config::dest_enabled(config, id) {
             destinations.push(build_destination(config, id)?);
         }
     }
@@ -53,24 +56,6 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
         Engine::new(sources, destinations, config.engine_routes(), rules, state)
             .with_digest_kinds(digest_kinds),
     )
-}
-
-fn source_enabled(config: &Config, id: &str) -> bool {
-    match id {
-        "github" => config.github.enabled,
-        "gitlab" => config.gitlab.enabled,
-        "gitea" => config.gitea.enabled,
-        _ => false,
-    }
-}
-
-fn destination_enabled(config: &Config, id: &str) -> bool {
-    match id {
-        "slack" => config.slack.enabled,
-        "discord" => config.discord.enabled,
-        "email" => config.email.enabled,
-        _ => false,
-    }
 }
 
 /// Build a single source by id, regardless of its `enabled` flag (so `navi test`
@@ -147,8 +132,9 @@ pub fn build_destination(config: &Config, id: &str) -> Result<Arc<dyn Destinatio
     }
 }
 
-/// Build the Slack destination, shared by the engine and `navi test`.
-pub fn build_slack(config: &SlackConfig) -> Result<SlackDestination> {
+/// Build the Slack destination (its config needs a little more massaging than the
+/// others, so it's split out).
+fn build_slack(config: &SlackConfig) -> Result<SlackDestination> {
     let token = config.resolve_token()?;
     SlackDestination::new(SlackDestinationConfig {
         token,

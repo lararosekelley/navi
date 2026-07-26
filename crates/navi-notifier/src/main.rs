@@ -129,11 +129,10 @@ fn load_and_init_logging(config_path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-async fn open_engine(config: &Config) -> Result<(Engine, Arc<SqliteStore>)> {
+async fn open_engine(config: &Config) -> Result<Engine> {
     let state_path = resolve_state_path()?;
     let store = Arc::new(SqliteStore::open(&state_path).context("opening state store")?);
-    let engine = wiring::build_engine(config, store.clone())?;
-    Ok((engine, store))
+    wiring::build_engine(config, store)
 }
 
 /// Compute the current local time-of-day (minutes since midnight) for quiet hours.
@@ -148,7 +147,7 @@ fn filter_context(config: &Config) -> FilterContext {
 
 async fn cmd_once(config_path: &Path, dry_run: bool) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let (engine, _store) = open_engine(&config).await?;
+    let engine = open_engine(&config).await?;
     let report = engine.run_once(filter_context(&config), dry_run).await;
     print_report(&report, dry_run);
     Ok(())
@@ -156,7 +155,7 @@ async fn cmd_once(config_path: &Path, dry_run: bool) -> Result<()> {
 
 async fn cmd_run(config_path: &Path) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let (engine, _store) = open_engine(&config).await?;
+    let engine = open_engine(&config).await?;
     let interval = std::time::Duration::from_secs(config.general.poll_interval_secs.max(1));
     info!(
         interval_secs = interval.as_secs(),

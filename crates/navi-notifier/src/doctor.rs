@@ -23,41 +23,32 @@ pub async fn doctor(config: &Config, offline: bool) -> Result<()> {
     if offline {
         report(
             "github",
-            config.github.enabled,
-            config.github.resolve_token().is_ok(),
+            config::source_enabled(config, "github"),
+            config::source_creds(config, "github"),
         );
     } else {
         check_github(config).await;
     }
     report(
         "gitlab",
-        config.gitlab.enabled,
-        config.gitlab.resolve_token().is_ok(),
+        config::source_enabled(config, "gitlab"),
+        config::source_creds(config, "gitlab"),
     );
     report(
         "gitea",
-        config.gitea.enabled,
-        config.gitea.resolve_token().is_ok(),
+        config::source_enabled(config, "gitea"),
+        config::source_creds(config, "gitea"),
     );
 
     println!("\ndestinations:");
-    report(
-        "slack",
-        config.slack.enabled,
-        config.slack.resolve_token().is_ok(),
-    );
-    report(
-        "discord",
-        config.discord.enabled,
-        // Webhook mode (a URL in dm_to) is self-authenticating; user-id DM mode
-        // needs a bot token. A bare user id without a token is a misconfig, not creds.
-        config.discord.dm_to.contains("://") || config.discord.resolve_token().is_some(),
-    );
-    report(
-        "email",
-        config.email.enabled,
-        config.email.resolve_password().is_some(),
-    );
+    for id in config::DESTINATION_IDS {
+        // Webhook-mode Discord is self-authenticating; the shared `dest_creds` knows.
+        report(
+            id,
+            config::dest_enabled(config, id),
+            config::dest_creds(config, id),
+        );
+    }
 
     if errors > 0 {
         bail!("config has {errors} error(s) above; fix them before running navi");
