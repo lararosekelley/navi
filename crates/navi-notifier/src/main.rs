@@ -364,7 +364,8 @@ dm_to = "self"
 # merged, closed, ready_for_review, entered_merge_queue, removed_merge_queue,
 # review_approved, review_changes_requested, review_commented.
 # review_submitted covers every review; the review_approved / review_changes_requested /
-# review_commented shorthands narrow it to a single state.
+# review_commented shorthands narrow it to a single state. Review *submissions* only
+# broadcast for PRs you authored; review_dismissed still broadcasts (it's your review).
 broadcast = ["merged", "closed", "review_dismissed", "review_approved", "review_changes_requested"]
 
 [discord]
