@@ -98,18 +98,18 @@ fn headline(event: &Event, actor: &str) -> (String, u32) {
             0x2ecc71,
         ),
         EventKind::EnteredMergeQueue => (
-            format!("🚆 {} entered the merge queue", event.pr_phrase()),
+            format!("🚆 {} entered the merge queue", event.pr_owner_phrase()),
             0x3498db,
         ),
         EventKind::RemovedFromMergeQueue { reason } => match reason {
             MergeQueueRemoval::Dequeued => (
-                format!("◀️ {} left the merge queue", event.pr_phrase()),
+                format!("◀️ {} left the merge queue", event.pr_owner_phrase()),
                 0x95a5a6,
             ),
             MergeQueueRemoval::Unmergeable => (
                 format!(
                     "⚠️ {} was kicked from the merge queue (can't merge)",
-                    event.pr_phrase()
+                    event.pr_owner_phrase()
                 ),
                 0xe67e22,
             ),
@@ -199,5 +199,27 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(d3.contains("merged their own PR"), "got {d3}");
+    }
+
+    #[test]
+    fn merge_queue_names_the_author_not_their_own_pr() {
+        // No actor precedes the phrase here, so "their own PR" would read oddly even
+        // when the author enqueued their own PR — name them instead.
+        let mut own = event(EventKind::EnteredMergeQueue);
+        own.actor = Actor::new("octo"); // author enqueued their own PR
+        let d = render(&own).embed["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d.contains("octo's PR entered the merge queue"), "got {d}");
+        assert!(!d.contains("their own PR"), "got {d}");
+        // Your own PR still reads "your PR".
+        let mut mine = event(EventKind::EnteredMergeQueue);
+        mine.viewer.is_author = true;
+        let d2 = render(&mine).embed["description"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(d2.contains("your PR entered the merge queue"), "got {d2}");
     }
 }

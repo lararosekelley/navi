@@ -204,13 +204,17 @@ fn headline(event: &Event) -> String {
         EventKind::Merged => format!("{actor} merged {}", event.pr_phrase()),
         EventKind::Closed => format!("{} was closed", event.pr_phrase()),
         EventKind::ReadyForReview => format!("{actor} marked a PR ready for review"),
-        EventKind::EnteredMergeQueue => format!("{} entered the merge queue", event.pr_phrase()),
+        EventKind::EnteredMergeQueue => {
+            format!("{} entered the merge queue", event.pr_owner_phrase())
+        }
         EventKind::RemovedFromMergeQueue { reason } => match reason {
-            MergeQueueRemoval::Dequeued => format!("{} left the merge queue", event.pr_phrase()),
+            MergeQueueRemoval::Dequeued => {
+                format!("{} left the merge queue", event.pr_owner_phrase())
+            }
             MergeQueueRemoval::Unmergeable => {
                 format!(
                     "{} was kicked from the merge queue (can't merge)",
-                    event.pr_phrase()
+                    event.pr_owner_phrase()
                 )
             }
         },

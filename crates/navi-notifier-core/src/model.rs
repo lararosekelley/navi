@@ -247,6 +247,18 @@ impl Event {
         }
     }
 
+    /// Like [`Event::pr_phrase`], but for headlines with no preceding actor mention
+    /// (e.g. "… entered the merge queue"): names the PR's author directly instead of
+    /// collapsing to "their own PR", which reads oddly with nothing for "their" to
+    /// refer back to. Still "your PR" when you authored it.
+    pub fn pr_owner_phrase(&self) -> String {
+        if self.viewer.is_author {
+            "your PR".to_string()
+        } else {
+            format!("{}'s PR", self.pull_request.author.label())
+        }
+    }
+
     /// Provider-stable per-PR key (`owner/repo#number`). Groups an event with the
     /// pull request it came from, so the engine can advance per-PR state as a unit.
     pub fn scope(&self) -> String {
