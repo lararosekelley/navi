@@ -44,35 +44,27 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let config_path = resolve_config_path(cli.config.clone())?;
 
-    // Load navi.env before starting the async runtime, so populating the process
+    // Load navi.env before any async runtime starts, so populating the process
     // environment happens while we're still single-threaded (set_var is not safe
     // to call once the runtime's worker threads are up). navi.env is authoritative.
     envfile::load_beside_config(&config_path);
 
-    // `logs` (especially --follow) is a long-running synchronous tail; run it
-    // without spinning up the async runtime, which it neither needs nor should
-    // block a thread of.
-    if let Command::Logs { follow, lines } = &cli.command {
-        return logs::show(*follow, *lines);
-    }
-
-    tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .context("starting the async runtime")?
-        .block_on(dispatch(cli.command, config_path))
+    dispatch(cli.command, config_path)
 }
 
-async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
+/// Route a command. Only the handful that actually `.await` spin up a Tokio runtime
+/// (via `on_runtime`); the rest — config edits, service management, upgrades, `logs`
+/// — run synchronously and never pay for one.
+fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
     match command {
         Command::Init { force } => cmd_init(&config_path, force),
-        Command::Once { dry_run } => cmd_once(&config_path, dry_run).await,
-        Command::Run => cmd_run(&config_path).await,
+        Command::Once { dry_run } => on_runtime(cmd_once(&config_path, dry_run)),
+        Command::Run => on_runtime(cmd_run(&config_path)),
         Command::Test {
             source,
             destination,
-        } => cmd_test(&config_path, source, destination).await,
-        Command::Doctor { offline } => cmd_doctor(&config_path, offline).await,
+        } => on_runtime(cmd_test(&config_path, source, destination)),
+        Command::Doctor { offline } => on_runtime(cmd_doctor(&config_path, offline)),
         Command::Config { action } => match action {
             ConfigAction::Get { key } => config_cmd::get(&config_path, &key),
             ConfigAction::Set { key, value } => config_cmd::set(&config_path, &key, &value),
@@ -86,7 +78,7 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             }
             ProvidersAction::Setup { name } => providers::setup(&name),
         },
-        Command::Logs { .. } => unreachable!("logs is handled before the runtime in main"),
+        Command::Logs { follow, lines } => logs::show(follow, lines),
         Command::Completions { shell } => completions::print(shell),
         Command::Setup { yes, refresh } => setup::setup(yes, refresh),
         Command::Service { action } => match action {
@@ -107,6 +99,15 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             no_restart,
         } => upgrade::downgrade(to, yes, no_restart),
     }
+}
+
+/// Run an async command body on a fresh multi-thread Tokio runtime.
+fn on_runtime<F: std::future::Future<Output = Result<()>>>(fut: F) -> Result<()> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("starting the async runtime")?
+        .block_on(fut)
 }
 
 /// Load config and initialize logging from it. Shared by the runtime commands.
