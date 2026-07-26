@@ -65,54 +65,36 @@ pub fn render_digest(events: &[Event]) -> Rendered {
 
 /// One-line headline plus an embed color for the event kind.
 fn headline(event: &Event, actor: &str) -> (String, u32) {
-    match &event.kind {
-        EventKind::ReviewRequested => (format!("👀 **{actor}** requested your review"), 0x5865f2),
-        EventKind::ReReviewRequested => (format!("🔁 **{actor}** requested a re-review"), 0x5865f2),
+    // Discord doesn't need markup-escaping, so the phrase passes through unchanged.
+    let (emoji, color) = decoration(&event.kind);
+    let text = format!(
+        "{emoji} {}",
+        event.headline(&format!("**{actor}**"), |s| s.to_string())
+    );
+    (text, color)
+}
+
+/// The leading emoji and embed colour for each event kind (Discord-specific; the
+/// wording is shared via `Event::headline`).
+fn decoration(kind: &EventKind) -> (&'static str, u32) {
+    match kind {
+        EventKind::ReviewRequested => ("👀", 0x5865f2),
+        EventKind::ReReviewRequested => ("🔁", 0x5865f2),
         EventKind::ReviewSubmitted { state } => match state {
-            ReviewState::Approved => (
-                format!("✅ **{actor}** approved {}", event.pr_phrase()),
-                0x2ecc71,
-            ),
-            ReviewState::ChangesRequested => {
-                (format!("⚠️ **{actor}** requested changes"), 0xe67e22)
-            }
-            ReviewState::Commented => (format!("💬 **{actor}** left a review comment"), 0x3498db),
+            ReviewState::Approved => ("✅", 0x2ecc71),
+            ReviewState::ChangesRequested => ("⚠️", 0xe67e22),
+            ReviewState::Commented => ("💬", 0x3498db),
         },
-        EventKind::ReviewDismissed => (format!("♻️ **{actor}** dismissed your review"), 0x95a5a6),
-        EventKind::CommentReply { on_your_comment } => {
-            let text = if *on_your_comment {
-                format!("💬 **{actor}** replied to your comment")
-            } else {
-                format!("💬 **{actor}** replied in a thread you're in")
-            };
-            (text, 0x3498db)
-        }
-        EventKind::Mentioned => (format!("👋 **{actor}** mentioned you"), 0xf1c40f),
-        EventKind::Merged => (
-            format!("🟣 **{actor}** merged {}", event.pr_phrase()),
-            0x9b59b6,
-        ),
-        EventKind::Closed => (format!("🚫 {} was closed", event.pr_phrase()), 0xe74c3c),
-        EventKind::ReadyForReview => (
-            format!("🚀 **{actor}** marked a PR ready for review"),
-            0x2ecc71,
-        ),
-        EventKind::EnteredMergeQueue => (
-            format!("🚆 {} entered the merge queue", event.pr_owner_phrase()),
-            0x3498db,
-        ),
+        EventKind::ReviewDismissed => ("♻️", 0x95a5a6),
+        EventKind::CommentReply { .. } => ("💬", 0x3498db),
+        EventKind::Mentioned => ("👋", 0xf1c40f),
+        EventKind::Merged => ("🟣", 0x9b59b6),
+        EventKind::Closed => ("🚫", 0xe74c3c),
+        EventKind::ReadyForReview => ("🚀", 0x2ecc71),
+        EventKind::EnteredMergeQueue => ("🚆", 0x3498db),
         EventKind::RemovedFromMergeQueue { reason } => match reason {
-            MergeQueueRemoval::Dequeued => (
-                format!("◀️ {} left the merge queue", event.pr_owner_phrase()),
-                0x95a5a6,
-            ),
-            MergeQueueRemoval::Unmergeable => (
-                format!(
-                    "⚠️ {} was kicked from the merge queue (can't merge)",
-                    event.pr_owner_phrase()
-                ),
-                0xe67e22,
-            ),
+            MergeQueueRemoval::Dequeued => ("◀️", 0x95a5a6),
+            MergeQueueRemoval::Unmergeable => ("⚠️", 0xe67e22),
         },
     }
 }
@@ -199,6 +181,16 @@ mod tests {
             .unwrap()
             .to_string();
         assert!(d3.contains("merged their own PR"), "got {d3}");
+    }
+
+    #[test]
+    fn digest_lists_each_event() {
+        let events = [event(EventKind::Merged), event(EventKind::Mentioned)];
+        let r = render_digest(&events);
+        assert_eq!(r.content, "navi digest: 2 updates");
+        let desc = r.embed["description"].as_str().unwrap();
+        assert!(desc.contains("merged octo's PR"));
+        assert!(desc.contains("mentioned you"));
     }
 
     #[test]
