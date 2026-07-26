@@ -143,7 +143,10 @@ fn build_digest_message(
             escape(&repo_ref)
         ));
     }
-    html.push_str("</ul>\n<p style=\"color:#888\">sent by navi</p>\n");
+    text.push_str(&format!("\n-- \nsent by navi ({NAVI_URL})\n"));
+    html.push_str(&format!(
+        "</ul>\n<p style=\"color:#888\">sent by <a href=\"{NAVI_URL}\">navi</a></p>\n"
+    ));
 
     Message::builder()
         .from(from.clone())
@@ -221,6 +224,9 @@ fn headline(event: &Event) -> String {
     }
 }
 
+/// Project home the footer's "navi" links to (HTML) / points at (plain text).
+const NAVI_URL: &str = "https://github.com/lararosekelley/navi";
+
 fn body_text(event: &Event, headline: &str, repo_ref: &str, link: &str) -> String {
     let mut out = format!(
         "{headline}\n\n{repo_ref}: {}\n{link}\n",
@@ -229,7 +235,7 @@ fn body_text(event: &Event, headline: &str, repo_ref: &str, link: &str) -> Strin
     if let Some(excerpt) = &event.excerpt {
         out.push_str(&format!("\n> {excerpt}\n"));
     }
-    out.push_str("\n-- \nsent by navi\n");
+    out.push_str(&format!("\n-- \nsent by navi ({NAVI_URL})\n"));
     out
 }
 
@@ -245,7 +251,9 @@ fn body_html(event: &Event, headline: &str, repo_ref: &str, link: &str) -> Strin
     if let Some(excerpt) = &event.excerpt {
         out.push_str(&format!("<blockquote>{}</blockquote>\n", escape(excerpt)));
     }
-    out.push_str("<p style=\"color:#888\">sent by navi</p>\n");
+    out.push_str(&format!(
+        "<p style=\"color:#888\">sent by <a href=\"{NAVI_URL}\">navi</a></p>\n"
+    ));
     out
 }
 
@@ -319,6 +327,32 @@ mod tests {
     fn includes_excerpt_in_body() {
         let raw = formatted(EventKind::Mentioned, "k3");
         assert!(raw.contains("looks good"));
+    }
+
+    #[test]
+    fn footer_links_navi_to_the_project() {
+        let e = event(EventKind::Merged, "k");
+        let html = body_html(&e, "h", "acme/widgets#12", "https://x");
+        assert!(
+            html.contains(&format!("sent by <a href=\"{NAVI_URL}\">navi</a>")),
+            "got {html}"
+        );
+        let text = body_text(&e, "h", "acme/widgets#12", "https://x");
+        assert!(
+            text.contains(&format!("sent by navi ({NAVI_URL})")),
+            "got {text}"
+        );
+
+        // The digest carries the footer too — its plain-text footer is newly added.
+        // Assert on the plain-text part, which (unlike the HTML) isn't QP-encoded.
+        let from = "navi <navi@example.com>".parse::<Mailbox>().unwrap();
+        let to = "you <you@example.com>".parse::<Mailbox>().unwrap();
+        let digest = build_digest_message(&from, &to, &[event(EventKind::Merged, "k")]).unwrap();
+        let raw = String::from_utf8(digest.formatted()).unwrap();
+        assert!(
+            raw.contains(&format!("sent by navi ({NAVI_URL})")),
+            "digest is missing the plain-text footer link: {raw}"
+        );
     }
 
     #[test]
