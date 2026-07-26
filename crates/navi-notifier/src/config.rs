@@ -397,11 +397,14 @@ impl Finding {
     }
 }
 
-const SOURCE_IDS: [&str; 3] = ["github", "gitlab", "gitea"];
-const DESTINATION_IDS: [&str; 3] = ["slack", "discord", "email"];
+/// The known source ids, in display order. Single source of truth for the provider
+/// loops in `providers`, `wiring`, and `doctor`.
+pub const SOURCE_IDS: [&str; 3] = ["github", "gitlab", "gitea"];
+/// The known destination ids, in display order.
+pub const DESTINATION_IDS: [&str; 3] = ["slack", "discord", "email"];
 /// Event tags accepted in `slack.broadcast` and `digest.kinds`: the `EventKind`
 /// tags plus the per-state review shorthands. Kept in sync with the model by the
-/// `broadcast_tags_are_all_known` test.
+/// `known_tags_cover_every_event_tag` test.
 const KNOWN_TAGS: [&str; 14] = [
     "review_requested",
     "re_review_requested",
@@ -557,20 +560,48 @@ pub fn validate(config: &Config) -> Vec<Finding> {
     out
 }
 
-fn source_enabled(config: &Config, id: &str) -> bool {
+/// Whether the source with this id is enabled. Only ever called with an id from
+/// [`SOURCE_IDS`] (callers guard with `SOURCE_IDS.contains` first), so an unknown
+/// id is a wiring bug, not a runtime input.
+pub fn source_enabled(config: &Config, id: &str) -> bool {
     match id {
         "github" => config.github.enabled,
         "gitlab" => config.gitlab.enabled,
         "gitea" => config.gitea.enabled,
-        _ => false,
+        _ => unreachable!("source_enabled called with unknown id `{id}`"),
     }
 }
 
-fn dest_enabled(config: &Config, id: &str) -> bool {
+/// Whether the destination with this id is enabled. Only ever called with an id
+/// from [`DESTINATION_IDS`], so an unknown id is a wiring bug, not a runtime input.
+pub fn dest_enabled(config: &Config, id: &str) -> bool {
     match id {
         "slack" => config.slack.enabled,
         "discord" => config.discord.enabled,
         "email" => config.email.enabled,
+        _ => unreachable!("dest_enabled called with unknown id `{id}`"),
+    }
+}
+
+/// Whether a source's credentials resolve from config/env (no network).
+pub fn source_creds(config: &Config, id: &str) -> bool {
+    match id {
+        "github" => config.github.resolve_token().is_ok(),
+        "gitlab" => config.gitlab.resolve_token().is_ok(),
+        "gitea" => config.gitea.resolve_token().is_ok(),
+        _ => false,
+    }
+}
+
+/// Whether a destination's credentials resolve from config/env (no network).
+pub fn dest_creds(config: &Config, id: &str) -> bool {
+    match id {
+        "slack" => config.slack.resolve_token().is_ok(),
+        // Webhook mode (a URL in dm_to) needs no token; DM mode does.
+        "discord" => {
+            config.discord.dm_to.contains("://") || config.discord.resolve_token().is_some()
+        }
+        "email" => config.email.resolve_password().is_some(),
         _ => false,
     }
 }
@@ -711,5 +742,42 @@ mod tests {
         let c = Config::default();
         let f = validate(&c);
         assert!(!f.iter().any(|x| x.message.contains("unknown tag")));
+    }
+
+    #[test]
+    fn known_tags_cover_every_event_tag() {
+        use navi_notifier_core::model::{EventKind, MergeQueueRemoval, ReviewState};
+        // Every tag the model can emit must be a KNOWN_TAG, else a valid config value
+        // gets a spurious "unknown tag" warning. Extend this list with new EventKinds.
+        let kinds = [
+            EventKind::ReviewRequested,
+            EventKind::ReReviewRequested,
+            EventKind::ReviewSubmitted {
+                state: ReviewState::Approved,
+            },
+            EventKind::ReviewSubmitted {
+                state: ReviewState::ChangesRequested,
+            },
+            EventKind::ReviewSubmitted {
+                state: ReviewState::Commented,
+            },
+            EventKind::ReviewDismissed,
+            EventKind::CommentReply {
+                on_your_comment: true,
+            },
+            EventKind::Mentioned,
+            EventKind::Merged,
+            EventKind::Closed,
+            EventKind::ReadyForReview,
+            EventKind::EnteredMergeQueue,
+            EventKind::RemovedFromMergeQueue {
+                reason: MergeQueueRemoval::Dequeued,
+            },
+        ];
+        for kind in &kinds {
+            for tag in kind.match_tags() {
+                assert!(KNOWN_TAGS.contains(&tag), "KNOWN_TAGS is missing `{tag}`");
+            }
+        }
     }
 }

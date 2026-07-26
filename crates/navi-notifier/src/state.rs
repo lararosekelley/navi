@@ -32,7 +32,7 @@ impl SqliteStore {
     }
 
     /// In-memory store, primarily for tests.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self, StateError> {
         let conn = Connection::open_in_memory().map_err(|e| StateError::Backend(e.to_string()))?;
         Self::from_connection(conn)
