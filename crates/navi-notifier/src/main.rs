@@ -72,7 +72,7 @@ async fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             source,
             destination,
         } => cmd_test(&config_path, source, destination).await,
-        Command::Doctor => cmd_doctor(&config_path).await,
+        Command::Doctor { offline } => cmd_doctor(&config_path, offline).await,
         Command::Config { action } => match action {
             ConfigAction::Get { key } => config_cmd::get(&config_path, &key),
             ConfigAction::Set { key, value } => config_cmd::set(&config_path, &key, &value),
@@ -206,9 +206,9 @@ async fn cmd_test(
     test_cmd::run(&config, source, destination).await
 }
 
-async fn cmd_doctor(config_path: &Path) -> Result<()> {
+async fn cmd_doctor(config_path: &Path, offline: bool) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    doctor::doctor(&config).await
+    doctor::doctor(&config, offline).await
 }
 
 /// Print a human-readable summary of a run (used by `once`).
