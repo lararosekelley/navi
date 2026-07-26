@@ -189,7 +189,7 @@ impl Destination for DiscordDestination {
         // threads. Only bot DMs support replies; webhooks have no reply/thread
         // primitive, so they post top-level. Best-effort: a state error just posts a
         // standalone message.
-        let key = thread_key(event);
+        let key = event.thread_key();
         let parent = match self.mode {
             Mode::Dm(_) => state.get_cursor(DISCORD_NS, &key).await.ok().flatten(),
             Mode::Webhook(_) => None,
@@ -218,13 +218,6 @@ impl Destination for DiscordDestination {
 
 /// Namespace for the Discord destination's own cursors in the shared state store.
 const DISCORD_NS: &str = "discord";
-
-/// Cursor key mapping a PR to the id of the message that opened its reply chain.
-/// Includes the source id so a GitHub and GitLab PR sharing an `owner/repo#number`
-/// don't collapse into one chain.
-fn thread_key(event: &Event) -> String {
-    format!("thread:{}:{}", event.source_id, event.scope())
-}
 
 impl DiscordDestination {
     /// Post a rendered message to the resolved endpoint, retrying transient

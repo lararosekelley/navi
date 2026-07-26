@@ -162,7 +162,7 @@ impl Destination for SlackDestination {
         // Group a PR's events into one Slack thread: the first message we post for a
         // PR becomes the parent; later ones reply under it. Threading is best-effort,
         // so a state read/write failure just falls back to a top-level message.
-        let key = thread_key(event);
+        let key = event.thread_key();
         let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
         // High-signal kinds break out of the thread so they aren't buried. Only
         // meaningful for a reply (a thread-opening message is already top-level).
@@ -209,13 +209,6 @@ impl Destination for SlackDestination {
 
 /// Namespace for the Slack destination's own cursors in the shared state store.
 const SLACK_NS: &str = "slack";
-
-/// Cursor key mapping a PR to the ts of the Slack message that opened its thread.
-/// Includes the source id so a GitHub and a GitLab PR that happen to share an
-/// `owner/repo#number` don't collapse into one thread.
-fn thread_key(event: &Event) -> String {
-    format!("thread:{}:{}", event.source_id, event.scope())
-}
 
 impl SlackDestination {
     /// Post a rendered message to the resolved channel, retrying transient

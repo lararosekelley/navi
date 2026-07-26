@@ -1,6 +1,9 @@
 //! Pure rendering of a navi [`Event`] into a Slack message (fallback text + Block
 //! Kit blocks). Kept free of I/O so message shape is unit-testable.
 
+// Slack mrkdwn escapes the same three characters as HTML (`&`, `<`, `>`), so the
+// core `html_escape` is reused verbatim rather than duplicated here.
+use navi_notifier_core::html_escape;
 use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
 use serde_json::{json, Value};
 
@@ -22,21 +25,23 @@ pub fn render(event: &Event) -> Rendered {
     let text = format!("{} · {}: {}", strip_mrkdwn(&headline), repo_ref, pr.title);
 
     let link_url = event.target_url.clone().unwrap_or_else(|| pr.url.clone());
-    let mut context_bits = vec![format!("<{}|{}>", pr.url, repo_ref)];
-    context_bits.push(format!("by {}", event.pull_request.author.label()));
+    let context_bits = [
+        format!("<{}|{}>", pr.url, repo_ref),
+        format!("by {}", event.pull_request.author.label()),
+    ];
 
     let mut blocks = vec![json!({
         "type": "section",
         "text": {
             "type": "mrkdwn",
-            "text": format!("{}\n<{}|{}: {}>", headline, link_url, repo_ref, escape(&pr.title)),
+            "text": format!("{}\n<{}|{}: {}>", headline, link_url, repo_ref, html_escape(&pr.title)),
         }
     })];
 
     if let Some(excerpt) = &event.excerpt {
         blocks.push(json!({
             "type": "section",
-            "text": { "type": "mrkdwn", "text": format!("> {}", escape(excerpt)) }
+            "text": { "type": "mrkdwn", "text": format!("> {}", html_escape(excerpt)) }
         }));
     }
 
@@ -80,60 +85,37 @@ pub fn render_digest(events: &[Event]) -> Rendered {
 
 /// The one-line headline with a leading emoji, in Slack mrkdwn.
 fn headline(event: &Event, actor: &str) -> String {
-    let a = format!("*{}*", escape(actor));
-    match &event.kind {
-        EventKind::ReviewRequested => format!(":eyes: {a} requested your review"),
-        EventKind::ReReviewRequested => {
-            format!(":arrows_counterclockwise: {a} requested a re-review")
-        }
-        EventKind::ReviewSubmitted { state } => match state {
-            ReviewState::Approved => {
-                format!(
-                    ":white_check_mark: {a} approved {}",
-                    escape(&event.pr_phrase())
-                )
-            }
-            ReviewState::ChangesRequested => format!(":warning: {a} requested changes"),
-            ReviewState::Commented => format!(":speech_balloon: {a} left a review comment"),
-        },
-        EventKind::ReviewDismissed => format!(":recycle: {a} dismissed your review"),
-        EventKind::CommentReply { on_your_comment } => {
-            if *on_your_comment {
-                format!(":left_speech_bubble: {a} replied to your comment")
-            } else {
-                format!(":left_speech_bubble: {a} replied in a thread you're in")
-            }
-        }
-        EventKind::Mentioned => format!(":wave: {a} mentioned you"),
-        EventKind::Merged => format!(":purple_heart: {a} merged {}", escape(&event.pr_phrase())),
-        EventKind::Closed => format!(":no_entry_sign: {} was closed", escape(&event.pr_phrase())),
-        EventKind::ReadyForReview => format!(":rocket: {a} marked a PR ready for review"),
-        EventKind::EnteredMergeQueue => {
-            format!(
-                ":train: {} entered the merge queue",
-                escape(&event.pr_owner_phrase())
-            )
-        }
-        EventKind::RemovedFromMergeQueue { reason } => match reason {
-            MergeQueueRemoval::Dequeued => {
-                format!(
-                    ":arrow_backward: {} left the merge queue",
-                    escape(&event.pr_owner_phrase())
-                )
-            }
-            MergeQueueRemoval::Unmergeable => format!(
-                ":warning: {} was kicked from the merge queue (can't merge)",
-                escape(&event.pr_owner_phrase())
-            ),
-        },
-    }
+    // Bold, escaped actor + the shared English sentence (pr phrase escaped for mrkdwn).
+    let bold = format!("*{}*", html_escape(actor));
+    format!(
+        "{} {}",
+        emoji(&event.kind),
+        event.headline(&bold, html_escape)
+    )
 }
 
-/// Escape the three characters Slack mrkdwn treats specially.
-fn escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
+/// The leading emoji for each event kind (Slack-specific; the wording is shared).
+fn emoji(kind: &EventKind) -> &'static str {
+    match kind {
+        EventKind::ReviewRequested => ":eyes:",
+        EventKind::ReReviewRequested => ":arrows_counterclockwise:",
+        EventKind::ReviewSubmitted { state } => match state {
+            ReviewState::Approved => ":white_check_mark:",
+            ReviewState::ChangesRequested => ":warning:",
+            ReviewState::Commented => ":speech_balloon:",
+        },
+        EventKind::ReviewDismissed => ":recycle:",
+        EventKind::CommentReply { .. } => ":left_speech_bubble:",
+        EventKind::Mentioned => ":wave:",
+        EventKind::Merged => ":purple_heart:",
+        EventKind::Closed => ":no_entry_sign:",
+        EventKind::ReadyForReview => ":rocket:",
+        EventKind::EnteredMergeQueue => ":train:",
+        EventKind::RemovedFromMergeQueue { reason } => match reason {
+            MergeQueueRemoval::Dequeued => ":arrow_backward:",
+            MergeQueueRemoval::Unmergeable => ":warning:",
+        },
+    }
 }
 
 /// Strip `*` used for bold when building plain fallback text.
@@ -222,5 +204,16 @@ mod tests {
         e.excerpt = None;
         let r = render(&e);
         assert_eq!(r.blocks.len(), 2); // section + context
+    }
+
+    #[test]
+    fn digest_has_a_header_and_one_line_per_event() {
+        let events = [event(EventKind::Merged), event(EventKind::Mentioned)];
+        let r = render_digest(&events);
+        assert_eq!(r.text, "navi digest: 2 updates");
+        let body = r.blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(body.contains("navi digest* · 2 updates"));
+        assert!(body.contains("merged octo's PR"));
+        assert!(body.contains("mentioned you"));
     }
 }
