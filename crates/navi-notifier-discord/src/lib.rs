@@ -241,15 +241,24 @@ impl DiscordDestination {
         let mut attempt = 0;
         loop {
             attempt += 1;
-            let resp = self.post_raw(&endpoint, &body).await?;
-            match check_status(&resp) {
-                Ok(()) => {
-                    debug!(label, "delivered to discord");
-                    // Bot mode returns the created message (with id); webhooks 204.
-                    let text = resp.text().await.unwrap_or_default();
-                    let id = serde_json::from_str::<MessagePosted>(&text)
+            // Fold the send + status check + id parse into one fallible step so a
+            // transient network error retries the same way a 429/5xx does (parity
+            // with the Slack destination).
+            let sent = async {
+                let resp = self.post_raw(&endpoint, &body).await?;
+                check_status(&resp)?;
+                // Bot mode returns the created message (with id); webhooks 204.
+                let text = resp.text().await.unwrap_or_default();
+                Ok::<_, DestinationError>(
+                    serde_json::from_str::<MessagePosted>(&text)
                         .ok()
-                        .and_then(|m| m.id);
+                        .and_then(|m| m.id),
+                )
+            }
+            .await;
+            match sent {
+                Ok(id) => {
+                    debug!(label, "delivered to discord");
                     return Ok(id);
                 }
                 Err(DestinationError::RateLimited { retry_after_secs })
@@ -260,6 +269,10 @@ impl DiscordDestination {
                         attempt, "discord rate limited; backing off"
                     );
                     tokio::time::sleep(Duration::from_secs(retry_after_secs.max(1))).await;
+                }
+                Err(DestinationError::Delivery(_)) if attempt < MAX_ATTEMPTS => {
+                    let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
+                    tokio::time::sleep(backoff).await;
                 }
                 Err(e) => return Err(e),
             }
