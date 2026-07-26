@@ -28,7 +28,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use navi_notifier_core::{Engine, FilterContext, RuleConfig, RuleEngine};
-use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use serde_json::{json, Value};
 
@@ -208,16 +207,7 @@ async fn verify(
         backfill: Default::default(),
     })
     .map_err(|e| format!("build github source: {e}"))?;
-    let email = EmailDestination::new(EmailDestinationConfig {
-        smtp_host,
-        smtp_port,
-        tls: EmailTls::None,
-        username: None,
-        password: None,
-        from: "navi <navi@navi.local>".into(),
-        to: "you <you@navi.local>".into(),
-    })
-    .map_err(|e| format!("build email destination: {e}"))?;
+    let email = e2e_common::mailpit_email(smtp_host, smtp_port)?;
     let engine = Engine::new(
         vec![Arc::new(source)],
         vec![Arc::new(email)],
@@ -232,7 +222,9 @@ async fn verify(
         for (src, err) in &report.source_errors {
             eprintln!("e2e-github: source {src} error: {err}");
         }
-        if let Some(subject) = mailpit_review_request(http, mailpit, expect).await? {
+        if let Some(subject) =
+            e2e_common::mailpit_review_request(http, mailpit, Some(expect)).await?
+        {
             println!("e2e-github: email delivered, subject: {subject}");
             return Ok(());
         }
@@ -287,39 +279,11 @@ async fn whoami(http: &reqwest::Client, api: &str, token: &str) -> Result<String
         .ok_or_else(|| "GET /user response missing login".into())
 }
 
-/// The subject of a Mailpit message that is a review request for the specific PR
-/// identified by `expect` (e.g. `[owner/name#7]`), if any. Scoping to the PR marker
-/// keeps a live viewer's unrelated real review requests from passing the test.
-async fn mailpit_review_request(
-    http: &reqwest::Client,
-    mailpit: &str,
-    expect: &str,
-) -> Result<Option<String>, String> {
-    let value = get_unauthed(http, &format!("{mailpit}/api/v1/messages")).await?;
-    let found = value["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["Subject"].as_str())
-        .find(|s| s.contains(expect) && s.contains("requested your review"))
-        .map(str::to_string);
-    Ok(found)
-}
-
 async fn get(http: &reqwest::Client, url: &str, token: &str) -> Result<Value, String> {
     let resp = http
         .get(url)
         .bearer_auth(token)
         .header("Accept", "application/vnd.github+json")
-        .send()
-        .await
-        .map_err(|e| format!("GET {url}: {e}"))?;
-    json_ok(resp, &format!("GET {url}")).await
-}
-
-async fn get_unauthed(http: &reqwest::Client, url: &str) -> Result<Value, String> {
-    let resp = http
-        .get(url)
         .send()
         .await
         .map_err(|e| format!("GET {url}: {e}"))?;

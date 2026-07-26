@@ -17,7 +17,6 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use navi_notifier_core::{Engine, FilterContext, RuleConfig, RuleEngine};
-use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use navi_notifier_gitea::{GiteaSource, GiteaSourceConfig};
 use serde_json::{json, Value};
 
@@ -112,16 +111,7 @@ async fn run() -> Result<(), String> {
         backfill: Default::default(),
     })
     .map_err(|e| format!("build gitea source: {e}"))?;
-    let email = EmailDestination::new(EmailDestinationConfig {
-        smtp_host,
-        smtp_port,
-        tls: EmailTls::None,
-        username: None,
-        password: None,
-        from: "navi <navi@navi.local>".into(),
-        to: "you <you@navi.local>".into(),
-    })
-    .map_err(|e| format!("build email destination: {e}"))?;
+    let email = e2e_common::mailpit_email(smtp_host, smtp_port)?;
 
     let engine = Engine::new(
         vec![Arc::new(source)],
@@ -138,7 +128,7 @@ async fn run() -> Result<(), String> {
         for (src, err) in &report.source_errors {
             eprintln!("e2e-gitea: source {src} error: {err}");
         }
-        if let Some(subject) = mailpit_review_request(&http, &mailpit).await? {
+        if let Some(subject) = e2e_common::mailpit_review_request(&http, &mailpit, None).await? {
             println!("e2e-gitea: email delivered, subject: {subject}");
             return Ok(());
         }
@@ -242,25 +232,4 @@ async fn put(http: &reqwest::Client, url: &str, token: &str, body: &Value) -> Re
             resp.text().await.unwrap_or_default()
         ))
     }
-}
-
-/// Return the subject of a "requested your review" message in Mailpit, if any.
-async fn mailpit_review_request(
-    http: &reqwest::Client,
-    mailpit: &str,
-) -> Result<Option<String>, String> {
-    let resp = http
-        .get(format!("{mailpit}/api/v1/messages"))
-        .send()
-        .await
-        .map_err(|e| format!("mailpit query: {e}"))?;
-    let value = json_ok(resp, "mailpit query").await?;
-    let found = value["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["Subject"].as_str())
-        .find(|s| s.contains("requested your review"))
-        .map(str::to_string);
-    Ok(found)
 }

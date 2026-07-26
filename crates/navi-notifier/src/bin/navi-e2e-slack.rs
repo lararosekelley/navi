@@ -1,10 +1,8 @@
 //! Live Slack-destination end-to-end test with read-back.
 //!
-//! Replaces the old send-and-hope smoke (`navi-e2e`): it posts a synthetic event
-//! through navi's real Slack destination, then **reads the message back** via
-//! `conversations.history` and asserts the unique marker it embedded actually
-//! landed — proving delivery, not just that the API call didn't error. (The GitHub
-//! auth-poll the old smoke also did is now covered far better by `navi-e2e-github`.)
+//! Posts a synthetic event through navi's real Slack destination, then reads the
+//! message back via `conversations.history` and asserts the unique marker it embedded
+//! actually landed — proving delivery, not just a non-erroring API call.
 //!
 //! Gated behind the `e2e` feature; run by the e2e workflow's `slack-live` job.
 //!
