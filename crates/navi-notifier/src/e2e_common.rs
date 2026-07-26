@@ -8,13 +8,53 @@
 // `ok`-envelope parser and never calls `json_ok`), so unused-in-one-bin is expected.
 #![allow(dead_code)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 
 use async_trait::async_trait;
 use navi_notifier_core::traits::StateStore;
 use navi_notifier_core::StateError;
+use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use serde_json::Value;
+
+/// The Mailpit email destination every source slice delivers into (unencrypted local
+/// SMTP; `navi.local` addresses are cosmetic).
+pub fn mailpit_email(smtp_host: String, smtp_port: u16) -> Result<EmailDestination, String> {
+    EmailDestination::new(EmailDestinationConfig {
+        smtp_host,
+        smtp_port,
+        tls: EmailTls::None,
+        username: None,
+        password: None,
+        from: "navi <navi@navi.local>".into(),
+        to: "you <you@navi.local>".into(),
+    })
+    .map_err(|e| format!("build email destination: {e}"))
+}
+
+/// Find a "requested your review" subject in Mailpit's message list. With
+/// `expect = Some(marker)` only a subject containing that marker matches (so a live
+/// viewer's unrelated real reviews can't pass the test); `None` matches any.
+pub async fn mailpit_review_request(
+    http: &reqwest::Client,
+    mailpit: &str,
+    expect: Option<&str>,
+) -> Result<Option<String>, String> {
+    let resp = http
+        .get(format!("{mailpit}/api/v1/messages"))
+        .send()
+        .await
+        .map_err(|e| format!("mailpit query: {e}"))?;
+    let value = json_ok(resp, "mailpit query").await?;
+    let found = value["messages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|m| m["Subject"].as_str())
+        .find(|s| s.contains("requested your review") && expect.is_none_or(|e| s.contains(e)))
+        .map(str::to_string);
+    Ok(found)
+}
 
 /// A required env var, or an error naming it.
 pub fn env(key: &str) -> Result<String, String> {
@@ -53,7 +93,7 @@ pub async fn json_ok(resp: reqwest::Response, what: &str) -> Result<Value, Strin
 #[derive(Default)]
 pub struct MemState {
     snapshots: Mutex<HashMap<String, Vec<u8>>>,
-    delivered: Mutex<HashMap<String, ()>>,
+    delivered: Mutex<HashSet<String>>,
     cursors: Mutex<HashMap<String, String>>,
 }
 
@@ -70,10 +110,10 @@ impl StateStore for MemState {
         Ok(())
     }
     async fn was_delivered(&self, key: &str) -> Result<bool, StateError> {
-        Ok(self.delivered.lock().unwrap().contains_key(key))
+        Ok(self.delivered.lock().unwrap().contains(key))
     }
     async fn mark_delivered(&self, key: &str) -> Result<(), StateError> {
-        self.delivered.lock().unwrap().insert(key.to_string(), ());
+        self.delivered.lock().unwrap().insert(key.to_string());
         Ok(())
     }
     async fn get_cursor(&self, s: &str, key: &str) -> Result<Option<String>, StateError> {

@@ -27,7 +27,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use navi_notifier_core::{Engine, FilterContext, RuleConfig, RuleEngine};
-use navi_notifier_email::{EmailDestination, EmailDestinationConfig, EmailTls};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use serde_json::{json, Value};
 
@@ -199,16 +198,7 @@ async fn verify(
         backfill: Default::default(),
     })
     .map_err(|e| format!("build gitlab source: {e}"))?;
-    let email = EmailDestination::new(EmailDestinationConfig {
-        smtp_host,
-        smtp_port,
-        tls: EmailTls::None,
-        username: None,
-        password: None,
-        from: "navi <navi@navi.local>".into(),
-        to: "you <you@navi.local>".into(),
-    })
-    .map_err(|e| format!("build email destination: {e}"))?;
+    let email = e2e_common::mailpit_email(smtp_host, smtp_port)?;
     let engine = Engine::new(
         vec![Arc::new(source)],
         vec![Arc::new(email)],
@@ -223,7 +213,9 @@ async fn verify(
         for (src, err) in &report.source_errors {
             eprintln!("e2e-gitlab: source {src} error: {err}");
         }
-        if let Some(subject) = mailpit_review_request(http, mailpit, expect).await? {
+        if let Some(subject) =
+            e2e_common::mailpit_review_request(http, mailpit, Some(expect)).await?
+        {
             println!("e2e-gitlab: email delivered, subject: {subject}");
             return Ok(());
         }
@@ -286,30 +278,6 @@ async fn whoami(http: &reqwest::Client, api: &str, token: &str) -> Result<Who, S
         .ok_or("GET /user missing username")?
         .to_string();
     Ok(Who { id, username })
-}
-
-/// The subject of a Mailpit message that is a review request for the specific MR
-/// identified by `expect` (e.g. `[you/navi-e2e#7]`), if any. Scoping to the MR marker
-/// keeps a live viewer's unrelated real review requests from passing the test.
-async fn mailpit_review_request(
-    http: &reqwest::Client,
-    mailpit: &str,
-    expect: &str,
-) -> Result<Option<String>, String> {
-    let resp = http
-        .get(format!("{mailpit}/api/v1/messages"))
-        .send()
-        .await
-        .map_err(|e| format!("mailpit query: {e}"))?;
-    let value = json_ok(resp, "mailpit query").await?;
-    let found = value["messages"]
-        .as_array()
-        .into_iter()
-        .flatten()
-        .filter_map(|m| m["Subject"].as_str())
-        .find(|s| s.contains(expect) && s.contains("requested your review"))
-        .map(str::to_string);
-    Ok(found)
 }
 
 async fn get(http: &reqwest::Client, url: &str, token: &str) -> Result<Value, String> {
