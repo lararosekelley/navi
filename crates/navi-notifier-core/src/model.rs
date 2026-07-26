@@ -108,8 +108,8 @@ pub enum Backfill {
 }
 
 /// The kind of thing that happened. This is the taxonomy the rule layer filters on
-/// and the destination renders. Discriminant-only variants keep matching cheap; payload
-/// detail lives on [`Event`].
+/// and the destination renders. Most variants are lightweight; the richer payload
+/// (excerpt, urls, actor) lives on [`Event`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum EventKind {
@@ -269,6 +269,57 @@ impl Event {
         )
     }
 
+    /// Stable per-PR key a destination uses to group its messages into one thread.
+    /// Includes the source so a GitHub and a GitLab PR that share an `owner/repo#n`
+    /// don't collapse together.
+    pub fn thread_key(&self) -> String {
+        format!("thread:{}:{}", self.source_id, self.scope())
+    }
+
+    /// The plain-English notification sentence, shared by every destination so the
+    /// wording lives in one place. `actor` is the caller's already-formatted actor
+    /// token (bold for Slack/Discord, plain for email); `escape` is applied to the PR
+    /// phrase so a markup-sensitive destination (Slack) can escape it while others
+    /// pass it through. Emoji and colour stay destination-specific in each renderer.
+    pub fn headline(&self, actor: &str, escape: impl Fn(&str) -> String) -> String {
+        match &self.kind {
+            EventKind::ReviewRequested => format!("{actor} requested your review"),
+            EventKind::ReReviewRequested => format!("{actor} requested a re-review"),
+            EventKind::ReviewSubmitted { state } => match state {
+                ReviewState::Approved => format!("{actor} approved {}", escape(&self.pr_phrase())),
+                ReviewState::ChangesRequested => format!("{actor} requested changes"),
+                ReviewState::Commented => format!("{actor} left a review comment"),
+            },
+            EventKind::ReviewDismissed => format!("{actor} dismissed your review"),
+            EventKind::CommentReply { on_your_comment } => {
+                if *on_your_comment {
+                    format!("{actor} replied to your comment")
+                } else {
+                    format!("{actor} replied in a thread you're in")
+                }
+            }
+            EventKind::Mentioned => format!("{actor} mentioned you"),
+            EventKind::Merged => format!("{actor} merged {}", escape(&self.pr_phrase())),
+            EventKind::Closed => format!("{} was closed", escape(&self.pr_phrase())),
+            EventKind::ReadyForReview => format!("{actor} marked a PR ready for review"),
+            EventKind::EnteredMergeQueue => {
+                format!(
+                    "{} entered the merge queue",
+                    escape(&self.pr_owner_phrase())
+                )
+            }
+            EventKind::RemovedFromMergeQueue { reason } => match reason {
+                MergeQueueRemoval::Dequeued => {
+                    format!("{} left the merge queue", escape(&self.pr_owner_phrase()))
+                }
+                MergeQueueRemoval::Unmergeable => format!(
+                    "{} was kicked from the merge queue (can't merge)",
+                    escape(&self.pr_owner_phrase())
+                ),
+            },
+        }
+    }
+
     /// Convenience for building a dedup key from provider-stable parts.
     /// Callers should feed identifiers that never change for a given action
     /// (e.g. `github:owner/repo#12:review:456789`).
@@ -285,5 +336,105 @@ impl Event {
             pr_number,
             discriminator
         )
+    }
+}
+
+/// Escape the three characters that HTML and Slack mrkdwn both treat specially, so
+/// user-supplied text (titles, comment excerpts) can't inject markup. Shared by the
+/// email (HTML) and Slack renderers, which need the same `&`/`<`/`>` entities.
+pub fn html_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use time::OffsetDateTime;
+
+    fn event(kind: EventKind) -> Event {
+        Event {
+            source_id: "github".into(),
+            kind,
+            pull_request: PullRequest {
+                repo: Repo::new("acme", "widgets"),
+                number: 12,
+                title: "Add gizmo".into(),
+                url: "https://gh.test/acme/widgets/pull/12".into(),
+                author: Actor::new("octo"),
+                draft: false,
+            },
+            viewer: ViewerRelationship::default(),
+            actor: Actor::new("reviewer"),
+            occurred_at: OffsetDateTime::UNIX_EPOCH,
+            target_url: None,
+            excerpt: None,
+            dedup_key: "k".into(),
+        }
+    }
+
+    #[test]
+    fn match_tags_split_review_submissions_by_state() {
+        let approved = EventKind::ReviewSubmitted {
+            state: ReviewState::Approved,
+        };
+        assert_eq!(
+            approved.match_tags(),
+            vec!["review_submitted", "review_approved"]
+        );
+        let changes = EventKind::ReviewSubmitted {
+            state: ReviewState::ChangesRequested,
+        };
+        assert_eq!(
+            changes.match_tags(),
+            vec!["review_submitted", "review_changes_requested"]
+        );
+        // Non-review kinds match only their single tag.
+        assert_eq!(EventKind::Merged.match_tags(), vec!["merged"]);
+    }
+
+    #[test]
+    fn pr_phrase_and_owner_phrase_reflect_authorship() {
+        let mut e = event(EventKind::Merged); // viewer not author; actor=reviewer, author=octo
+        assert_eq!(e.pr_phrase(), "octo's PR");
+        assert_eq!(e.pr_owner_phrase(), "octo's PR");
+        // The author acted on their own PR: pr_phrase collapses, pr_owner_phrase names them.
+        e.actor = Actor::new("OCTO"); // case-insensitive match
+        assert_eq!(e.pr_phrase(), "their own PR");
+        assert_eq!(e.pr_owner_phrase(), "octo's PR");
+        // The viewer authored it.
+        e.viewer.is_author = true;
+        assert_eq!(e.pr_phrase(), "your PR");
+        assert_eq!(e.pr_owner_phrase(), "your PR");
+    }
+
+    #[test]
+    fn headline_substitutes_actor_and_escapes_the_phrase() {
+        let e = event(EventKind::ReviewRequested);
+        assert_eq!(
+            e.headline("*bob*", |s| s.to_string()),
+            "*bob* requested your review"
+        );
+        // The escaper only touches the PR phrase (here a markup-bearing author name).
+        let mut merged = event(EventKind::Merged);
+        merged.pull_request.author = Actor::new("a<b>");
+        assert_eq!(
+            merged.headline("bob", html_escape),
+            "bob merged a&lt;b&gt;'s PR"
+        );
+    }
+
+    #[test]
+    fn thread_key_includes_source_and_scope() {
+        assert_eq!(
+            event(EventKind::Merged).thread_key(),
+            "thread:github:acme/widgets#12"
+        );
+    }
+
+    #[test]
+    fn html_escape_covers_amp_lt_gt() {
+        assert_eq!(html_escape("a & b < c > d"), "a &amp; b &lt; c &gt; d");
     }
 }
