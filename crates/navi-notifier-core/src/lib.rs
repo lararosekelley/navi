@@ -18,8 +18,8 @@ pub use config::RuleConfig;
 pub use engine::{Engine, EventOutcome, EventRecord, Route, RunReport};
 pub use error::{DestinationError, SourceError, StateError};
 pub use model::{
-    Actor, Backfill, Event, EventKind, MergeQueueRemoval, PullRequest, Repo, ReviewState,
-    ViewerRelationship,
+    html_escape, Actor, Backfill, Event, EventKind, MergeQueueRemoval, PullRequest, Repo,
+    ReviewState, ViewerRelationship,
 };
 pub use rules::{Decision, DropReason, FilterContext, RuleEngine};
 pub use traits::{Destination, Source, StateStore};
