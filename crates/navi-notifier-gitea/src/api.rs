@@ -168,3 +168,31 @@ impl GiteaIssueComment {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn review(state: &str, dismissed: bool) -> GiteaReview {
+        GiteaReview {
+            id: 1,
+            user: None,
+            state: state.into(),
+            dismissed,
+            submitted_at: None,
+            html_url: None,
+        }
+    }
+
+    #[test]
+    fn into_forge_normalizes_review_state() {
+        assert_eq!(
+            review("REQUEST_CHANGES", false).into_forge().state,
+            "CHANGES_REQUESTED"
+        );
+        assert_eq!(review("COMMENT", false).into_forge().state, "COMMENTED");
+        assert_eq!(review("APPROVED", false).into_forge().state, "APPROVED");
+        // The dismissed flag wins over whatever state Gitea reports.
+        assert_eq!(review("APPROVED", true).into_forge().state, "DISMISSED");
+    }
+}

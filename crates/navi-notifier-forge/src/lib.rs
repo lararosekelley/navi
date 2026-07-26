@@ -9,5 +9,8 @@ pub mod diff;
 pub mod model;
 pub mod snapshot;
 
-pub use diff::{diff, first_sight_watermark, team_key, DiffContext, FIRST_SIGHT_LEEWAY};
+pub use diff::{
+    diff, excerpt, first_sight_watermark, is_settled, team_key, ts_key, DiffContext,
+    FIRST_SIGHT_LEEWAY,
+};
 pub use snapshot::PrSnapshot;

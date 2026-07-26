@@ -1,8 +1,7 @@
 //! The pure diff engine: `(previous snapshot, freshly fetched PR data) -> events`.
 //!
-//! Maps GitHub's shape onto navi's taxonomy. Free of I/O so it can be unit-tested
-//! from fixtures; the source layer  handles fetching and
-//! persistence.
+//! Maps the forge's shape onto navi's taxonomy. Free of I/O so it can be unit-tested
+//! from fixtures; the source layer handles fetching and persistence.
 
 use std::collections::{HashMap, HashSet};
 
@@ -377,10 +376,11 @@ pub fn diff(ctx: &DiffContext, data: &PrData, old: &PrSnapshot) -> (Vec<Event>, 
     (events, new_snapshot)
 }
 
-/// Whether a comment is old enough to notify about, given the optional min-age
-/// hold. A missing or unparseable timestamp counts as settled, so bad data never
-/// holds a comment back forever.
-fn is_settled(
+/// Whether a comment is old enough to notify on: `true` once it's at least `min_age`
+/// old (or when no minimum is set / the timestamp won't parse, so bad data never
+/// holds a comment back forever). Lets an edit-in-place bot settle to its final text
+/// first. Shared with the GitLab source.
+pub fn is_settled(
     created_at: Option<&str>,
     now: OffsetDateTime,
     min_age: Option<time::Duration>,
@@ -468,12 +468,15 @@ fn parse_ts(raw: Option<&str>, fallback: OffsetDateTime) -> OffsetDateTime {
 }
 
 /// Stable-enough discriminator fragment from a timestamp string.
-fn ts_key(raw: Option<&str>) -> String {
+/// A comment's timestamp as a snapshot-map key (`"0"` when absent). Shared with the
+/// GitLab source.
+pub fn ts_key(raw: Option<&str>) -> String {
     raw.unwrap_or("0").to_string()
 }
 
-/// First non-empty line of a comment body, trimmed to a readable length.
-fn excerpt(body: &str) -> Option<String> {
+/// First non-empty line of a comment body, trimmed to a readable length. Shared with
+/// the GitLab source.
+pub fn excerpt(body: &str) -> Option<String> {
     let line = body.lines().map(str::trim).find(|l| !l.is_empty())?;
     const MAX: usize = 140;
     if line.chars().count() > MAX {

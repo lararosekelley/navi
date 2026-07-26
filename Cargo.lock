@@ -1146,6 +1146,7 @@ version = "0.2.9"
 dependencies = [
  "async-trait",
  "navi-notifier-core",
+ "navi-notifier-forge",
  "reqwest",
  "serde",
  "serde_json",

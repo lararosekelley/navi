@@ -10,6 +10,7 @@ description = "GitLab source for navi: review-request and mention alerts from th
 
 [dependencies]
 navi-notifier-core.workspace = true
+navi-notifier-forge.workspace = true
 async-trait.workspace = true
 reqwest.workspace = true
 serde.workspace = true
