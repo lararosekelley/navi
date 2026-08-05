@@ -4,6 +4,15 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.1
+
+### Fixed
+
+- **github:** set connect/read/write timeouts on the API client, so a half-open
+  connection can no longer park a poll forever
+- **cli:** abandon and retry a poll pass that overruns, so one stuck source
+  can't silently wedge the daemon
+
 ## 0.3.0
 
 ### Added
