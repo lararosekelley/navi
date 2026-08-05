@@ -27,7 +27,7 @@ use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
 use navi_notifier_core::{Engine, EventOutcome, FilterContext, RunReport};
 use time::OffsetDateTime;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use crate::cli::{Cli, Command, ConfigAction, ProvidersAction, ServiceAction};
@@ -158,6 +158,10 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
     let engine = open_engine(&config).await?;
     let interval = std::time::Duration::from_secs(config.general.poll_interval_secs.max(1));
+    // Backstop against a provider that hangs instead of erroring: a pass that
+    // overruns this is abandoned and retried next interval, rather than wedging
+    // the daemon forever. Generous, so only a genuinely stuck pass trips it.
+    let pass_timeout = (interval * 3).max(std::time::Duration::from_secs(300));
     info!(
         interval_secs = interval.as_secs(),
         "navi daemon started; polling for review activity"
@@ -171,13 +175,27 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     tokio::pin!(shutdown);
 
     loop {
-        let report = engine.run_once(filter_context(&config), false).await;
-        if report.delivered_count() > 0 || !report.source_errors.is_empty() {
-            info!(
-                delivered = report.delivered_count(),
-                errors = report.source_errors.len(),
-                "poll pass complete"
-            );
+        // Abandoning a pass mid-flight can re-derive events next pass; the dedup
+        // set stops anything already sent from sending twice.
+        match tokio::time::timeout(
+            pass_timeout,
+            engine.run_once(filter_context(&config), false),
+        )
+        .await
+        {
+            Ok(report) => {
+                if report.delivered_count() > 0 || !report.source_errors.is_empty() {
+                    info!(
+                        delivered = report.delivered_count(),
+                        errors = report.source_errors.len(),
+                        "poll pass complete"
+                    );
+                }
+            }
+            Err(_) => error!(
+                timeout_secs = pass_timeout.as_secs(),
+                "poll pass timed out; abandoning it and retrying next interval"
+            ),
         }
 
         // Flush the digest on its own cadence, independent of the poll interval.
