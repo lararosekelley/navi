@@ -61,6 +61,9 @@ const MAX_PAGES: u8 = 10;
 const NOTIF_MAX_PAGES: u8 = 30;
 /// Overlap window when advancing the `since` cursor, to tolerate clock skew.
 const SINCE_OVERLAP: Duration = Duration::minutes(5);
+/// Per-request connect/read/write timeout for the GitHub client, matching the
+/// other providers. Octocrab sets none by default.
+const HTTP_TIMEOUT_SECS: u64 = 30;
 
 /// Configuration for the GitHub source.
 pub struct GitHubSourceConfig {
@@ -112,15 +115,11 @@ impl GitHubSource {
                 "GitHub token is empty; set NAVI_GITHUB_TOKEN".into(),
             ));
         }
-        let mut builder = Octocrab::builder().personal_token(config.token);
-        if let Some(base) = config.api_base {
-            builder = builder
-                .base_uri(base)
-                .map_err(|e| SourceError::Request(format!("invalid api_base: {e}")))?;
-        }
-        let octo = builder
-            .build()
-            .map_err(|e| SourceError::Auth(e.to_string()))?;
+        let octo = Self::build_client(
+            config.token,
+            config.api_base,
+            std::time::Duration::from_secs(HTTP_TIMEOUT_SECS),
+        )?;
         Ok(Self {
             octo,
             viewer: OnceCell::new(),
@@ -134,6 +133,30 @@ impl GitHubSource {
             pending_mq: Mutex::new(HashMap::new()),
             pending_pr_cursors: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Build the API client with connect/read/write timeouts applied. Octocrab sets
+    /// none by default, and without them a half-open connection to the API parks the
+    /// poll forever instead of erroring, stalling every later pass too. Split out
+    /// from `new` so tests can drive it with a short timeout.
+    fn build_client(
+        token: String,
+        api_base: Option<String>,
+        timeout: std::time::Duration,
+    ) -> Result<Octocrab, SourceError> {
+        let mut builder = Octocrab::builder()
+            .personal_token(token)
+            .set_connect_timeout(Some(timeout))
+            .set_read_timeout(Some(timeout))
+            .set_write_timeout(Some(timeout));
+        if let Some(base) = api_base {
+            builder = builder
+                .base_uri(base)
+                .map_err(|e| SourceError::Request(format!("invalid api_base: {e}")))?;
+        }
+        builder
+            .build()
+            .map_err(|e| SourceError::Auth(e.to_string()))
     }
 
     /// The viewer's team memberships as `"org/slug"` keys, for matching team review
@@ -1009,12 +1032,44 @@ fn classify_github_error(msg: &str) -> SourceError {
 mod tests {
     use super::{
         classify_github_error, is_fresh_no_queue, merge_queue_change, parse_pr_url, parse_repo_url,
-        MQ_ABSENT,
+        GitHubSource, MQ_ABSENT,
     };
     use navi_notifier_core::model::{EventKind, MergeQueueRemoval};
     use navi_notifier_core::SourceError;
     use time::format_description::well_known::Rfc3339;
     use time::{Duration, OffsetDateTime};
+
+    /// A server that accepts the connection then never answers must surface an error,
+    /// not park forever. Regression test: with no timeout on the client, a half-open
+    /// connection to the API wedged the daemon indefinitely.
+    #[tokio::test]
+    async fn client_times_out_when_the_api_never_responds() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            // Far longer than the client timeout below, so the read timeout decides.
+            .respond_with(ResponseTemplate::new(200).set_delay(std::time::Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+
+        let octo = GitHubSource::build_client(
+            "token".into(),
+            Some(server.uri()),
+            std::time::Duration::from_secs(1),
+        )
+        .unwrap();
+
+        // The outer bound makes a missing timeout fail the test instead of hanging it.
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            octo.get::<serde_json::Value, _, ()>("/user", None),
+        )
+        .await
+        .expect("client hung past its timeout; no request timeout is being applied");
+        assert!(result.is_err(), "expected a timeout error, got {result:?}");
+    }
 
     #[test]
     fn is_fresh_no_queue_respects_verdict_ttl_and_bad_data() {
