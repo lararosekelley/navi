@@ -66,7 +66,9 @@ dist-plan:
 release-dry level:
     cargo release {{level}}
 
-# Cut a release (main only): cargo-release bumps every crate's version AND the
+# Cut a release (main only): write the CHANGELOG.md `## <version>` section for the
+# version you're about to cut first - dist publishes that section as the GitHub
+# release notes. cargo-release bumps every crate's version AND the
 # internal cross-crate dep requirements in lockstep, commits, tags v<version>,
 # and pushes. The tag triggers the cargo-dist release workflow, which builds the
 # binaries/installers and runs publish-crates.yml to publish all crates.
