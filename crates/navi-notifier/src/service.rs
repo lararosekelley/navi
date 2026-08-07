@@ -223,12 +223,18 @@ fn restart_task(do_restart: bool) -> Result<()> {
 }
 
 /// The program path from a unit's `ExecStart=` line, or `None` if unreadable.
+/// Specifiers are resolved after the value is split, since `%h` itself never
+/// carries quotes or spaces but the home it expands to might.
 fn systemd_exec_path(unit: &Path) -> Option<PathBuf> {
     let text = fs::read_to_string(unit).ok()?;
     let value = text
         .lines()
         .find_map(|l| l.trim().strip_prefix("ExecStart="))?;
-    Some(PathBuf::from(exec_program(value)))
+    let home = home_dir().ok()?;
+    Some(PathBuf::from(expand_specifiers(
+        &exec_program(value),
+        &home.to_string_lossy(),
+    )))
 }
 
 /// The program path from an `ExecStart` value: our quoted `"path" args` form, or a
@@ -297,7 +303,7 @@ fn install_systemd(exe: &str, config: &Path, yes: bool) -> Result<()> {
 
     fs::create_dir_all(&unit_dir)
         .with_context(|| format!("failed to create {}", unit_dir.display()))?;
-    fs::write(&unit_path, systemd_unit(exe, config, &env_file))
+    fs::write(&unit_path, systemd_unit(exe, config, &env_file, &home))
         .with_context(|| format!("failed to write {}", unit_path.display()))?;
     ensure_env_file(&env_file)?;
 
@@ -345,8 +351,14 @@ fn status_systemd() -> Result<()> {
     Ok(())
 }
 
-/// The `[Unit]`/`[Service]` file. Paths are double-quoted so spaces survive.
-fn systemd_unit(exe: &str, config: &Path, env_file: &Path) -> String {
+/// The `[Unit]`/`[Service]` file. Paths are double-quoted so spaces survive, and
+/// those under `$HOME` are written with systemd's `%h` specifier so the unit can
+/// be checked into dotfiles without pinning one user's home directory.
+fn systemd_unit(exe: &str, config: &Path, env_file: &Path, home: &Path) -> String {
+    let home = home.to_string_lossy();
+    let exe = systemd_path(exe, &home);
+    let config = systemd_path(&config.to_string_lossy(), &home);
+    let env_file = systemd_path(&env_file.to_string_lossy(), &home);
     format!(
         "[Unit]\n\
          Description=navi: focused PR-review alerts\n\
@@ -362,10 +374,47 @@ fn systemd_unit(exe: &str, config: &Path, env_file: &Path) -> String {
          \n\
          [Install]\n\
          WantedBy=default.target\n",
-        exe = exe,
-        config = config.display(),
-        env_file = env_file.display(),
     )
+}
+
+/// A path as it should appear in a unit file: rewritten to `%h/...` when it sits
+/// under `$HOME`, with any literal `%` doubled so systemd doesn't read it as a
+/// specifier of its own.
+fn systemd_path(path: &str, home: &str) -> String {
+    let escaped = path.replace('%', "%%");
+    let home = home.trim_end_matches('/');
+    if home.is_empty() {
+        return escaped;
+    }
+    match escaped.strip_prefix(&home.replace('%', "%%")) {
+        // Only a whole path component matches: /home/mel must not swallow /home/melissa.
+        Some(rest) if rest.starts_with('/') => format!("%h{rest}"),
+        _ => escaped,
+    }
+}
+
+/// Resolve the specifiers [`systemd_path`] writes, so a unit we generated can be
+/// compared against real filesystem paths. Specifiers we don't emit are left
+/// alone rather than guessed at.
+fn expand_specifiers(value: &str, home: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut chars = value.chars();
+    while let Some(c) = chars.next() {
+        if c != '%' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('h') => out.push_str(home.trim_end_matches('/')),
+            Some('%') => out.push('%'),
+            Some(other) => {
+                out.push('%');
+                out.push(other);
+            }
+            None => out.push('%'),
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -730,11 +779,67 @@ mod tests {
             "/home/me/.cargo/bin/navi",
             Path::new("/home/me/.config/navi/config.toml"),
             Path::new("/home/me/.config/navi/navi.env"),
+            Path::new("/home/me"),
+        );
+        // Paths under $HOME become %h so the unit is portable across machines.
+        assert!(unit.contains(
+            "ExecStart=\"%h/.cargo/bin/navi\" run --config \"%h/.config/navi/config.toml\""
+        ));
+        assert!(unit.contains("EnvironmentFile=-%h/.config/navi/navi.env"));
+        assert!(unit.contains("WantedBy=default.target"));
+        assert!(!unit.contains("/home/me"), "no home should be baked in");
+    }
+
+    #[test]
+    fn systemd_unit_keeps_paths_outside_home_absolute() {
+        let unit = systemd_unit(
+            "/usr/local/bin/navi",
+            Path::new("/etc/navi/config.toml"),
+            Path::new("/etc/navi/navi.env"),
+            Path::new("/home/me"),
         );
         assert!(unit
-            .contains("ExecStart=\"/home/me/.cargo/bin/navi\" run --config \"/home/me/.config/navi/config.toml\""));
-        assert!(unit.contains("EnvironmentFile=-/home/me/.config/navi/navi.env"));
-        assert!(unit.contains("WantedBy=default.target"));
+            .contains("ExecStart=\"/usr/local/bin/navi\" run --config \"/etc/navi/config.toml\""));
+        assert!(unit.contains("EnvironmentFile=-/etc/navi/navi.env"));
+        assert!(!unit.contains("%h"));
+    }
+
+    #[test]
+    fn systemd_path_aliases_home_and_escapes_percents() {
+        assert_eq!(systemd_path("/home/me/bin/navi", "/home/me"), "%h/bin/navi");
+        // A trailing slash on HOME must not eat the separator.
+        assert_eq!(
+            systemd_path("/home/me/bin/navi", "/home/me/"),
+            "%h/bin/navi"
+        );
+        // A longer sibling home is not a prefix match.
+        assert_eq!(
+            systemd_path("/home/melissa/bin/navi", "/home/me"),
+            "/home/melissa/bin/navi"
+        );
+        // Literal percents are doubled so systemd doesn't read them as specifiers.
+        assert_eq!(
+            systemd_path("/home/me/100%/navi", "/home/me"),
+            "%h/100%%/navi"
+        );
+        assert_eq!(systemd_path("/opt/navi", ""), "/opt/navi");
+    }
+
+    #[test]
+    fn expand_specifiers_reverses_systemd_path() {
+        for path in [
+            "/home/me/.local/bin/navi",
+            "/home/me/100%/navi",
+            "/usr/local/bin/navi",
+        ] {
+            assert_eq!(
+                expand_specifiers(&systemd_path(path, "/home/me"), "/home/me"),
+                path
+            );
+        }
+        // Specifiers we never emit are left as written.
+        assert_eq!(expand_specifiers("%t/navi", "/home/me"), "%t/navi");
+        assert_eq!(expand_specifiers("navi%", "/home/me"), "navi%");
     }
 
     #[test]
