@@ -2,7 +2,7 @@
 //!
 //! Posts a synthetic event through navi's real Slack destination, then reads the
 //! message back via `conversations.history` and asserts the unique marker it embedded
-//! actually landed — proving delivery, not just a non-erroring API call.
+//! actually landed, proving delivery rather than just a non-erroring API call.
 //!
 //! Gated behind the `e2e` feature; run by the e2e workflow's `slack-live` job.
 //!
@@ -42,7 +42,7 @@ async fn run() -> Result<(), String> {
     let http = reqwest::Client::new();
 
     // A per-run marker carried in the PR title, which navi renders into the message's
-    // fallback `text` — so we can find *this* message in the channel history.
+    // fallback `text`, so we can find *this* message in the channel history.
     let marker = format!("navi-e2e-slack-{}", std::process::id());
 
     // Resolve the same channel navi will post to, so we can read history from it.

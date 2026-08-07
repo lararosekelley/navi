@@ -286,7 +286,7 @@ pub struct RouteConfig {
     #[serde(default)]
     pub repos: Vec<String>,
     /// When true, this route only receives events that no non-fallback route
-    /// claimed — a catch-all for "everything else". Combine with scoped routes to
+    /// claimed: a catch-all for "everything else". Combine with scoped routes to
     /// send some repos one place and the remainder somewhere else.
     #[serde(default)]
     pub fallback: bool,

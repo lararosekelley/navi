@@ -3,7 +3,7 @@
 //! Mirrors `navi-e2e-slack` for Discord: posts a synthetic event through navi's real
 //! Discord destination in bot-DM mode, then **reads the message back** via
 //! `GET /channels/{id}/messages` and asserts the unique marker it embedded actually
-//! landed — proving delivery, not just a non-erroring send.
+//! landed, proving delivery rather than just a non-erroring send.
 //!
 //! Bot DMs need the bot and the recipient to share a server, and the recipient's DM
 //! privacy to allow it. Gated behind the `e2e` feature; run by `discord-live`.
@@ -44,7 +44,7 @@ async fn run() -> Result<(), String> {
     let http = reqwest::Client::new();
 
     // A per-run marker carried in the PR title, which navi renders into both the
-    // message content and the embed title — so we can find *this* message.
+    // message content and the embed title, so we can find *this* message.
     let marker = format!("navi-e2e-discord-{}", std::process::id());
 
     // Preflight: a bot can only DM a user it shares a server with. Opening the DM
@@ -85,7 +85,7 @@ async fn run() -> Result<(), String> {
 
 /// Verify the bot can plausibly DM the recipient: confirm the token, list the bot's
 /// servers, and check the recipient is a member of at least one. If not, fail with a
-/// message that names where the bot actually is — the common cause of a 403 on send.
+/// message that names where the bot actually is, the common cause of a 403 on send.
 async fn preflight(
     http: &reqwest::Client,
     api: &str,
@@ -106,7 +106,7 @@ async fn preflight(
         names.join(", ")
     );
     if guilds.is_empty() {
-        return Err("the bot is in no servers — invite it to a server you're in".into());
+        return Err("the bot is in no servers; invite it to a server you're in".into());
     }
     for g in &guilds {
         let Some(gid) = g["id"].as_str() else {

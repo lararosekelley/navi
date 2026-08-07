@@ -306,7 +306,7 @@ mod tests {
             "got {text}"
         );
 
-        // The digest carries the footer too — its plain-text footer is newly added.
+        // The digest carries the footer too; its plain-text footer is newly added.
         // Assert on the plain-text part, which (unlike the HTML) isn't QP-encoded.
         let from = "navi <navi@example.com>".parse::<Mailbox>().unwrap();
         let to = "you <you@example.com>".parse::<Mailbox>().unwrap();
