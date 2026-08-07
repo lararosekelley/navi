@@ -10,8 +10,8 @@
 
 ---
 
-`navi` is a free, open-source, and locally-run service for keeping you up-to-date with code review requests. It
-supports GitHub, GitLab, and Gitea/Forgejo as **sources** and Slack, Discord, and email as **destinations**.
+`navi` is a free, open-source, locally-run service that keeps you up to date on code review. It supports GitHub,
+GitLab, and Gitea/Forgejo as **sources** and Slack, Discord, and email as **destinations**.
 
 It will notify you when:
 
@@ -22,10 +22,9 @@ It will notify you when:
 - 👋 you were **@-mentioned**
 - 🟣 your PR was **merged**, or 🚫 **closed**
 
-Every alert type is individually toggle-able, filterable by repo, and mutable by author, so you maintain control
-over the granularity and frequency of your notifications. `navi` was inspired by how noisy GitHub's native Slack app
-is, and emails becoming harder to manage with the rise of LLMs and bots creating, commenting on, and interacting with
-PRs.
+Every alert type is individually toggle-able, filterable by repo, and mutable by author, so you control the
+granularity and frequency of your notifications. `navi` was inspired by how noisy GitHub's native Slack app is, and by
+emails becoming harder to manage as LLMs and bots pile onto PRs.
 
 > **Note:** the published crate is `navi-notifier`, but the installed binary and command are just `navi`.
 
@@ -33,22 +32,24 @@ Read more at [larakelley.com/posts/navi](https://larakelley.com/posts/navi)!
 
 ## Reporting issues
 
-Please report bugs and feature requests in [GitHub issues](https://github.com/lararosekelley/navi/issues).
-Redact any tokens before pasting output.
+Bugs and feature requests go in [GitHub issues](https://github.com/lararosekelley/navi/issues). Redact any tokens
+before pasting output.
 
 ## How it works
 
 `navi` normalizes activity from each **source** into one common set of events, filters them by your rules, and routes
-them to your **destinations**. For GitHub and Gitea it polls the notifications API as a trigger, then **diffs** each
-PR's reviews and comments against a stored snapshot to derive precise events, so it can tell "reply to _my_ comment"
-from "a dismissal" from "a re-review"; for GitLab it reads the Todos feed. GitHub additionally polls your involved open
-PRs directly (`track_prs`, on by default), so reviews on your own PRs and activity in muted repos still reach you even
-when GitHub doesn't create a notification. State lives in a local SQLite database, so delivery is idempotent (you're
-never pinged twice) and it never touches your read/unread state on the source.
+them to your **destinations**.
 
 ```text
 source activity → normalized events → filter (rules) → route → destination
 ```
+
+For GitHub and Gitea it polls the notifications API as a trigger, then **diffs** each PR's reviews and comments
+against a stored snapshot to derive precise events, so it can tell "reply to _my_ comment" from "a dismissal" from "a
+re-review"; for GitLab it reads the Todos feed. GitHub also polls your involved open PRs directly (`track_prs`, on by
+default), so reviews on your own PRs and activity in muted repos reach you even when GitHub creates no notification.
+State lives in a local SQLite database, so delivery is idempotent and your read/unread state on the source is never
+touched.
 
 ## Install
 
@@ -73,55 +74,38 @@ brew install lararosekelley/tap/navi-notifier
 With a Rust toolchain, `cargo install navi-notifier --locked` builds from source, or
 `cargo binstall navi-notifier` fetches the prebuilt binary. Every install puts a `navi` binary on your PATH.
 
-The shell command runs [`install.sh`](install.sh), a wrapper around the
-[cargo-dist](https://github.com/axodotdev/cargo-dist)-generated `navi-notifier-installer.sh`; PowerShell fetches the
-matching `.ps1`. Both pull prebuilt binaries from
-[GitHub Releases](https://github.com/lararosekelley/navi/releases), so they need a published release (see
-[Releasing](#releasing)). Linux builds are static musl and run on any distro. `navi` runs on Linux, macOS, and Windows,
-and `navi service install` can register a background service on all three (systemd, launchd, Task Scheduler).
+Both scripts pull prebuilt binaries from [GitHub Releases](https://github.com/lararosekelley/navi/releases), so they
+need a published release (see [Releasing](#releasing)). Linux builds are static musl and run on any distro. `navi`
+itself runs on Linux, macOS, and Windows, and `navi service install` registers a background service on all three.
 
 ## Setup
 
-### 1. GitHub token
-
-Create a Personal Access Token that can read your notifications and PRs:
-
-- **Classic PAT:** scopes `notifications` + `repo` (read access to the repos you care about).
-- **Fine-grained PAT:** read access to _Pull requests_ and _Notifications_ on the relevant repos.
-
-Export it as `NAVI_GITHUB_TOKEN`.
-
-### 2. Slack app
-
-1. Create an app at <https://api.slack.com/apps> → _From scratch_.
-2. Under **OAuth & Permissions**, add bot scopes: `chat:write` and `im:write`.
-3. Install the app to your workspace and copy the **Bot User OAuth Token** (`xoxb-…`).
-4. Export it as `NAVI_SLACK_TOKEN`.
-
-`dm_to = "self"` DMs whoever the token authenticates as. If that resolves to the bot rather than you, set `dm_to` to
-your Slack user id (`U…`); find it via your Slack profile → _Copy member ID_.
-
-### 3. Configure
-
 ```sh
-navi init                 # writes ~/.config/navi/config.toml with commented defaults
-$EDITOR ~/.config/navi/config.toml
-navi test-slack           # DMs you a sample message to confirm credentials
+navi init      # write ~/.config/navi/config.toml, then walk through enabling providers
+navi doctor    # validate the config and report what each enabled provider can see
 ```
 
-### Other sources and destinations
+Every provider ships **disabled**. `navi init` offers to enable each one in turn, printing its setup steps and storing
+the token you paste in `navi.env` beside the config. To do it by hand at any point:
 
-GitHub (source) and Slack (destination) are on by default. The rest are opt-in: set their token and flip
-`enabled = true` in the matching config section.
+```sh
+navi providers list              # what's on, and whether its credentials resolve
+navi providers setup slack       # setup steps for one provider (incl. a Slack app manifest)
+navi config set slack.enabled true
+navi test --destination slack    # send a sample; --source github polls and prints what it derives
+```
 
-| Provider      | Kind        | Token env            | Notes                                                |
-| ------------- | ----------- | -------------------- | ---------------------------------------------------- |
-| GitLab        | source      | `NAVI_GITLAB_TOKEN`  | PAT with `read_api`; set `api_base` for self-hosted. |
-| Gitea/Forgejo | source      | `NAVI_GITEA_TOKEN`   | set `api_base` to your instance (`.../api/v1`).      |
-| Discord       | destination | `NAVI_DISCORD_TOKEN` | or set `dm_to` to a webhook URL (no token needed).   |
+| Provider      | Kind        | Token env             | Notes                                                      |
+| ------------- | ----------- | --------------------- | ---------------------------------------------------------- |
+| GitHub        | source      | `NAVI_GITHUB_TOKEN`   | `notifications` + `repo` read; `read:org` for team review. |
+| GitLab        | source      | `NAVI_GITLAB_TOKEN`   | PAT with `read_api`; set `api_base` for self-hosted.       |
+| Gitea/Forgejo | source      | `NAVI_GITEA_TOKEN`    | set `api_base` to your instance (`.../api/v1`).            |
+| Slack         | destination | `NAVI_SLACK_TOKEN`    | bot token (`xoxb-…`) with `chat:write` + `im:write`.       |
+| Discord       | destination | `NAVI_DISCORD_TOKEN`  | or set `dm_to` to a webhook URL (no token needed).         |
+| Email         | destination | `NAVI_EMAIL_PASSWORD` | SMTP host, `from`, and `to` in the `[email]` section.      |
 
-Then use `routes` to wire which sources feed which destinations (omit `routes` to send every source to every
-destination).
+With more than one of each, use `routes` to wire which sources feed which destinations; omit `routes` to send every
+source to every destination.
 
 ## Usage
 
@@ -131,8 +115,16 @@ navi once             # one poll pass; actually delivers
 navi run              # run continuously on the configured interval
 ```
 
-Preview your filters safely with `once --dry-run`; it shows each derived event and why it was delivered or
+`once --dry-run` is the safe way to preview your filters: it shows each derived event and why it was delivered or
 suppressed, without sending anything or advancing state.
+
+```sh
+navi doctor                            # validate the config; check what each provider can see
+navi config get general.poll_interval_secs       # read a value by dotted key
+navi config set general.poll_interval_secs 120   # write one in place, comments preserved
+navi config edit                       # open config.toml in $VISUAL/$EDITOR
+navi env                               # open navi.env (the token file) in $VISUAL/$EDITOR
+```
 
 ### As a background service
 
@@ -141,13 +133,15 @@ suppressed, without sending anything or advancing state.
 ```sh
 navi service install     # generate + enable a login service for your OS
 navi service status      # is it installed and running?
+navi service restart     # re-read config and navi.env
 navi service uninstall   # stop and remove it
 navi logs -f             # tail the service's logs (journald on Linux, a log file on macOS/Windows)
 ```
 
-The service is generated from your actual binary and config paths and runs on login:
+The service is generated from your own binary and config paths and runs on login:
 
-- **Linux:** a systemd user unit at `~/.config/systemd/user/navi.service`.
+- **Linux:** a systemd user unit at `~/.config/systemd/user/navi.service`. Paths use systemd's `%h` specifier rather
+  than a hard-coded home directory, so the unit is safe to check into dotfiles.
 - **macOS:** a launchd agent at `~/Library/LaunchAgents/dev.navi.navi.plist`.
 - **Windows:** a Task Scheduler logon task named `Navi`, run hidden (no console window).
 
@@ -162,37 +156,45 @@ The hand-written templates in [`deploy/`](deploy) remain for reference or manual
 
 ```sh
 navi setup                 # install the man page + wire completions into your shell rc (idempotent)
-navi completions zsh       # or print the script yourself for bash/zsh/fish/powershell
+navi completions zsh       # or print the script yourself (bash/zsh/fish/powershell/elvish)
 navi upgrade               # update an installer-managed copy to the latest release
 navi downgrade --to 0.1.4  # step back to an earlier release (or bare `downgrade` for the previous one)
 navi uninstall             # reverse setup + the installer (completions, man page, config); reports how to remove the binary
 ```
 
 `upgrade`/`downgrade` re-run the release installer, so they apply to copies installed via the shell/PowerShell
-installer or Homebrew; a `cargo install` copy should update through cargo. They also restart the background service
-onto the new binary (pass `--no-restart` to skip), since a running daemon otherwise stays on the old build until it's
-restarted. A once-a-day check prints a one-line nudge when a newer release exists (silence it with
-`NAVI_NO_UPDATE_CHECK=1`).
+installer or Homebrew; a `cargo install` copy should update through cargo. Both restart the background service onto the
+new binary (`--no-restart` to skip), since a running daemon otherwise stays on the old build. A once-a-day check prints
+a one-line nudge when a newer release exists (silence it with `NAVI_NO_UPDATE_CHECK=1`).
 
 ## Configuration
 
-`navi init` documents every field inline. Highlights:
+`navi init` documents every field inline, and `navi config set <key> <value>` edits one in place. The fields worth
+knowing about:
 
 | Section              | Key                      | Meaning                                                               |
 | -------------------- | ------------------------ | --------------------------------------------------------------------- |
 | `general`            | `poll_interval_secs`     | Seconds between poll passes (`run`).                                  |
 | `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.                           |
+| `general`            | `comment_min_age_secs`   | Hold comments back this long so bots that edit in place settle first. |
+| `general`            | `backfill`               | First-poll behavior: `review_requests`, `none`, or `all_open`.        |
+| `general`            | `log_level`              | `tracing` filter, e.g. `info` or `navi=debug`.                        |
 | `github`             | `token_env` / `api_base` | Source. Token env var; API base for GitHub Enterprise.                |
-| `gitlab`             | `enabled` / `token_env`  | Source, off by default. `read_api` token; `api_base` for self-hosted. |
-| `gitea`              | `enabled` / `api_base`   | Source, off by default. Gitea or Forgejo instance.                    |
+| `github`             | `track_prs`              | Also poll your involved open PRs, not just the notifications inbox.   |
+| `github`             | `mark_read`              | Mark a notification thread read once delivered. Off by default.       |
+| `gitlab`             | `enabled` / `token_env`  | Source. `read_api` token; `api_base` for self-hosted.                 |
+| `gitea`              | `enabled` / `api_base`   | Source. Gitea or Forgejo instance.                                    |
 | `slack`              | `dm_to`                  | Destination. `"self"`, a user id `U…`, `C…`, or `#name`.              |
-| `discord`            | `enabled` / `dm_to`      | Destination, off by default. Webhook URL or user id.                  |
+| `slack`              | `broadcast`              | Event tags that surface at top level, not just in the PR thread.      |
+| `discord`            | `enabled` / `dm_to`      | Destination. Webhook URL or user id.                                  |
+| `email`              | `smtp_host` / `to`       | Destination. SMTP delivery, threaded per PR.                          |
+| `digest`             | `enabled` / `kinds`      | Batch low-signal kinds into a periodic summary instead of alerting.   |
 | `rules.events.*`     |                          | Per-event-kind on/off toggles.                                        |
 | `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.                      |
 | `rules.mute_authors` |                          | Logins whose actions never notify (e.g. bots).                        |
 | `rules.quiet_hours`  |                          | Suppress during a local time window.                                  |
 | `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                                        |
-| `routes`             |                          | Which sources feed which destinations.                                |
+| `routes`             | `repos` / `fallback`     | Which sources feed which destinations, optionally scoped by repo.     |
 
 It works across **all repos your token can see**. There's no repo list to maintain; narrow the firehose with
 `rules.repos`.
@@ -225,16 +227,16 @@ just check            # format + lint + test
 just e2e              # live smoke test (needs NAVI_GITHUB_TOKEN + NAVI_SLACK_TOKEN)
 ```
 
-Commits follow [Conventional Commits](https://www.conventionalcommits.org) with a required scope (enforced by
-commitlint via a git hook); run `just install` once to wire the hooks. The interesting logic (the GitHub diff engine
-and the rule filter) is pure and covered by fixture tests; the HTTP wiring is covered by
+Commits follow [Conventional Commits](https://www.conventionalcommits.org) with a required scope, enforced by
+commitlint via a git hook; run `just install` once to wire the hooks. The interesting logic (the forge diff engine and
+the rule filter) is pure and covered by fixture tests; HTTP wiring is covered by
 [wiremock](https://docs.rs/wiremock) integration tests under each provider crate's `tests/`.
 
 ## Releasing
 
 Versioning is driven by [cargo-release](https://github.com/crate-ci/cargo-release) and artifact building by
-[cargo-dist](https://github.com/axodotdev/cargo-dist) ([`dist-workspace.toml`](dist-workspace.toml)). All four crates
-share one version; cargo-release keeps that version _and_ the internal cross-crate dependency requirements in lockstep
+[cargo-dist](https://github.com/axodotdev/cargo-dist) ([`dist-workspace.toml`](dist-workspace.toml)). Every crate
+shares one version; cargo-release keeps that version _and_ the internal cross-crate dependency requirements in lockstep
 on every bump (see [`[workspace.metadata.release]`](Cargo.toml)), so they can never drift.
 
 One-time setup: install the tooling and generate the (not-hand-written) release workflow:
@@ -252,10 +254,9 @@ just release minor            # bump all crates + internal deps, commit, tag v<v
 ```
 
 `just release` only bumps/commits/tags/pushes; it does **not** publish. The tag push triggers the cargo-dist release
-workflow, which builds the binaries and installers, runs the [e2e workflow](.github/workflows/e2e.yml) as a
-pre-release gate, and then runs [`publish-crates.yml`](.github/workflows/publish-crates.yml) to publish all crates to
-crates.io in dependency order; publishing only happens after the release builds pass. See
-[`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md) for the manual pre-release checklist.
+workflow, which builds the binaries and installers, gates on the [e2e workflow](.github/workflows/e2e.yml), and then
+runs [`publish-crates.yml`](.github/workflows/publish-crates.yml) to publish every crate to crates.io in dependency
+order. See [`docs/SMOKE_TEST.md`](docs/SMOKE_TEST.md) for the manual pre-release checklist.
 
 ## License
 
