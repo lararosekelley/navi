@@ -7,7 +7,7 @@
 //! requests the **viewer**'s review; navi (authenticated as the viewer) polls the
 //! live notifications API, derives a `ReviewRequested`, and delivers it to a
 //! Dockerized Mailpit sink. We assert the email lands, then tear the PR + branch
-//! down — even on failure — so the fixed repo stays clean for the next run.
+//! down, even on failure, so the fixed repo stays clean for the next run.
 //!
 //! Mailpit is the destination so this slice needs only GitHub credentials; live
 //! Slack/Discord delivery is proven by their own slices. Gated behind the `e2e`
@@ -78,7 +78,7 @@ async fn run() -> Result<(), String> {
     println!("e2e-github: viewer={viewer} actor={actor} repo={owner}/{name}");
 
     // Seed the event as the actor, then always tear it down so the fixed repo stays
-    // clean — even when the assertion below fails.
+    // clean, even when the assertion below fails.
     let seeded = seed(&http, &api, &actor_token, owner, name, &viewer).await?;
     // Match the *specific* ephemeral PR, not just any "requested your review": the
     // viewer is a live account whose real outstanding reviews also surface on the

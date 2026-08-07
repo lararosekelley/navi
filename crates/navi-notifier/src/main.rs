@@ -53,8 +53,8 @@ fn main() -> Result<()> {
 }
 
 /// Route a command. Only the handful that actually `.await` spin up a Tokio runtime
-/// (via `on_runtime`); the rest — config edits, service management, upgrades, `logs`
-/// — run synchronously and never pay for one.
+/// (via `on_runtime`); the rest (config edits, service management, upgrades, `logs`)
+/// run synchronously and never pay for one.
 fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
     match command {
         Command::Init { force } => cmd_init(&config_path, force),
@@ -480,7 +480,7 @@ destination = "slack"
 # source = "github"
 # destination = "email"
 # repos = ["me/*"]
-# Set `fallback = true` on a route to catch only events no other route claimed —
+# Set `fallback = true` on a route to catch only events no other route claimed,
 # "everything else". e.g. acme/* to Slack above, and the remainder to email:
 # [[routes]]
 # source = "github"

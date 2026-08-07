@@ -167,7 +167,7 @@ impl Destination for SlackDestination {
         // High-signal kinds break out of the thread so they aren't buried. Only
         // meaningful for a reply (a thread-opening message is already top-level).
         // A review *submission* (approved/changes-requested/commented) on a PR you
-        // only review isn't worth surfacing channel-wide, so it stays in-thread —
+        // only review isn't worth surfacing channel-wide, so it stays in-thread:
         // only your own PRs' review submissions break out. (This is submissions only:
         // `review_dismissed` is *your* review being dismissed, relevant on any PR.)
         let review_on_others_pr =

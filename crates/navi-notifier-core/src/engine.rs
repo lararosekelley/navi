@@ -27,10 +27,10 @@ pub struct Route {
     /// Empty = every repo from `source`.
     pub repos: Vec<String>,
     /// When true, this route only acts on events that no normal (non-fallback)
-    /// route claimed — a catch-all for "everything else". Lets a config send some
+    /// route claimed: a catch-all for "everything else". Lets a config send some
     /// repos to one destination and route the remainder to another without listing
     /// every owner. A fallback route may still set `source`/`repos` to narrow when
-    /// it acts — but note an unclaimed event that doesn't match this route's own
+    /// it acts, but note an unclaimed event that doesn't match this route's own
     /// `source`/`repos` is still suppressed, not caught, so a scoped fallback is not
     /// a universal safety net.
     pub fallback: bool,
@@ -123,8 +123,8 @@ impl Engine {
     /// Destinations that should receive this event, given its source and repo. A
     /// route matches when its source matches and its repo globs are empty or match
     /// the event's repo; every matching normal route's destination receives it
-    /// (fan-out). Fallback routes act only when no normal route matched the event —
-    /// so a repo a normal route claims never also reaches the fallback, even if that
+    /// (fan-out). Fallback routes act only when no normal route matched the event, so a
+    /// repo a normal route claims never also reaches the fallback, even if that
     /// route's destination is disabled. With no routes at all, every destination
     /// receives everything.
     fn destinations_for(&self, event: &Event) -> Vec<Arc<dyn Destination>> {
@@ -855,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn event_with_no_matching_route_is_suppressed_not_failed() {
         // A scoped route that this event's repo doesn't match must suppress the
-        // event, not fail it — else its snapshot is held back and it re-derives
+        // event, not fail it, else its snapshot is held back and it re-derives
         // every poll (a loop).
         let dest = Arc::new(MockDestination {
             id: "dest-a".into(),

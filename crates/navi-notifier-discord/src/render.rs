@@ -196,7 +196,7 @@ mod tests {
     #[test]
     fn merge_queue_names_the_author_not_their_own_pr() {
         // No actor precedes the phrase here, so "their own PR" would read oddly even
-        // when the author enqueued their own PR — name them instead.
+        // when the author enqueued their own PR, so name them instead.
         let mut own = event(EventKind::EnteredMergeQueue);
         own.actor = Actor::new("octo"); // author enqueued their own PR
         let d = render(&own).embed["description"]

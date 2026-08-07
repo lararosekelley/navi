@@ -10,7 +10,7 @@ use anyhow::Result;
 use crate::{config_cmd, envfile, prompt, providers};
 
 /// `(id, the secret env var to offer to fill, or None when setup isn't a single
-/// token — the setup text guides those)`.
+/// token; the setup text guides those)`.
 const PROVIDERS: &[(&str, Option<&str>)] = &[
     ("github", Some("NAVI_GITHUB_TOKEN")),
     ("gitlab", Some("NAVI_GITLAB_TOKEN")),

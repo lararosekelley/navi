@@ -603,7 +603,7 @@ fn status_task() -> Result<()> {
 
 /// The PowerShell arguments that run navi through a hidden window (so no console
 /// appears at sign-in) and append all output to a per-user log file, rotating it
-/// past a size cap and creating its directory first — a hidden task otherwise has
+/// past a size cap and creating its directory first, since a hidden task otherwise has
 /// nowhere to log.
 fn ps_run_arguments(exe: &str, config: &Path) -> String {
     // Double any single quote so a path like C:\Users\O'Brien\... can't break out
@@ -617,7 +617,7 @@ fn ps_run_arguments(exe: &str, config: &Path) -> String {
 }
 
 /// A Task Scheduler XML definition for the logon task. Registered via `schtasks
-/// /XML`, which — unlike `/TR` — imposes no 261-char command limit, so navi's hidden
+/// /XML`, which (unlike `/TR`) imposes no 261-char command limit, so navi's hidden
 /// PowerShell log-wrapper plus long install/config paths can't overflow it (#125).
 fn task_xml(exe: &str, config: &Path) -> String {
     let args = xml_escape(&ps_run_arguments(exe, config));
@@ -652,7 +652,7 @@ fn task_xml(exe: &str, config: &Path) -> String {
     )
 }
 
-/// Encode as UTF-16LE with a BOM, matching the XML declaration — schtasks rejects a
+/// Encode as UTF-16LE with a BOM, matching the XML declaration: schtasks rejects a
 /// task file whose bytes don't match its declared encoding.
 fn utf16le_with_bom(s: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];

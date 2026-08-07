@@ -6,7 +6,7 @@
 //! which creates a `review_requested` todo; navi (authenticated as the viewer)
 //! polls the live Todos API, derives a `ReviewRequested`, and delivers it to a
 //! Dockerized Mailpit sink. We assert the email lands for that specific MR, then
-//! close the MR and delete its branch — even on failure.
+//! close the MR and delete its branch, even on failure.
 //!
 //! Mailpit is the destination so this slice needs only GitLab credentials; live
 //! Slack/Discord delivery is proven by their own slices. Gated behind the `e2e`
