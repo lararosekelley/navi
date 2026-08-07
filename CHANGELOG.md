@@ -4,6 +4,13 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.2
+
+### Changed
+
+- **service:** write the generated systemd unit's paths with the `%h` specifier
+  instead of a hard-coded home directory, so it can be checked into dotfiles
+
 ## 0.3.1
 
 ### Fixed
