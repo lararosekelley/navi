@@ -12,6 +12,8 @@ published into that release's GitHub notes by `dist`, so the headings must stay
   window ends, instead of dropping them for good
 - **core:** hold the digest inside a quiet window too, so batching a kind no
   longer opts it out of quiet hours
+- **core:** track delivery per destination, so a retry after one destination
+  fails no longer re-notifies the ones that already succeeded
 
 ## 0.3.3
 
