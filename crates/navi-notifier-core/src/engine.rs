@@ -96,6 +96,13 @@ const DIGEST_SCOPE: &str = "pending";
 const DEFERRED_SOURCE: &str = "__deferred__";
 const DEFERRED_SCOPE: &str = "pending";
 
+/// Dedup sinks standing for "accepted into a buffer" rather than "sent to a
+/// destination". Taking an event into a buffer is recorded so a re-derived copy is
+/// not buffered twice; the real per-destination sinks are recorded later, when the
+/// flush actually sends it. Both are `__`-wrapped, which no destination id can be.
+const DIGEST_SINK: &str = "__digest__";
+const DEFERRED_SINK: &str = "__deferred__";
+
 /// What one digest flush did, so the caller can tell an attempt that had nothing
 /// to send from one a quiet window prevented from sending.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -282,28 +289,6 @@ impl Engine {
             Decision::Defer(reason) => Some(reason),
         };
 
-        // 2. Dedup: never ping twice for the same underlying action.
-        match self.state.was_delivered(&event.dedup_key).await {
-            Ok(true) => {
-                return EventRecord {
-                    event,
-                    outcome: EventOutcome::AlreadyDelivered,
-                };
-            }
-            Ok(false) => {}
-            Err(err) => {
-                // Fail safe: if we can't check dedup, treat as a delivery failure
-                // so it is retried next pass rather than risk spamming.
-                warn!(dedup_key = %event.dedup_key, %err, "dedup check failed");
-                return EventRecord {
-                    event,
-                    outcome: EventOutcome::DeliveryFailed {
-                        errors: vec![format!("dedup check failed: {err}")],
-                    },
-                };
-            }
-        }
-
         let target_ids: Vec<String> = targets.iter().map(|n| n.id().to_string()).collect();
 
         if dry_run {
@@ -334,67 +319,73 @@ impl Engine {
             };
         }
 
-        // Digest kinds are buffered for the periodic flush rather than sent now.
-        // Marked delivered so they don't re-derive; the flush handles routing.
-        // Checked before the quiet-hours buffer below: a kind the user chose to
-        // batch is already deferred by their own choice, so it keeps the digest's
-        // cadence rather than being double-handled. The window is still honoured,
-        // by `flush_digest` re-deciding each event before it sends.
+        // 2. Buffered paths. Both hand the event to a flush that will route it
+        // later, so neither delivers here.
+        //
+        // Digest is checked first: a kind the user chose to batch is already
+        // deferred by their own choice, so it keeps the digest's cadence rather than
+        // being double-handled. The window is still honoured, by `flush_digest`
+        // re-deciding each event before it sends.
         if self.digest_kinds.contains(event.kind.tag()) {
-            if let Err(err) = self.enqueue_digest(&event).await {
-                warn!(dedup_key = %event.dedup_key, %err, "failed to buffer digest event");
-                return EventRecord {
+            return self
+                .take_into_buffer(
                     event,
-                    outcome: EventOutcome::DeliveryFailed {
-                        errors: vec![format!("digest buffer: {err}")],
-                    },
-                };
-            }
-            if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
-                warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
-            }
-            return EventRecord {
-                event,
-                outcome: EventOutcome::Digested,
-            };
+                    DIGEST_SINK,
+                    DIGEST_SOURCE,
+                    DIGEST_SCOPE,
+                    "digest",
+                    |_| EventOutcome::Digested,
+                )
+                .await;
         }
 
-        // 3. Quiet hours: buffer for release rather than discard. Marked delivered
-        // so the snapshot may advance without the event re-deriving every pass;
-        // the buffer, not the snapshot, is what holds it now. Buffering before
-        // marking means a failure here leaves the event to be re-derived next pass
-        // rather than losing it.
+        // Quiet hours: buffer for release rather than discard, so the window costs
+        // the user silence and not the notification.
         if let Some(reason) = deferred {
-            if let Err(err) = self.enqueue_deferred(&event).await {
-                warn!(dedup_key = %event.dedup_key, %err, "failed to buffer deferred event");
+            return self
+                .take_into_buffer(
+                    event,
+                    DEFERRED_SINK,
+                    DEFERRED_SOURCE,
+                    DEFERRED_SCOPE,
+                    "deferred",
+                    move |_| EventOutcome::Deferred(reason.clone()),
+                )
+                .await;
+        }
+
+        // 3. Dedup, per destination: an event that reached Slack but not email last
+        // pass must retry email alone. Keyed on the pair, so a retry never re-pings
+        // a destination that already took it.
+        let pending = match self.undelivered_targets(&event, targets).await {
+            Ok(p) => p,
+            Err(err) => {
+                // Fail safe: if we can't check dedup, treat as a delivery failure so
+                // it is retried next pass rather than risk spamming.
+                warn!(dedup_key = %event.dedup_key, %err, "dedup check failed");
                 return EventRecord {
                     event,
                     outcome: EventOutcome::DeliveryFailed {
-                        errors: vec![format!("defer buffer: {err}")],
+                        errors: vec![format!("dedup check failed: {err}")],
                     },
                 };
             }
-            if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
-                warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
-            }
-            debug!(dedup_key = %event.dedup_key, ?reason, "event deferred");
+        };
+        if pending.is_empty() {
             return EventRecord {
                 event,
-                outcome: EventOutcome::Deferred(reason),
+                outcome: EventOutcome::AlreadyDelivered,
             };
         }
 
-        // 4. Deliver to every routed destination.
-        let (delivered_to, errors) = self.fan_out(&event, targets).await;
+        // 4. Deliver to every destination that still needs it.
+        let (delivered_to, errors) = self.fan_out(&event, &pending).await;
 
-        // Only consider the event delivered (and advance provider cursors) if every
-        // routed destination succeeded. A partial failure stays undelivered so the next
-        // pass retries; dedup guards against double-sends to destinations that did work
-        // via provider-side idempotency where available.
+        // Successes were already recorded per destination by `fan_out`. Provider
+        // cursors only advance once every routed destination has the event, so a
+        // partial failure still re-derives next pass - but the dedup sinks mean that
+        // retry reaches only the destinations that actually failed.
         if errors.is_empty() {
-            if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
-                warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
-            }
             if let Err(err) = source.commit(self.state.as_ref(), &event).await {
                 warn!(%err, "source commit hook failed");
             }
@@ -410,9 +401,13 @@ impl Engine {
         }
     }
 
-    /// Send one event to every routed destination, returning the ids that took it
-    /// and the errors from those that didn't. Shared by the live path and the
-    /// deferred flush so both fan out identically.
+    /// Send one event to each destination, recording every success against that
+    /// destination's own dedup sink before moving on. Returns the ids that took it
+    /// and the errors from those that didn't.
+    ///
+    /// Marking here, per destination and as each one lands, is what keeps a retry
+    /// from re-pinging destinations that already took the event. Shared by the live
+    /// path and the deferred flush so both behave identically.
     async fn fan_out(
         &self,
         event: &Event,
@@ -422,7 +417,19 @@ impl Engine {
         let mut errors = Vec::new();
         for destination in targets {
             match destination.send(event, self.state.as_ref()).await {
-                Ok(()) => delivered_to.push(destination.id().to_string()),
+                Ok(()) => {
+                    if let Err(err) = self
+                        .state
+                        .mark_delivered(&event.dedup_key, destination.id())
+                        .await
+                    {
+                        // The send happened; only the record of it failed. Warn
+                        // rather than report failure, so the pass doesn't retry a
+                        // destination that already has the message.
+                        warn!(dedup_key = %event.dedup_key, destination = destination.id(), %err, "delivered but failed to persist the dedup key; it may re-send");
+                    }
+                    delivered_to.push(destination.id().to_string());
+                }
                 Err(err) => {
                     error!(destination = destination.id(), %err, "delivery failed");
                     errors.push(format!("{}: {err}", destination.id()));
@@ -430,6 +437,72 @@ impl Engine {
             }
         }
         (delivered_to, errors)
+    }
+
+    /// The subset of `targets` that has not already received `event`.
+    async fn undelivered_targets(
+        &self,
+        event: &Event,
+        targets: &[Arc<dyn Destination>],
+    ) -> Result<Vec<Arc<dyn Destination>>, StateError> {
+        let mut pending = Vec::new();
+        for destination in targets {
+            if !self
+                .state
+                .was_delivered(&event.dedup_key, destination.id())
+                .await?
+            {
+                pending.push(destination.clone());
+            }
+        }
+        Ok(pending)
+    }
+
+    /// Hand an event to one of the buffers, recording it against that buffer's sink
+    /// so a re-derived copy is not buffered twice. Buffering before marking means a
+    /// write failure leaves the event to be re-derived next pass rather than lost.
+    async fn take_into_buffer(
+        &self,
+        event: Event,
+        sink: &str,
+        source: &str,
+        scope: &str,
+        label: &str,
+        outcome: impl FnOnce(&Event) -> EventOutcome,
+    ) -> EventRecord {
+        match self.state.was_delivered(&event.dedup_key, sink).await {
+            Ok(true) => {
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::AlreadyDelivered,
+                };
+            }
+            Ok(false) => {}
+            Err(err) => {
+                warn!(dedup_key = %event.dedup_key, %err, "dedup check failed");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::DeliveryFailed {
+                        errors: vec![format!("dedup check failed: {err}")],
+                    },
+                };
+            }
+        }
+        if let Err(err) = self.enqueue(source, scope, label, &event).await {
+            warn!(dedup_key = %event.dedup_key, buffer = label, %err, "failed to buffer event");
+            return EventRecord {
+                event,
+                outcome: EventOutcome::DeliveryFailed {
+                    errors: vec![format!("{label} buffer: {err}")],
+                },
+            };
+        }
+        if let Err(err) = self.state.mark_delivered(&event.dedup_key, sink).await {
+            warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
+        }
+        debug!(dedup_key = %event.dedup_key, buffer = label, "event buffered");
+        let outcome = outcome(&event);
+        EventRecord { event, outcome }
     }
 
     /// The events currently sitting in one of the persisted buffers.
@@ -456,10 +529,10 @@ impl Engine {
 
     /// Append an event to one of the persisted buffers, unless it is already there.
     ///
-    /// Idempotent on `dedup_key`, because the caller marks the event delivered only
-    /// after this succeeds: if that mark fails, the event re-derives next pass and
-    /// arrives here a second time. Appending it twice would mean two identical pings
-    /// on release.
+    /// Idempotent on `dedup_key`, because `take_into_buffer` marks the buffer's sink
+    /// only after this succeeds: if that mark fails, the event re-derives next pass
+    /// and arrives here a second time. Appending it twice would mean two identical
+    /// pings on release.
     ///
     /// Capped, because the buffer is one state row rewritten in full on every
     /// append. Over a long window with a wedged destination it would otherwise grow
@@ -504,18 +577,6 @@ impl Engine {
     /// The events currently buffered for the next digest flush.
     async fn read_digest(&self) -> Result<Vec<Event>, StateError> {
         self.read_buffer(DIGEST_SOURCE, DIGEST_SCOPE, "digest")
-            .await
-    }
-
-    /// Append an event to the persisted digest buffer.
-    async fn enqueue_digest(&self, event: &Event) -> Result<(), StateError> {
-        self.enqueue(DIGEST_SOURCE, DIGEST_SCOPE, "digest", event)
-            .await
-    }
-
-    /// Append an event to the persisted deferred (quiet-hours) buffer.
-    async fn enqueue_deferred(&self, event: &Event) -> Result<(), StateError> {
-        self.enqueue(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred", event)
             .await
     }
 
@@ -675,19 +736,30 @@ impl Engine {
                 }
                 Decision::Deliver => {
                     let targets = self.destinations_for(&event);
+                    // Only the destinations that don't have it yet: a previous flush
+                    // may have delivered to some of them before failing on the rest.
+                    let targets = match self.undelivered_targets(&event, &targets).await {
+                        Ok(t) => t,
+                        Err(err) => {
+                            warn!(dedup_key = %event.dedup_key, %err, "dedup check failed on flush; keeping it buffered");
+                            keep.push(event);
+                            continue;
+                        }
+                    };
                     if targets.is_empty() {
-                        debug!(dedup_key = %event.dedup_key, "deferred event has no destination");
+                        debug!(dedup_key = %event.dedup_key, "deferred event has no destination left to reach");
                         dropped += 1;
                         continue;
                     }
-                    // The event was marked delivered when it was buffered, so a
-                    // failure here can't be recovered by re-deriving it. Keep it
-                    // buffered and retry on the next flush instead.
+                    // The event was recorded against the buffer's sink when it was
+                    // taken in, so a failure here can't be recovered by re-deriving
+                    // it. Keep it buffered and retry on the next flush; `fan_out`
+                    // marked whatever did land, so that retry skips those.
                     let (_, errors) = self.fan_out(&event, &targets).await;
                     if errors.is_empty() {
                         delivered += 1;
                     } else {
-                        warn!(dedup_key = %event.dedup_key, errors = ?errors, "deferred event failed to deliver; keeping it buffered");
+                        warn!(dedup_key = %event.dedup_key, errors = ?errors, "deferred event partially delivered; keeping it buffered for the rest");
                         keep.push(event);
                     }
                 }
@@ -737,6 +809,7 @@ mod tests {
     use crate::traits::{Destination, Source, StateStore};
     use async_trait::async_trait;
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
     use time::OffsetDateTime;
 
@@ -765,11 +838,15 @@ mod tests {
                 .insert(format!("{s}:{scope}"), b.to_vec());
             Ok(())
         }
-        async fn was_delivered(&self, k: &str) -> Result<bool, StateError> {
-            Ok(self.delivered.lock().unwrap().contains(k))
+        async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            Ok(self
+                .delivered
+                .lock()
+                .unwrap()
+                .contains(&format!("{k}@{sink}")))
         }
-        async fn mark_delivered(&self, k: &str) -> Result<(), StateError> {
-            self.delivered.lock().unwrap().insert(k.to_string());
+        async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
+            self.delivered.lock().unwrap().insert(format!("{k}@{sink}"));
             Ok(())
         }
         async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
@@ -801,11 +878,11 @@ mod tests {
         async fn put_snapshot(&self, s: &str, scope: &str, b: &[u8]) -> Result<(), StateError> {
             self.0.put_snapshot(s, scope, b).await
         }
-        async fn was_delivered(&self, k: &str) -> Result<bool, StateError> {
-            self.0.was_delivered(k).await
+        async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            self.0.was_delivered(k, sink).await
         }
-        async fn mark_delivered(&self, k: &str) -> Result<(), StateError> {
-            self.0.mark_delivered(k).await
+        async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
+            self.0.mark_delivered(k, sink).await
         }
         async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
             self.0.get_cursor(s, k).await
@@ -845,7 +922,9 @@ mod tests {
         sent: Mutex<Vec<String>>,
         /// Batches received via `send_digest` (each is the dedup keys in the batch).
         digests: Mutex<Vec<Vec<String>>>,
-        fail: bool,
+        /// Whether `send` errors. Settable mid-test so a destination can recover and
+        /// the retry behaviour after a partial failure can be observed.
+        fail: AtomicBool,
     }
     #[async_trait]
     impl Destination for MockDestination {
@@ -861,7 +940,7 @@ mod tests {
             event: &Event,
             _state: &dyn StateStore,
         ) -> Result<(), DestinationError> {
-            if self.fail {
+            if self.fail.load(Ordering::Relaxed) {
                 return Err(DestinationError::Delivery("boom".into()));
             }
             self.sent.lock().unwrap().push(event.dedup_key.clone());
@@ -872,7 +951,7 @@ mod tests {
             events: &[Event],
             _state: &dyn StateStore,
         ) -> Result<(), DestinationError> {
-            if self.fail {
+            if self.fail.load(Ordering::Relaxed) {
                 return Err(DestinationError::Delivery("boom".into()));
             }
             self.digests
@@ -990,7 +1069,7 @@ mod tests {
         ));
         assert!(destination.sent.lock().unwrap().is_empty());
         // Not marked delivered → a real run afterwards would still deliver.
-        assert!(!state.was_delivered("k1").await.unwrap());
+        assert!(!state.was_delivered("k1", "mock-notify").await.unwrap());
     }
 
     #[tokio::test]
@@ -1132,7 +1211,7 @@ mod tests {
     #[tokio::test]
     async fn deferred_event_that_fails_to_deliver_stays_buffered() {
         let dest = Arc::new(MockDestination {
-            fail: true,
+            fail: AtomicBool::new(true),
             ..Default::default()
         });
         let (engine, state) = engine_with(
@@ -1226,6 +1305,148 @@ mod tests {
         assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
     }
 
+    /// Build an engine fanning one event out to two destinations, with no routes
+    /// (so both receive everything).
+    fn engine_fanning_out(
+        a: Arc<MockDestination>,
+        b: Arc<MockDestination>,
+    ) -> (Engine, Arc<MemState>) {
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::ReviewRequested, "k1")],
+                ..Default::default()
+            })],
+            vec![a, b],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        );
+        (engine, state)
+    }
+
+    /// The bug this change fixes: with two destinations and one of them failing,
+    /// every later pass used to re-send to the one that had already succeeded.
+    #[tokio::test]
+    async fn partial_failure_retries_only_the_failed_destination() {
+        let good = Arc::new(MockDestination {
+            id: "good".into(),
+            ..Default::default()
+        });
+        let bad = Arc::new(MockDestination {
+            id: "bad".into(),
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let (engine, _state) = engine_fanning_out(good.clone(), bad.clone());
+
+        // Pass 1: good takes it, bad fails, so the event is not fully delivered.
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::DeliveryFailed { .. }
+        ));
+        assert_eq!(good.sent.lock().unwrap().as_slice(), &["k1".to_string()]);
+
+        // Pass 2: the source re-derives the event (the scope was held back). good
+        // must not hear about it a second time.
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::DeliveryFailed { .. }
+        ));
+        assert_eq!(
+            good.sent.lock().unwrap().len(),
+            1,
+            "a destination that already took the event must not be re-sent to"
+        );
+
+        // Pass 3: bad recovers and gets exactly one copy; good still has one.
+        bad.fail.store(false, Ordering::Relaxed);
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(
+            matches!(&r.records[0].outcome, EventOutcome::Delivered { to } if to == &["bad".to_string()]),
+            "only the destination that still needed it should be reported: {:?}",
+            r.records[0].outcome
+        );
+        assert_eq!(good.sent.lock().unwrap().len(), 1);
+        assert_eq!(bad.sent.lock().unwrap().as_slice(), &["k1".to_string()]);
+    }
+
+    /// Once every destination has it, the event is fully deduped again.
+    #[tokio::test]
+    async fn event_delivered_everywhere_is_already_delivered() {
+        let a = Arc::new(MockDestination {
+            id: "a".into(),
+            ..Default::default()
+        });
+        let b = Arc::new(MockDestination {
+            id: "b".into(),
+            ..Default::default()
+        });
+        let (engine, _state) = engine_fanning_out(a.clone(), b.clone());
+
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::Delivered { .. }
+        ));
+
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::AlreadyDelivered
+        ));
+        assert_eq!(a.sent.lock().unwrap().len(), 1);
+        assert_eq!(b.sent.lock().unwrap().len(), 1);
+    }
+
+    /// A deferred event released while one destination is down must not re-send to
+    /// the other when the flush retries. Same guarantee as the live path, on the
+    /// path added for quiet hours.
+    #[tokio::test]
+    async fn deferred_release_retries_only_the_failed_destination() {
+        let good = Arc::new(MockDestination {
+            id: "good".into(),
+            ..Default::default()
+        });
+        let bad = Arc::new(MockDestination {
+            id: "bad".into(),
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::ReviewRequested, "k1")],
+                ..Default::default()
+            })],
+            vec![good.clone(), bad.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        );
+
+        engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(good.sent.lock().unwrap().is_empty());
+
+        // First release: good takes it, bad fails, so it stays buffered for bad.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(good.sent.lock().unwrap().as_slice(), &["k1".to_string()]);
+        assert_eq!(buffered(&state).await, vec!["k1".to_string()]);
+
+        // Second release with bad still down: good must not get it again.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(good.sent.lock().unwrap().len(), 1);
+
+        // bad recovers: it gets one copy and the buffer finally empties.
+        bad.fail.store(false, Ordering::Relaxed);
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(good.sent.lock().unwrap().len(), 1);
+        assert_eq!(bad.sent.lock().unwrap().as_slice(), &["k1".to_string()]);
+        assert!(buffered(&state).await.is_empty());
+    }
+
     /// A transient store read must not be mistaken for an empty buffer: `enqueue`
     /// reads, appends and writes back, so treating a read failure as empty would
     /// overwrite everything held with the one event being added.
@@ -1234,7 +1455,6 @@ mod tests {
         let dest = Arc::new(MockDestination::default());
         let state = Arc::new(MemState::default());
 
-        // Hold two events with a healthy store.
         let engine = Engine::new(
             vec![Arc::new(MockSource {
                 events: vec![
@@ -1251,7 +1471,7 @@ mod tests {
         engine.run_once(INSIDE_WINDOW, false).await;
         assert_eq!(buffered(&state).await.len(), 2);
 
-        // Now a third event arrives while reads are failing.
+        // A third event arrives while reads are failing.
         let failing = Engine::new(
             vec![Arc::new(MockSource {
                 events: vec![ev(EventKind::ReviewRequested, "k3")],
@@ -1274,35 +1494,24 @@ mod tests {
         );
     }
 
-    /// If marking the event fails, it re-derives and reaches `enqueue` again.
-    /// Buffering it twice would mean two identical pings on release.
+    /// If marking the buffer's sink fails, the event re-derives and reaches
+    /// `enqueue` again. Buffering it twice would mean two identical pings on release.
     #[tokio::test]
     async fn buffering_the_same_event_twice_holds_one_copy() {
         let dest = Arc::new(MockDestination::default());
-        let (engine, state) = engine_with(
-            vec![ev(EventKind::ReviewRequested, "k1")],
-            quiet_rules(),
-            dest.clone(),
-        );
+        let (engine, state) = engine_with(vec![], quiet_rules(), dest.clone());
 
-        engine
-            .enqueue(
-                DEFERRED_SOURCE,
-                DEFERRED_SCOPE,
-                "deferred",
-                &ev(EventKind::ReviewRequested, "k1"),
-            )
-            .await
-            .unwrap();
-        engine
-            .enqueue(
-                DEFERRED_SOURCE,
-                DEFERRED_SCOPE,
-                "deferred",
-                &ev(EventKind::ReviewRequested, "k1"),
-            )
-            .await
-            .unwrap();
+        for _ in 0..2 {
+            engine
+                .enqueue(
+                    DEFERRED_SOURCE,
+                    DEFERRED_SCOPE,
+                    "deferred",
+                    &ev(EventKind::ReviewRequested, "k1"),
+                )
+                .await
+                .unwrap();
+        }
         assert_eq!(buffered(&state).await, vec!["k1".to_string()]);
 
         assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 1);
@@ -1360,7 +1569,6 @@ mod tests {
         )
         .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
 
-        // Buffered as a digest kind, as before.
         let r = engine.run_once(INSIDE_WINDOW, false).await;
         assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
 
@@ -1430,9 +1638,7 @@ mod tests {
         // The quiet one must still be buffered, not wiped with the batch.
         let left = engine.read_digest().await.unwrap();
         assert_eq!(
-            left.iter()
-                .map(|e| e.dedup_key.as_str())
-                .collect::<Vec<_>>(),
+            left.iter().map(|e| e.dedup_key.as_str()).collect::<Vec<_>>(),
             vec!["quiet1"]
         );
 
@@ -1867,7 +2073,7 @@ mod tests {
         let engine = Engine::new(
             vec![src.clone()],
             vec![Arc::new(MockDestination {
-                fail: true,
+                fail: AtomicBool::new(true),
                 ..Default::default()
             })],
             vec![],
@@ -1903,7 +2109,7 @@ mod tests {
     #[tokio::test]
     async fn failed_delivery_is_not_marked_delivered() {
         let destination = Arc::new(MockDestination {
-            fail: true,
+            fail: AtomicBool::new(true),
             ..Default::default()
         });
         let (engine, state) = engine_with(
@@ -1917,6 +2123,6 @@ mod tests {
             EventOutcome::DeliveryFailed { .. }
         ));
         // Must remain undelivered so the next pass retries.
-        assert!(!state.was_delivered("k1").await.unwrap());
+        assert!(!state.was_delivered("k1", "mock-notify").await.unwrap());
     }
 }
