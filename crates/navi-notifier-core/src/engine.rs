@@ -96,6 +96,11 @@ const DIGEST_SCOPE: &str = "pending";
 const DEFERRED_SOURCE: &str = "__deferred__";
 const DEFERRED_SCOPE: &str = "pending";
 
+/// Most events either buffer will hold. Generous enough that a normal quiet window
+/// never reaches it, low enough that a wedged destination can't grow one state row
+/// without limit. See [`Engine::enqueue`].
+const MAX_BUFFERED: usize = 1000;
+
 pub struct Engine {
     sources: Vec<Arc<dyn Source>>,
     destinations: Vec<Arc<dyn Destination>>,
@@ -396,26 +401,39 @@ impl Engine {
         (delivered_to, errors)
     }
 
-    /// The events currently sitting in one of the persisted buffers. A buffer that
-    /// can't be parsed is treated as empty rather than poisoning every later flush.
-    async fn read_buffer(&self, source: &str, scope: &str, label: &str) -> Vec<Event> {
-        match self.state.get_snapshot(source, scope).await {
-            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
-                Ok(events) => events,
-                Err(err) => {
-                    error!(%err, buffer = label, "buffer is unreadable; discarding it");
-                    Vec::new()
-                }
-            },
-            Ok(None) => Vec::new(),
-            Err(err) => {
-                warn!(%err, buffer = label, "could not read buffer; leaving it in place");
+    /// The events currently sitting in one of the persisted buffers.
+    ///
+    /// A payload that can't be parsed is treated as empty, since nothing can be
+    /// recovered from it. A *backend* failure is propagated instead: the two are not
+    /// interchangeable, because `enqueue` reads, appends and writes back, so
+    /// answering "empty" to a transient read error would overwrite the whole buffer
+    /// with the one event being added.
+    async fn read_buffer(
+        &self,
+        source: &str,
+        scope: &str,
+        label: &str,
+    ) -> Result<Vec<Event>, StateError> {
+        match self.state.get_snapshot(source, scope).await? {
+            Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|err| {
+                error!(%err, buffer = label, "buffer is unreadable; discarding it");
                 Vec::new()
-            }
+            })),
+            None => Ok(Vec::new()),
         }
     }
 
-    /// Append an event to one of the persisted buffers.
+    /// Append an event to one of the persisted buffers, unless it is already there.
+    ///
+    /// Idempotent on `dedup_key`, because the caller marks the event delivered only
+    /// after this succeeds: if that mark fails, the event re-derives next pass and
+    /// arrives here a second time. Appending it twice would mean two identical pings
+    /// on release.
+    ///
+    /// Capped, because the buffer is one state row rewritten in full on every
+    /// append. Over a long window with a wedged destination it would otherwise grow
+    /// without bound, and quadratically in write cost. At the cap the oldest event
+    /// is dropped, which is a loss, but a bounded one that is loudly logged.
     async fn enqueue(
         &self,
         source: &str,
@@ -423,8 +441,21 @@ impl Engine {
         label: &str,
         event: &Event,
     ) -> Result<(), StateError> {
-        let mut pending = self.read_buffer(source, scope, label).await;
+        let mut pending = self.read_buffer(source, scope, label).await?;
+        if pending.iter().any(|e| e.dedup_key == event.dedup_key) {
+            debug!(dedup_key = %event.dedup_key, buffer = label, "already buffered");
+            return Ok(());
+        }
         pending.push(event.clone());
+        while pending.len() > MAX_BUFFERED {
+            let dropped = pending.remove(0);
+            error!(
+                dedup_key = %dropped.dedup_key,
+                buffer = label,
+                cap = MAX_BUFFERED,
+                "buffer is full; dropping the oldest held event"
+            );
+        }
         self.write_buffer(source, scope, &pending).await
     }
 
@@ -440,7 +471,7 @@ impl Engine {
     }
 
     /// The events currently buffered for the next digest flush.
-    async fn read_digest(&self) -> Vec<Event> {
+    async fn read_digest(&self) -> Result<Vec<Event>, StateError> {
         self.read_buffer(DIGEST_SOURCE, DIGEST_SCOPE, "digest")
             .await
     }
@@ -462,8 +493,32 @@ impl Engine {
     /// digest interval. Returns how many events were flushed. If any destination
     /// fails, the buffer is kept for the next interval (which may re-send to
     /// destinations that already succeeded - acceptable for a low-priority digest).
-    pub async fn flush_digest(&self) -> usize {
-        let pending = self.read_digest().await;
+    ///
+    /// Events a deferring rule currently holds back are left in the buffer, so a
+    /// digest never breaks a quiet window. Without that, batching a kind would opt
+    /// it out of quiet hours: the flush runs on its own interval and would happily
+    /// fire at 02:00.
+    pub async fn flush_digest(&self, ctx: &FilterContext) -> usize {
+        let buffered = match self.read_digest().await {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(%err, "could not read the digest buffer; leaving it in place");
+                return 0;
+            }
+        };
+        if buffered.is_empty() {
+            return 0;
+        }
+        let held = buffered.len();
+        let (pending, hold): (Vec<Event>, Vec<Event>) = buffered
+            .into_iter()
+            .partition(|e| !matches!(self.rules.decide(e, ctx), Decision::Defer(_)));
+        if !hold.is_empty() {
+            debug!(
+                count = hold.len(),
+                "holding digest events inside a quiet window"
+            );
+        }
         if pending.is_empty() {
             return 0;
         }
@@ -487,13 +542,18 @@ impl Engine {
         if !all_ok {
             return 0;
         }
-        // If the buffer can't be cleared, don't report success: the events are still
-        // buffered and would re-send next flush, so surface it as a non-clean flush.
-        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
+        // If the buffer can't be rewritten, don't report success: the events are
+        // still buffered and would re-send next flush, so surface it as a non-clean
+        // flush. What was held back for quiet hours stays.
+        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &hold).await {
             warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
             return 0;
         }
-        info!(count = pending.len(), "digest flushed");
+        info!(
+            count = pending.len(),
+            held = held - pending.len(),
+            "digest flushed"
+        );
         pending.len()
     }
 
@@ -510,9 +570,16 @@ impl Engine {
     ///
     /// Returns how many events were delivered.
     pub async fn flush_deferred(&self, ctx: &FilterContext) -> usize {
-        let pending = self
+        let pending = match self
             .read_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred")
-            .await;
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(%err, "could not read the deferred buffer; leaving it in place");
+                return 0;
+            }
+        };
         if pending.is_empty() {
             return 0;
         }
@@ -559,7 +626,11 @@ impl Engine {
                 .write_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, &keep)
                 .await
             {
+                // Same contract as `flush_digest`: the events did send, but they are
+                // still in the buffer and will send again, so this is not a clean
+                // flush and the caller must not report it as one.
                 error!(%err, "deferred events were released but the buffer could not be updated; they may re-send");
+                return 0;
             }
             info!(
                 delivered,
@@ -639,6 +710,32 @@ mod tests {
                 .unwrap()
                 .insert(format!("{s}:{k}"), v.to_string());
             Ok(())
+        }
+    }
+
+    /// Wraps a store and fails every `get_snapshot`, to exercise the difference
+    /// between "buffer is empty" and "the store could not be read".
+    struct ReadFails(Arc<MemState>);
+
+    #[async_trait]
+    impl StateStore for ReadFails {
+        async fn get_snapshot(&self, _: &str, _: &str) -> Result<Option<Vec<u8>>, StateError> {
+            Err(StateError::Backend("database is locked".into()))
+        }
+        async fn put_snapshot(&self, s: &str, scope: &str, b: &[u8]) -> Result<(), StateError> {
+            self.0.put_snapshot(s, scope, b).await
+        }
+        async fn was_delivered(&self, k: &str) -> Result<bool, StateError> {
+            self.0.was_delivered(k).await
+        }
+        async fn mark_delivered(&self, k: &str) -> Result<(), StateError> {
+            self.0.mark_delivered(k).await
+        }
+        async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
+            self.0.get_cursor(s, k).await
+        }
+        async fn put_cursor(&self, s: &str, k: &str, v: &str) -> Result<(), StateError> {
+            self.0.put_cursor(s, k, v).await
         }
     }
 
@@ -729,6 +826,13 @@ mod tests {
             excerpt: None,
             dedup_key: key.into(),
         }
+    }
+
+    /// Like [`ev`], but in a named repo, so per-repo rule overrides can be exercised.
+    fn ev_in(kind: EventKind, owner: &str, name: &str, key: &str) -> Event {
+        let mut e = ev(kind, key);
+        e.pull_request.repo = Repo::new(owner, name);
+        e
     }
 
     fn engine_with(
@@ -839,7 +943,7 @@ mod tests {
         assert!(dest.digests.lock().unwrap().is_empty(), "not flushed yet");
 
         // Flushing sends the batch via send_digest, once.
-        let flushed = engine.flush_digest().await;
+        let flushed = engine.flush_digest(&FilterContext::default()).await;
         assert_eq!(flushed, 1);
         assert_eq!(
             dest.digests.lock().unwrap().as_slice(),
@@ -847,7 +951,7 @@ mod tests {
         );
 
         // A second flush finds an empty buffer and does nothing.
-        assert_eq!(engine.flush_digest().await, 0);
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await, 0);
         assert_eq!(dest.digests.lock().unwrap().len(), 1);
     }
 
@@ -1044,6 +1148,224 @@ mod tests {
             EventOutcome::Suppressed(DropReason::EventKindDisabled)
         ));
         assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+    }
+
+    /// A transient store read must not be mistaken for an empty buffer: `enqueue`
+    /// reads, appends and writes back, so treating a read failure as empty would
+    /// overwrite everything held with the one event being added.
+    #[tokio::test]
+    async fn a_read_failure_does_not_clobber_the_buffer() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+
+        // Hold two events with a healthy store.
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![
+                    ev(EventKind::ReviewRequested, "k1"),
+                    ev(EventKind::Mentioned, "k2"),
+                ],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        );
+        engine.run_once(INSIDE_WINDOW, false).await;
+        assert_eq!(buffered(&state).await.len(), 2);
+
+        // Now a third event arrives while reads are failing.
+        let failing = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::ReviewRequested, "k3")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            Arc::new(ReadFails(state.clone())),
+        );
+        let r = failing.run_once(INSIDE_WINDOW, false).await;
+        assert!(
+            matches!(r.records[0].outcome, EventOutcome::DeliveryFailed { .. }),
+            "a read failure must surface, so the scope is held back and re-derives"
+        );
+        assert_eq!(
+            buffered(&state).await,
+            vec!["k1".to_string(), "k2".to_string()],
+            "the held events must survive a failed enqueue"
+        );
+    }
+
+    /// If marking the event fails, it re-derives and reaches `enqueue` again.
+    /// Buffering it twice would mean two identical pings on release.
+    #[tokio::test]
+    async fn buffering_the_same_event_twice_holds_one_copy() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            quiet_rules(),
+            dest.clone(),
+        );
+
+        engine
+            .enqueue(
+                DEFERRED_SOURCE,
+                DEFERRED_SCOPE,
+                "deferred",
+                &ev(EventKind::ReviewRequested, "k1"),
+            )
+            .await
+            .unwrap();
+        engine
+            .enqueue(
+                DEFERRED_SOURCE,
+                DEFERRED_SCOPE,
+                "deferred",
+                &ev(EventKind::ReviewRequested, "k1"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(buffered(&state).await, vec!["k1".to_string()]);
+
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(dest.sent.lock().unwrap().len(), 1, "one ping, not two");
+    }
+
+    /// A wedged destination plus a long window must not grow one state row for ever.
+    #[tokio::test]
+    async fn the_buffer_is_capped() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, state) = engine_with(vec![], quiet_rules(), dest);
+
+        // Seeded directly: appending one at a time rewrites the whole row each
+        // time, which is exactly the cost the cap exists to bound.
+        let seed: Vec<Event> = (0..MAX_BUFFERED)
+            .map(|i| ev(EventKind::Mentioned, &format!("k{i}")))
+            .collect();
+        engine
+            .write_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, &seed)
+            .await
+            .unwrap();
+        for i in MAX_BUFFERED..(MAX_BUFFERED + 5) {
+            engine
+                .enqueue(
+                    DEFERRED_SOURCE,
+                    DEFERRED_SCOPE,
+                    "deferred",
+                    &ev(EventKind::Mentioned, &format!("k{i}")),
+                )
+                .await
+                .unwrap();
+        }
+        let held = buffered(&state).await;
+        assert_eq!(held.len(), MAX_BUFFERED);
+        // The oldest went, the newest stayed.
+        assert_eq!(held.first().unwrap(), "k5");
+        assert_eq!(held.last().unwrap(), &format!("k{}", MAX_BUFFERED + 4));
+    }
+
+    /// Batching a kind must not opt it out of quiet hours. The digest flush runs on
+    /// its own interval, so without this it would fire inside the window.
+    #[tokio::test]
+    async fn digest_does_not_flush_inside_a_quiet_window() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        // Buffered as a digest kind, as before.
+        let r = engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
+
+        // A flush inside the window sends nothing and keeps the batch.
+        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await, 0);
+        assert!(
+            dest.digests.lock().unwrap().is_empty(),
+            "a digest must not break the quiet window"
+        );
+
+        // Once the window is over it goes out, exactly once.
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().as_slice(),
+            &[vec!["k1".to_string()]]
+        );
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 0);
+    }
+
+    /// A flush that sends some of the buffer and holds the rest must write back what
+    /// it held, not clear the row. A per-repo override makes one event deliverable
+    /// and the other quiet at the same instant.
+    #[tokio::test]
+    async fn a_partial_digest_flush_keeps_the_held_events() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let rules = RuleConfig {
+            quiet_hours: crate::config::QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            overrides: vec![crate::config::RuleOverride {
+                repos: vec!["loud/*".into()],
+                quiet_hours: crate::config::QuietHoursOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![
+                    ev_in(EventKind::Mentioned, "loud", "repo", "loud1"),
+                    ev_in(EventKind::Mentioned, "quiet", "repo", "quiet1"),
+                ],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // Inside the window: only the override'd repo's event goes out.
+        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().as_slice(),
+            &[vec!["loud1".to_string()]]
+        );
+
+        // The quiet one must still be buffered, not wiped with the batch.
+        let left = engine.read_digest().await.unwrap();
+        assert_eq!(
+            left.iter()
+                .map(|e| e.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["quiet1"]
+        );
+
+        // And it goes out once the window ends.
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().last().unwrap(),
+            &vec!["quiet1".to_string()]
+        );
     }
 
     #[tokio::test]

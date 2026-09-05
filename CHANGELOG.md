@@ -10,6 +10,8 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 
 - **core:** hold events that land during quiet hours and deliver them once the
   window ends, instead of dropping them for good
+- **core:** hold the digest inside a quiet window too, so batching a kind no
+  longer opts it out of quiet hours
 
 ## 0.3.3
 
