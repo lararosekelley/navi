@@ -4,6 +4,13 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.3
+
+### Changed
+
+- **readme:** sync with the current CLI and config surface, trim prose
+- **code:** remove em dashes that crept back into comments
+
 ## 0.3.2
 
 ### Changed
