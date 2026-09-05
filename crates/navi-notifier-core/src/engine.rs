@@ -292,9 +292,22 @@ impl Engine {
         let target_ids: Vec<String> = targets.iter().map(|n| n.id().to_string()).collect();
 
         if dry_run {
-            let outcome = match deferred {
-                Some(reason) => EventOutcome::WouldDefer(reason),
-                None => EventOutcome::WouldDeliver { to: target_ids },
+            if let Some(reason) = deferred {
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::WouldDefer(reason),
+                };
+            }
+            // Ask the same dedup question the live path asks below, or the preview
+            // claims it would send things every destination already has. Sources
+            // legitimately re-derive delivered events every pass - the GitLab todos
+            // feed has no snapshot at all - so without this a dry run against a live
+            // database reports the entire backlog as outgoing.
+            let outcome = match self.undelivered_targets(&event, targets).await {
+                Ok(pending) if pending.is_empty() && !targets.is_empty() => {
+                    EventOutcome::AlreadyDelivered
+                }
+                _ => EventOutcome::WouldDeliver { to: target_ids },
             };
             return EventRecord { event, outcome };
         }
@@ -585,9 +598,9 @@ impl Engine {
     /// by the daemon on the digest interval, and again on the next poll pass if a
     /// quiet window held everything back (see [`DigestFlush::starts_next_interval`]).
     ///
-    /// If any destination fails, the batch is kept and retried on the next interval,
-    /// which may re-send to destinations that already succeeded - acceptable for a
-    /// low-priority path.
+    /// If any destination fails, the batch is kept and retried on the next interval;
+    /// the per-destination dedup sinks mean that retry only reaches the destinations
+    /// that actually missed it.
     ///
     /// Events a deferring rule currently holds back are left in the buffer, so a
     /// digest never breaks a quiet window. Without that, batching a kind would opt
@@ -643,18 +656,54 @@ impl Engine {
         }
 
         let mut all_ok = true;
+        // Keys that reached at least one destination, so the return value counts
+        // what was actually sent rather than what happened to be in the buffer.
+        let mut sent: HashSet<String> = HashSet::new();
         for dest in &self.destinations {
-            let batch: Vec<Event> = pending
-                .iter()
-                .filter(|e| self.destinations_for(e).iter().any(|d| d.id() == dest.id()))
-                .cloned()
-                .collect();
+            // Routed here, and not already sent here. The second half matters
+            // because the digest branch runs ahead of the per-destination dedup
+            // check: an event delivered live, then added to `digest.kinds` by the
+            // user, re-derives and buffers with only its `__digest__` sink marked.
+            // Without this filter the flush would send it a second time.
+            let mut batch = Vec::new();
+            for event in &pending {
+                if !self
+                    .destinations_for(event)
+                    .iter()
+                    .any(|d| d.id() == dest.id())
+                {
+                    continue;
+                }
+                match self.state.was_delivered(&event.dedup_key, dest.id()).await {
+                    Ok(false) => batch.push(event.clone()),
+                    Ok(true) => {}
+                    Err(err) => {
+                        // Fail safe: skip it this flush rather than risk a duplicate.
+                        warn!(dedup_key = %event.dedup_key, %err, "dedup check failed for the digest");
+                        all_ok = false;
+                    }
+                }
+            }
             if batch.is_empty() {
                 continue;
             }
-            if let Err(err) = dest.send_digest(&batch, self.state.as_ref()).await {
-                error!(destination = dest.id(), %err, "digest flush failed");
-                all_ok = false;
+            match dest.send_digest(&batch, self.state.as_ref()).await {
+                Ok(()) => {
+                    // Recorded per destination as the live path does, so a retry
+                    // after another destination fails doesn't re-send this batch.
+                    for event in &batch {
+                        if let Err(err) =
+                            self.state.mark_delivered(&event.dedup_key, dest.id()).await
+                        {
+                            warn!(dedup_key = %event.dedup_key, destination = dest.id(), %err, "digest sent but the dedup key did not persist");
+                        }
+                        sent.insert(event.dedup_key.clone());
+                    }
+                }
+                Err(err) => {
+                    error!(destination = dest.id(), %err, "digest flush failed");
+                    all_ok = false;
+                }
             }
         }
 
@@ -677,13 +726,16 @@ impl Engine {
             };
         }
         info!(
-            count = pending.len(),
+            count = sent.len(),
             held = hold.len(),
             dropped,
             "digest flushed"
         );
+        // `sent`, not `pending`: an event every routed destination already had is
+        // dropped from the batch, so counting the buffer would report a send that
+        // never happened.
         DigestFlush {
-            sent: pending.len(),
+            sent: sent.len(),
             held: hold.len(),
             failed: false,
         }
@@ -1638,7 +1690,9 @@ mod tests {
         // The quiet one must still be buffered, not wiped with the batch.
         let left = engine.read_digest().await.unwrap();
         assert_eq!(
-            left.iter().map(|e| e.dedup_key.as_str()).collect::<Vec<_>>(),
+            left.iter()
+                .map(|e| e.dedup_key.as_str())
+                .collect::<Vec<_>>(),
             vec!["quiet1"]
         );
 
@@ -1647,6 +1701,130 @@ mod tests {
         assert_eq!(
             dest.digests.lock().unwrap().last().unwrap(),
             &vec!["quiet1".to_string()]
+        );
+    }
+
+    /// A dry run must answer the same dedup question the live pass answers. Sources
+    /// re-derive delivered events every poll, so without this the preview reports a
+    /// whole backlog as outgoing.
+    #[tokio::test]
+    async fn dry_run_reports_already_delivered() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, _state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            RuleConfig::default(),
+            dest.clone(),
+        );
+
+        // Deliver for real, then preview the same event again.
+        assert_eq!(
+            engine
+                .run_once(FilterContext::default(), false)
+                .await
+                .delivered_count(),
+            1
+        );
+        let r = engine.run_once(FilterContext::default(), true).await;
+        assert!(
+            matches!(r.records[0].outcome, EventOutcome::AlreadyDelivered),
+            "preview must not claim it would re-send: {:?}",
+            r.records[0].outcome
+        );
+        assert_eq!(dest.sent.lock().unwrap().len(), 1);
+    }
+
+    /// Turning on `digest.kinds` for a kind already delivered live must not re-notify
+    /// when the re-derived event lands in the digest buffer.
+    #[tokio::test]
+    async fn digest_does_not_resend_what_was_already_delivered() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let events = vec![ev(EventKind::Mentioned, "k1")];
+
+        // Delivered live first.
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: events.clone(),
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        );
+        assert_eq!(
+            engine
+                .run_once(FilterContext::default(), false)
+                .await
+                .delivered_count(),
+            1
+        );
+
+        // The user now batches that kind; the source re-derives the same event.
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events,
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(FilterContext::default(), false).await;
+
+        // The flush must find nothing left to send to a destination that has it.
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
+        assert!(
+            dest.digests.lock().unwrap().is_empty(),
+            "already-delivered event must not come back as a digest"
+        );
+        assert_eq!(dest.sent.lock().unwrap().len(), 1);
+    }
+
+    /// A digest that reaches one destination and fails at another must not re-send
+    /// to the first when the buffer is retried.
+    #[tokio::test]
+    async fn digest_retry_skips_destinations_that_got_the_batch() {
+        let good = Arc::new(MockDestination {
+            id: "good".into(),
+            ..Default::default()
+        });
+        let bad = Arc::new(MockDestination {
+            id: "bad".into(),
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![good.clone(), bad.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(FilterContext::default(), false).await;
+
+        // First flush: good takes the batch, bad fails, so the buffer is kept.
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
+        assert_eq!(good.digests.lock().unwrap().len(), 1);
+
+        // Retry with bad still down: good must not get the batch again.
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
+        assert_eq!(good.digests.lock().unwrap().len(), 1);
+
+        // bad recovers and gets it once.
+        bad.fail.store(false, Ordering::Relaxed);
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 1);
+        assert_eq!(good.digests.lock().unwrap().len(), 1);
+        assert_eq!(
+            bad.digests.lock().unwrap().as_slice(),
+            &[vec!["k1".to_string()]]
         );
     }
 
@@ -1823,9 +2001,8 @@ mod tests {
         )
         .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
 
-        let flush = engine.flush_digest(&FilterContext::default()).await;
         assert_eq!(
-            flush,
+            engine.flush_digest(&FilterContext::default()).await,
             DigestFlush::default(),
             "muted event must not be sent"
         );
