@@ -149,8 +149,16 @@ fn filter_context(config: &Config) -> FilterContext {
 async fn cmd_once(config_path: &Path, dry_run: bool) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
     let engine = open_engine(&config).await?;
-    let report = engine.run_once(filter_context(&config), dry_run).await;
+    let ctx = filter_context(&config);
+    let report = engine.run_once(ctx, dry_run).await;
     print_report(&report, dry_run);
+    // A dry run advances nothing, so it must not release the buffer either.
+    if !dry_run {
+        let released = engine.flush_deferred(&ctx).await;
+        if released > 0 {
+            println!("  released {released} event(s) held by quiet hours");
+        }
+    }
     Ok(())
 }
 
@@ -197,6 +205,12 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
                 "poll pass timed out; abandoning it and retrying next interval"
             ),
         }
+
+        // Release anything quiet hours held once the window has passed. Checked
+        // every pass rather than on a cadence of its own: the buffer read is cheap
+        // when empty, and this bounds the delay after the window ends to one poll
+        // interval.
+        engine.flush_deferred(&filter_context(&config)).await;
 
         // Flush the digest on its own cadence, independent of the poll interval.
         if config.digest.enabled && last_digest.elapsed() >= digest_interval {
@@ -248,6 +262,10 @@ fn print_report(report: &RunReport, dry_run: bool) {
             EventOutcome::Suppressed(reason) => format!("suppressed ({reason:?})"),
             EventOutcome::AlreadyDelivered => "already delivered".to_string(),
             EventOutcome::Digested => "digested (batched for the next flush)".to_string(),
+            EventOutcome::Deferred(reason) => {
+                format!("deferred ({reason:?}); will send when the window ends")
+            }
+            EventOutcome::WouldDefer(reason) => format!("WOULD defer ({reason:?})"),
             EventOutcome::DeliveryFailed { errors } => format!("FAILED: {}", errors.join("; ")),
         };
         println!("  {head:<40} {outcome}");
@@ -430,6 +448,8 @@ allow = []
 deny = []
 
 [rules.quiet_hours]
+# Events that land inside this window are held, not dropped: they are delivered
+# once the window ends. Nothing is lost to the night.
 enabled = false
 start = "22:00"
 end = "08:00"

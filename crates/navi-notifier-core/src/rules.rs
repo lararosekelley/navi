@@ -24,7 +24,6 @@ pub enum DropReason {
     RepoFiltered,
     AuthorMuted,
     Muted,
-    QuietHours,
     MergeCloseScope,
     /// Routes are configured, but none cover this event's repo.
     NoMatchingRoute,
@@ -35,6 +34,18 @@ pub enum DropReason {
 pub enum Decision {
     Deliver,
     Drop(DropReason),
+    /// Hold the event back for now and re-decide later, rather than discarding it.
+    /// Quiet hours is the only rule that defers: the user wants silence for a
+    /// window, not to lose what happened during it.
+    Defer(DeferReason),
+}
+
+/// Why an event was held back. Surfaced the same way [`DropReason`] is, so
+/// `--dry-run` can tell "you won't hear about this" from "you'll hear about this
+/// later".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeferReason {
+    QuietHours,
 }
 
 /// A mute rule compiled once when the engine is built: one or more conditions, all
@@ -259,8 +270,12 @@ impl RuleEngine {
             }
         }
 
+        // Deliberately last: an event that any other rule would drop is dropped, not
+        // deferred, so the quiet-hours buffer only ever holds events the user
+        // actually wants. It is re-decided on flush, so a rule change made during
+        // the window still applies when it comes back out.
         if self.in_quiet_hours(ovr, ctx) {
-            return Decision::Drop(DropReason::QuietHours);
+            return Decision::Defer(DeferReason::QuietHours);
         }
 
         Decision::Deliver
@@ -612,7 +627,7 @@ mod tests {
         };
         assert_eq!(
             engine.decide(&e, &ctx),
-            Decision::Drop(DropReason::QuietHours)
+            Decision::Defer(DeferReason::QuietHours)
         );
         // 12:00 is outside it.
         let ctx = FilterContext {
@@ -770,10 +785,10 @@ mod tests {
             engine.decide(&event_in(EventKind::Mentioned, "acme", "widgets"), &ctx),
             Decision::Deliver
         );
-        // Elsewhere the global quiet window suppresses it.
+        // Elsewhere the global quiet window defers it.
         assert_eq!(
             engine.decide(&event_in(EventKind::Mentioned, "other", "thing"), &ctx),
-            Decision::Drop(DropReason::QuietHours)
+            Decision::Defer(DeferReason::QuietHours)
         );
     }
 }

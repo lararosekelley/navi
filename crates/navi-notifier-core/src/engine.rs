@@ -13,7 +13,7 @@ use tracing::{debug, error, info, warn};
 use crate::config::pattern_matches;
 use crate::error::{SourceError, StateError};
 use crate::model::Event;
-use crate::rules::{Decision, DropReason, FilterContext, RuleEngine};
+use crate::rules::{Decision, DeferReason, DropReason, FilterContext, RuleEngine};
 use crate::traits::{Destination, Source, StateStore};
 
 /// Connects a source to a destination, optionally scoped to certain repos. If a
@@ -47,6 +47,10 @@ pub enum EventOutcome {
     AlreadyDelivered,
     /// Buffered into the periodic digest instead of delivered now.
     Digested,
+    /// Held back by a deferring rule (quiet hours) and buffered for release once
+    /// that rule stops applying. Unlike [`EventOutcome::Suppressed`], the event is
+    /// not lost.
+    Deferred(DeferReason),
     DeliveryFailed {
         errors: Vec<String>,
     },
@@ -54,6 +58,8 @@ pub enum EventOutcome {
     WouldDeliver {
         to: Vec<String>,
     },
+    /// Would have been deferred, but this was a dry run.
+    WouldDefer(DeferReason),
 }
 
 /// Per-event record pairing the event with its outcome.
@@ -83,6 +89,12 @@ impl RunReport {
 /// State-store keys under which the pending digest is buffered.
 const DIGEST_SOURCE: &str = "__digest__";
 const DIGEST_SCOPE: &str = "pending";
+
+/// State-store keys under which deferred (quiet-hours) events are buffered. A
+/// separate bucket from the digest: these are ordinary alerts waiting for the
+/// window to end, not events the user asked to have batched.
+const DEFERRED_SOURCE: &str = "__deferred__";
+const DEFERRED_SCOPE: &str = "pending";
 
 pub struct Engine {
     sources: Vec<Arc<dyn Source>>,
@@ -219,14 +231,20 @@ impl Engine {
         ctx: &FilterContext,
         dry_run: bool,
     ) -> EventRecord {
-        // 1. Rule filter.
-        if let Decision::Drop(reason) = self.rules.decide(&event, ctx) {
-            debug!(dedup_key = %event.dedup_key, ?reason, "event suppressed");
-            return EventRecord {
-                event,
-                outcome: EventOutcome::Suppressed(reason),
-            };
-        }
+        // 1. Rule filter. A Defer is carried past the routing checks rather than
+        // acted on here: there is no point buffering an event that dedup already
+        // covers, or that no route would ever deliver.
+        let deferred = match self.rules.decide(&event, ctx) {
+            Decision::Deliver => None,
+            Decision::Drop(reason) => {
+                debug!(dedup_key = %event.dedup_key, ?reason, "event suppressed");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::Suppressed(reason),
+                };
+            }
+            Decision::Defer(reason) => Some(reason),
+        };
 
         // 2. Dedup: never ping twice for the same underlying action.
         match self.state.was_delivered(&event.dedup_key).await {
@@ -253,10 +271,11 @@ impl Engine {
         let target_ids: Vec<String> = targets.iter().map(|n| n.id().to_string()).collect();
 
         if dry_run {
-            return EventRecord {
-                event,
-                outcome: EventOutcome::WouldDeliver { to: target_ids },
+            let outcome = match deferred {
+                Some(reason) => EventOutcome::WouldDefer(reason),
+                None => EventOutcome::WouldDeliver { to: target_ids },
             };
+            return EventRecord { event, outcome };
         }
 
         if targets.is_empty() {
@@ -281,6 +300,10 @@ impl Engine {
 
         // Digest kinds are buffered for the periodic flush rather than sent now.
         // Marked delivered so they don't re-derive; the flush handles routing.
+        // Checked before the quiet-hours buffer below: a kind the user chose to
+        // batch is already deferred by their own choice, so it keeps the digest's
+        // cadence rather than being double-handled. (The digest flush itself still
+        // ignores quiet hours; that predates this and is left alone.)
         if self.digest_kinds.contains(event.kind.tag()) {
             if let Err(err) = self.enqueue_digest(&event).await {
                 warn!(dedup_key = %event.dedup_key, %err, "failed to buffer digest event");
@@ -300,18 +323,33 @@ impl Engine {
             };
         }
 
-        // 3. Deliver to every routed destination.
-        let mut errors = Vec::new();
-        let mut delivered_to = Vec::new();
-        for destination in targets {
-            match destination.send(&event, self.state.as_ref()).await {
-                Ok(()) => delivered_to.push(destination.id().to_string()),
-                Err(err) => {
-                    error!(destination = destination.id(), %err, "delivery failed");
-                    errors.push(format!("{}: {err}", destination.id()));
-                }
+        // 3. Quiet hours: buffer for release rather than discard. Marked delivered
+        // so the snapshot may advance without the event re-deriving every pass;
+        // the buffer, not the snapshot, is what holds it now. Buffering before
+        // marking means a failure here leaves the event to be re-derived next pass
+        // rather than losing it.
+        if let Some(reason) = deferred {
+            if let Err(err) = self.enqueue_deferred(&event).await {
+                warn!(dedup_key = %event.dedup_key, %err, "failed to buffer deferred event");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::DeliveryFailed {
+                        errors: vec![format!("defer buffer: {err}")],
+                    },
+                };
             }
+            if let Err(err) = self.state.mark_delivered(&event.dedup_key).await {
+                warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
+            }
+            debug!(dedup_key = %event.dedup_key, ?reason, "event deferred");
+            return EventRecord {
+                event,
+                outcome: EventOutcome::Deferred(reason),
+            };
         }
+
+        // 4. Deliver to every routed destination.
+        let (delivered_to, errors) = self.fan_out(&event, targets).await;
 
         // Only consider the event delivered (and advance provider cursors) if every
         // routed destination succeeded. A partial failure stays undelivered so the next
@@ -336,22 +374,86 @@ impl Engine {
         }
     }
 
-    /// The events currently buffered for the next digest flush.
-    async fn read_digest(&self) -> Result<Vec<Event>, StateError> {
-        match self.state.get_snapshot(DIGEST_SOURCE, DIGEST_SCOPE).await? {
-            Some(bytes) => serde_json::from_slice(&bytes)
-                .map_err(|e| StateError::Serde(format!("digest buffer: {e}"))),
-            None => Ok(Vec::new()),
+    /// Send one event to every routed destination, returning the ids that took it
+    /// and the errors from those that didn't. Shared by the live path and the
+    /// deferred flush so both fan out identically.
+    async fn fan_out(
+        &self,
+        event: &Event,
+        targets: &[Arc<dyn Destination>],
+    ) -> (Vec<String>, Vec<String>) {
+        let mut delivered_to = Vec::new();
+        let mut errors = Vec::new();
+        for destination in targets {
+            match destination.send(event, self.state.as_ref()).await {
+                Ok(()) => delivered_to.push(destination.id().to_string()),
+                Err(err) => {
+                    error!(destination = destination.id(), %err, "delivery failed");
+                    errors.push(format!("{}: {err}", destination.id()));
+                }
+            }
         }
+        (delivered_to, errors)
+    }
+
+    /// The events currently sitting in one of the persisted buffers. A buffer that
+    /// can't be parsed is treated as empty rather than poisoning every later flush.
+    async fn read_buffer(&self, source: &str, scope: &str, label: &str) -> Vec<Event> {
+        match self.state.get_snapshot(source, scope).await {
+            Ok(Some(bytes)) => match serde_json::from_slice(&bytes) {
+                Ok(events) => events,
+                Err(err) => {
+                    error!(%err, buffer = label, "buffer is unreadable; discarding it");
+                    Vec::new()
+                }
+            },
+            Ok(None) => Vec::new(),
+            Err(err) => {
+                warn!(%err, buffer = label, "could not read buffer; leaving it in place");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Append an event to one of the persisted buffers.
+    async fn enqueue(
+        &self,
+        source: &str,
+        scope: &str,
+        label: &str,
+        event: &Event,
+    ) -> Result<(), StateError> {
+        let mut pending = self.read_buffer(source, scope, label).await;
+        pending.push(event.clone());
+        self.write_buffer(source, scope, &pending).await
+    }
+
+    /// Overwrite one of the persisted buffers with `events`.
+    async fn write_buffer(
+        &self,
+        source: &str,
+        scope: &str,
+        events: &[Event],
+    ) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(events).map_err(|e| StateError::Serde(e.to_string()))?;
+        self.state.put_snapshot(source, scope, &bytes).await
+    }
+
+    /// The events currently buffered for the next digest flush.
+    async fn read_digest(&self) -> Vec<Event> {
+        self.read_buffer(DIGEST_SOURCE, DIGEST_SCOPE, "digest")
+            .await
     }
 
     /// Append an event to the persisted digest buffer.
     async fn enqueue_digest(&self, event: &Event) -> Result<(), StateError> {
-        let mut pending = self.read_digest().await?;
-        pending.push(event.clone());
-        let bytes = serde_json::to_vec(&pending).map_err(|e| StateError::Serde(e.to_string()))?;
-        self.state
-            .put_snapshot(DIGEST_SOURCE, DIGEST_SCOPE, &bytes)
+        self.enqueue(DIGEST_SOURCE, DIGEST_SCOPE, "digest", event)
+            .await
+    }
+
+    /// Append an event to the persisted deferred (quiet-hours) buffer.
+    async fn enqueue_deferred(&self, event: &Event) -> Result<(), StateError> {
+        self.enqueue(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred", event)
             .await
     }
 
@@ -361,13 +463,7 @@ impl Engine {
     /// fails, the buffer is kept for the next interval (which may re-send to
     /// destinations that already succeeded - acceptable for a low-priority digest).
     pub async fn flush_digest(&self) -> usize {
-        let pending = match self.read_digest().await {
-            Ok(p) => p,
-            Err(err) => {
-                warn!(%err, "could not read digest buffer; leaving it in place");
-                return 0;
-            }
-        };
+        let pending = self.read_digest().await;
         if pending.is_empty() {
             return 0;
         }
@@ -393,16 +489,86 @@ impl Engine {
         }
         // If the buffer can't be cleared, don't report success: the events are still
         // buffered and would re-send next flush, so surface it as a non-clean flush.
-        if let Err(err) = self
-            .state
-            .put_snapshot(DIGEST_SOURCE, DIGEST_SCOPE, b"[]")
-            .await
-        {
+        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
             warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
             return 0;
         }
         info!(count = pending.len(), "digest flushed");
         pending.len()
+    }
+
+    /// Release events held by a deferring rule (quiet hours) now that the rule may
+    /// no longer apply. Called by the daemon each pass; cheap when the buffer is
+    /// empty.
+    ///
+    /// Every buffered event is re-decided against the current rules and `ctx`
+    /// rather than against whatever was true when it was buffered. That keeps
+    /// per-repo quiet-hours overrides working without recording which window
+    /// deferred what, and means a rule the user changed overnight (a new mute, a
+    /// repo deny) still applies on the way out. An event a rule now drops is
+    /// discarded; one still inside its window stays buffered.
+    ///
+    /// Returns how many events were delivered.
+    pub async fn flush_deferred(&self, ctx: &FilterContext) -> usize {
+        let pending = self
+            .read_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred")
+            .await;
+        if pending.is_empty() {
+            return 0;
+        }
+
+        let buffered = pending.len();
+        let mut keep = Vec::new();
+        let mut delivered = 0usize;
+        let mut dropped = 0usize;
+        for event in pending {
+            match self.rules.decide(&event, ctx) {
+                // Still inside the window: hold it for the next attempt.
+                Decision::Defer(_) => keep.push(event),
+                // A rule that changed while it sat in the buffer now drops it.
+                Decision::Drop(reason) => {
+                    debug!(dedup_key = %event.dedup_key, ?reason, "deferred event dropped on flush");
+                    dropped += 1;
+                }
+                Decision::Deliver => {
+                    let targets = self.destinations_for(&event);
+                    if targets.is_empty() {
+                        debug!(dedup_key = %event.dedup_key, "deferred event has no destination");
+                        dropped += 1;
+                        continue;
+                    }
+                    // The event was marked delivered when it was buffered, so a
+                    // failure here can't be recovered by re-deriving it. Keep it
+                    // buffered and retry on the next flush instead.
+                    let (_, errors) = self.fan_out(&event, &targets).await;
+                    if errors.is_empty() {
+                        delivered += 1;
+                    } else {
+                        warn!(dedup_key = %event.dedup_key, errors = ?errors, "deferred event failed to deliver; keeping it buffered");
+                        keep.push(event);
+                    }
+                }
+            }
+        }
+
+        // Rewrite only when something actually left the buffer. A write failure
+        // leaves released events in it, so they would send again next flush: loud,
+        // because that is a duplicate ping.
+        if keep.len() != buffered {
+            if let Err(err) = self
+                .write_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, &keep)
+                .await
+            {
+                error!(%err, "deferred events were released but the buffer could not be updated; they may re-send");
+            }
+            info!(
+                delivered,
+                dropped,
+                still_deferred = keep.len(),
+                "released deferred events"
+            );
+        }
+        delivered
     }
 
     fn log_source_error(source_id: &str, err: &SourceError) {
@@ -683,6 +849,201 @@ mod tests {
         // A second flush finds an empty buffer and does nothing.
         assert_eq!(engine.flush_digest().await, 0);
         assert_eq!(dest.digests.lock().unwrap().len(), 1);
+    }
+
+    /// The dedup keys sitting in the deferred buffer, for asserting on what a flush
+    /// kept versus cleared (a flush returning 0 alone can't tell those apart).
+    async fn buffered(state: &MemState) -> Vec<String> {
+        let bytes = state
+            .get_snapshot(DEFERRED_SOURCE, DEFERRED_SCOPE)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| b"[]".to_vec());
+        serde_json::from_slice::<Vec<Event>>(&bytes)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.dedup_key)
+            .collect()
+    }
+
+    /// A quiet window of 22:00-08:00, and the two clock readings either side of it.
+    fn quiet_rules() -> RuleConfig {
+        RuleConfig {
+            quiet_hours: crate::config::QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            ..Default::default()
+        }
+    }
+    const INSIDE_WINDOW: FilterContext = FilterContext {
+        local_minutes: Some(23 * 60),
+    };
+    const OUTSIDE_WINDOW: FilterContext = FilterContext {
+        local_minutes: Some(12 * 60),
+    };
+
+    #[tokio::test]
+    async fn quiet_hours_defers_then_releases_after_the_window() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            quiet_rules(),
+            dest.clone(),
+        );
+
+        // Inside the window: held, not sent, and not lost.
+        let r = engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::Deferred(DeferReason::QuietHours)
+        ));
+        assert!(dest.sent.lock().unwrap().is_empty());
+
+        // Still inside: the flush is a no-op and the event stays buffered.
+        assert_eq!(engine.flush_deferred(&INSIDE_WINDOW).await, 0);
+        assert!(dest.sent.lock().unwrap().is_empty());
+
+        // Window over: released exactly once.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(dest.sent.lock().unwrap().as_slice(), &["k1".to_string()]);
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(dest.sent.lock().unwrap().len(), 1);
+        assert!(buffered(&state).await.is_empty());
+    }
+
+    /// The regression this whole path exists for: the snapshot advances past a
+    /// deferred event (so it never re-derives), which is exactly why dropping it
+    /// used to lose it for good.
+    #[tokio::test]
+    async fn deferred_event_survives_the_snapshot_advancing() {
+        let dest = Arc::new(MockDestination::default());
+        let source = Arc::new(MockSource {
+            events: vec![ev(EventKind::ReviewRequested, "k1")],
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![source.clone()],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        );
+
+        engine.run_once(INSIDE_WINDOW, false).await;
+        // Nothing was held back, so the source committed the event's scope.
+        let committed = source.committed.lock().unwrap().clone();
+        assert_eq!(committed, vec![HashSet::new()]);
+
+        // A later pass re-polls the same event; dedup keeps it from buffering twice.
+        let r = engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::AlreadyDelivered
+        ));
+
+        // One copy comes out when the window ends.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(dest.sent.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn deferred_event_that_fails_to_deliver_stays_buffered() {
+        let dest = Arc::new(MockDestination {
+            fail: true,
+            ..Default::default()
+        });
+        let (engine, state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            quiet_rules(),
+            dest.clone(),
+        );
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // Delivery fails on release, so nothing is reported and it is kept. It was
+        // already marked delivered when buffered, so losing it here would lose it
+        // for good.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(buffered(&state).await, vec!["k1".to_string()]);
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(buffered(&state).await, vec!["k1".to_string()]);
+        assert!(dest.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deferred_event_is_re_decided_against_current_rules() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::ReviewRequested, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        );
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // Rebuild the engine as if the user disabled the kind overnight, keeping the
+        // same state (and so the same buffer).
+        let mut rules = quiet_rules();
+        rules.events.review_requested = false;
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        );
+
+        // The new rule drops it on the way out; it is not delivered, and the buffer
+        // is cleared rather than retrying forever.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert!(dest.sent.lock().unwrap().is_empty());
+        assert!(buffered(&state).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_deferral_without_buffering() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, _state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            quiet_rules(),
+            dest.clone(),
+        );
+
+        let r = engine.run_once(INSIDE_WINDOW, true).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::WouldDefer(DeferReason::QuietHours)
+        ));
+        // A dry run advances nothing, so there is nothing to release.
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
+        assert!(dest.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rule_that_drops_wins_over_quiet_hours() {
+        let dest = Arc::new(MockDestination::default());
+        let mut rules = quiet_rules();
+        rules.events.review_requested = false;
+        let (engine, _state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            rules,
+            dest.clone(),
+        );
+
+        // Suppressed outright, not parked in the buffer: the user said never, not later.
+        let r = engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::Suppressed(DropReason::EventKindDisabled)
+        ));
+        assert_eq!(engine.flush_deferred(&OUTSIDE_WINDOW).await, 0);
     }
 
     #[tokio::test]

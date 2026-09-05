@@ -192,7 +192,7 @@ knowing about:
 | `rules.events.*`     |                          | Per-event-kind on/off toggles.                                        |
 | `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.                      |
 | `rules.mute_authors` |                          | Logins whose actions never notify (e.g. bots).                        |
-| `rules.quiet_hours`  |                          | Suppress during a local time window.                                  |
+| `rules.quiet_hours`  |                          | Hold events during a local time window; delivered once it ends.       |
 | `rules.merge_close`  | `author` / `reviewer`    | Whose merges/closes to report.                                        |
 | `routes`             | `repos` / `fallback`     | Which sources feed which destinations, optionally scoped by repo.     |
 
