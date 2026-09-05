@@ -214,7 +214,7 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
 
         // Flush the digest on its own cadence, independent of the poll interval.
         if config.digest.enabled && last_digest.elapsed() >= digest_interval {
-            engine.flush_digest().await;
+            engine.flush_digest(&filter_context(&config)).await;
             last_digest = std::time::Instant::now();
         }
 
