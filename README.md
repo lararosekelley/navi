@@ -169,7 +169,9 @@ a one-line nudge when a newer release exists (silence it with `NAVI_NO_UPDATE_CH
 
 ## Configuration
 
-`navi init` documents every field inline, and `navi config set <key> <value>` edits one in place. The fields worth
+`navi init` documents every field inline, and `navi config set <key> <value>` edits one in place, adding the key (and
+its section) if your config predates it. Unknown keys and wrongly typed values are refused rather than written. The
+fields worth
 knowing about:
 
 | Section              | Key                      | Meaning                                                               |

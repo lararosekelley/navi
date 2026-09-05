@@ -61,7 +61,8 @@ pub enum Command {
         offline: bool,
     },
 
-    /// Read or write config values without hand-editing config.toml.
+    /// Read or write config values without hand-editing config.toml. `set` adds a
+    /// known key your config doesn't have yet, and refuses one navi doesn't know.
     Config {
         #[command(subcommand)]
         action: ConfigAction,
