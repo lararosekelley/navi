@@ -13,7 +13,10 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 - **core:** hold the digest inside a quiet window too, so batching a kind no
   longer opts it out of quiet hours
 - **core:** track delivery per destination, so a retry after one destination
-  fails no longer re-notifies the ones that already succeeded
+  fails no longer re-notifies the ones that already succeeded. The digest flush
+  follows the same rule, replacing its "may re-send" caveat
+- **cli:** `once --dry-run` reports events it has already delivered as such,
+  rather than previewing them as outgoing
 
 ## 0.3.3
 
