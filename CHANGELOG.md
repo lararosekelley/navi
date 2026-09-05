@@ -8,6 +8,10 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 
 ### Fixed
 
+- **cli:** let `config set` write a known key that isn't in config.toml yet,
+  creating its section if needed, so `Option` fields and fields added after your
+  `navi init` no longer need hand-editing. Unknown keys and wrongly typed values
+  are still refused
 - **core:** hold events that land during quiet hours and deliver them once the
   window ends, instead of dropping them for good
 - **core:** hold the digest inside a quiet window too, so batching a kind no
