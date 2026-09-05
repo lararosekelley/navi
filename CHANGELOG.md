@@ -4,6 +4,13 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.4
+
+### Fixed
+
+- **core:** hold events that land during quiet hours and deliver them once the
+  window ends, instead of dropping them for good
+
 ## 0.3.3
 
 ### Changed
