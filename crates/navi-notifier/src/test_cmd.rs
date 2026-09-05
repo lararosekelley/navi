@@ -110,11 +110,18 @@ impl StateStore for MemStore {
             .insert(format!("{s}:{scope}"), bytes.to_vec());
         Ok(())
     }
-    async fn was_delivered(&self, key: &str) -> Result<bool, StateError> {
-        Ok(self.delivered.lock().unwrap().contains_key(key))
+    async fn was_delivered(&self, key: &str, sink: &str) -> Result<bool, StateError> {
+        Ok(self
+            .delivered
+            .lock()
+            .unwrap()
+            .contains_key(&format!("{key}@{sink}")))
     }
-    async fn mark_delivered(&self, key: &str) -> Result<(), StateError> {
-        self.delivered.lock().unwrap().insert(key.to_string(), ());
+    async fn mark_delivered(&self, key: &str, sink: &str) -> Result<(), StateError> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .insert(format!("{key}@{sink}"), ());
         Ok(())
     }
     async fn get_cursor(&self, s: &str, key: &str) -> Result<Option<String>, StateError> {

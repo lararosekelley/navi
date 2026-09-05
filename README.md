@@ -48,8 +48,8 @@ For GitHub and Gitea it polls the notifications API as a trigger, then **diffs**
 against a stored snapshot to derive precise events, so it can tell "reply to _my_ comment" from "a dismissal" from "a
 re-review"; for GitLab it reads the Todos feed. GitHub also polls your involved open PRs directly (`track_prs`, on by
 default), so reviews on your own PRs and activity in muted repos reach you even when GitHub creates no notification.
-State lives in a local SQLite database, so delivery is idempotent and your read/unread state on the source is never
-touched.
+State lives in a local SQLite database, so delivery is idempotent (tracked per destination, so a retry after one
+destination fails never re-pings the others) and your read/unread state on the source is never touched.
 
 ## Install
 

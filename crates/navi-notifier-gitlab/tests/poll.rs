@@ -23,10 +23,10 @@ impl StateStore for NoState {
     async fn put_snapshot(&self, _: &str, _: &str, _: &[u8]) -> Result<(), StateError> {
         Ok(())
     }
-    async fn was_delivered(&self, _: &str) -> Result<bool, StateError> {
+    async fn was_delivered(&self, _: &str, _: &str) -> Result<bool, StateError> {
         Ok(false)
     }
-    async fn mark_delivered(&self, _: &str) -> Result<(), StateError> {
+    async fn mark_delivered(&self, _: &str, _: &str) -> Result<(), StateError> {
         Ok(())
     }
     async fn get_cursor(&self, _: &str, _: &str) -> Result<Option<String>, StateError> {
@@ -61,10 +61,10 @@ impl StateStore for MemState {
             .insert(key(src, scope), bytes.to_vec());
         Ok(())
     }
-    async fn was_delivered(&self, _: &str) -> Result<bool, StateError> {
+    async fn was_delivered(&self, _: &str, _: &str) -> Result<bool, StateError> {
         Ok(false)
     }
-    async fn mark_delivered(&self, _: &str) -> Result<(), StateError> {
+    async fn mark_delivered(&self, _: &str, _: &str) -> Result<(), StateError> {
         Ok(())
     }
     async fn get_cursor(&self, src: &str, k: &str) -> Result<Option<String>, StateError> {
