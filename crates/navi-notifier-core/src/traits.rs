@@ -34,11 +34,16 @@ pub trait StateStore: Send + Sync {
         bytes: &[u8],
     ) -> Result<(), StateError>;
 
-    /// True if `dedup_key` was already delivered successfully.
-    async fn was_delivered(&self, dedup_key: &str) -> Result<bool, StateError>;
+    /// True if `dedup_key` already reached `sink`.
+    ///
+    /// A sink is one destination id, or one of the engine's internal buffers. It is
+    /// part of the key because an event fanned out to several destinations can
+    /// succeed at some and fail at others: without it, a retry re-sends to the ones
+    /// that already took it.
+    async fn was_delivered(&self, dedup_key: &str, sink: &str) -> Result<bool, StateError>;
 
-    /// Record `dedup_key` as delivered. Idempotent.
-    async fn mark_delivered(&self, dedup_key: &str) -> Result<(), StateError>;
+    /// Record that `dedup_key` reached `sink`. Idempotent.
+    async fn mark_delivered(&self, dedup_key: &str, sink: &str) -> Result<(), StateError>;
 
     async fn get_cursor(&self, source_id: &str, key: &str) -> Result<Option<String>, StateError>;
 

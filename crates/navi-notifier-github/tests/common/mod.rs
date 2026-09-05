@@ -32,11 +32,18 @@ impl StateStore for MemState {
             .insert(key(s, scope), b.to_vec());
         Ok(())
     }
-    async fn was_delivered(&self, k: &str) -> Result<bool, StateError> {
-        Ok(self.delivered.lock().unwrap().contains_key(k))
+    async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+        Ok(self
+            .delivered
+            .lock()
+            .unwrap()
+            .contains_key(&format!("{k}@{sink}")))
     }
-    async fn mark_delivered(&self, k: &str) -> Result<(), StateError> {
-        self.delivered.lock().unwrap().insert(k.to_string(), ());
+    async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
+        self.delivered
+            .lock()
+            .unwrap()
+            .insert(format!("{k}@{sink}"), ());
         Ok(())
     }
     async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
