@@ -6,6 +6,12 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 
 ## 0.3.4
 
+### Added
+
+- **state:** prune aged-out snapshots and dedup rows once a day, so a
+  long-running daemon's database no longer grows for ever
+  (`general.state_retention_days`, default 90)
+
 ### Fixed
 
 - **core:** hold events that land during quiet hours and deliver them once the
