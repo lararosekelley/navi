@@ -131,9 +131,16 @@ fn load_and_init_logging(config_path: &Path) -> Result<Config> {
 }
 
 async fn open_engine(config: &Config) -> Result<Engine> {
+    Ok(open_engine_with_store(config)?.0)
+}
+
+/// The engine plus the concrete store behind it. `run` needs the latter to prune;
+/// everything else only wants the engine.
+fn open_engine_with_store(config: &Config) -> Result<(Engine, Arc<SqliteStore>)> {
     let state_path = resolve_state_path()?;
     let store = Arc::new(SqliteStore::open(&state_path).context("opening state store")?);
-    wiring::build_engine(config, store)
+    let engine = wiring::build_engine(config, store.clone())?;
+    Ok((engine, store))
 }
 
 /// Compute the current local time-of-day (minutes since midnight) for quiet hours.
@@ -164,7 +171,7 @@ async fn cmd_once(config_path: &Path, dry_run: bool) -> Result<()> {
 
 async fn cmd_run(config_path: &Path) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let engine = open_engine(&config).await?;
+    let (engine, store) = open_engine_with_store(&config)?;
     let interval = std::time::Duration::from_secs(config.general.poll_interval_secs.max(1));
     // Backstop against a provider that hangs instead of erroring: a pass that
     // overruns this is abandoned and retried next interval, rather than wedging
@@ -178,6 +185,12 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
 
     let digest_interval = std::time::Duration::from_secs(config.digest.interval_secs.max(1));
     let mut last_digest = std::time::Instant::now();
+
+    // Retention is a housekeeping job, not a poll one: daily is frequent enough for
+    // a horizon measured in months, and it VACUUMs when it removes anything. Run
+    // once at startup too, so a daemon restarted more often than daily still prunes.
+    const PRUNE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let mut last_prune: Option<std::time::Instant> = None;
 
     let shutdown = shutdown_signal();
     tokio::pin!(shutdown);
@@ -224,6 +237,21 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
             if flush.starts_next_interval() {
                 last_digest = std::time::Instant::now();
             }
+        }
+
+        if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
+            match store.prune(config.general.state_retention_days).await {
+                Ok(pruned) if pruned.total() > 0 => info!(
+                    snapshots = pruned.snapshots,
+                    delivered = pruned.delivered,
+                    retention_days = config.general.state_retention_days,
+                    "pruned aged-out state"
+                ),
+                Ok(_) => {}
+                // Housekeeping: a failure here costs disk, not correctness.
+                Err(err) => warn!(%err, "pruning state failed; will retry tomorrow"),
+            }
+            last_prune = Some(std::time::Instant::now());
         }
 
         tokio::select! {
@@ -363,6 +391,11 @@ comment_min_age_secs = 0
 #                                 needs the involved-PR sweep: track_prs for github
 #                                 and gitea; gitlab always sweeps)
 backfill = "review_requests"
+# Days of local state to keep. A PR's stored snapshot is dropped once it has gone
+# this long without showing up in a poll (so: settled and abandoned PRs, never an
+# active one), and dedup records are kept twice as long so an evicted snapshot can
+# never re-notify you. Swept once a day. 0 keeps everything forever.
+state_retention_days = 90
 
 # Every provider starts disabled. `navi init` walks you through enabling the ones
 # you want; or flip one yourself, e.g. `navi config set github.enabled true`.

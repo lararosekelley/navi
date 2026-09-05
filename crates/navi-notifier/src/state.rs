@@ -117,6 +117,74 @@ fn migrate_delivered_to_per_sink(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// How many rows a [`SqliteStore::prune`] pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    pub snapshots: u64,
+    pub delivered: u64,
+}
+
+impl Pruned {
+    pub fn total(&self) -> u64 {
+        self.snapshots + self.delivered
+    }
+}
+
+impl SqliteStore {
+    /// Drop state that can no longer affect a poll, keeping the database from
+    /// growing for the life of the daemon. `retention_days` of 0 disables it.
+    ///
+    /// **Snapshots** age out on `updated_at`, which is rewritten every pass a PR is
+    /// seen: a snapshot only goes stale once its PR has stopped appearing in the
+    /// source at all, which for an open PR it never does. So this evicts settled and
+    /// abandoned PRs, and re-derives (harmlessly) anything that comes back.
+    ///
+    /// **Dedup rows** are kept for twice as long, because eviction and re-derivation
+    /// interact: a PR whose snapshot was dropped is diffed from scratch on next
+    /// sight, and a first sight surfaces outstanding review requests. The dedup row
+    /// is what suppresses that, so it has to outlive the snapshot. The doubling
+    /// gives a full retention period of overlap. A PR that reappears later than that
+    /// is treated as new, exactly as it would be on a fresh install.
+    ///
+    /// `cursors` is bounded by provider count and is never pruned.
+    pub async fn prune(&self, retention_days: u32) -> Result<Pruned, StateError> {
+        if retention_days == 0 {
+            return Ok(Pruned::default());
+        }
+        let conn = self.conn.clone();
+        spawn_blocking(move || {
+            let snapshot_cutoff = format!("-{retention_days} days");
+            let delivered_cutoff = format!("-{} days", u64::from(retention_days) * 2);
+            let c = lock(&conn)?;
+            let snapshots = c
+                .execute(
+                    "DELETE FROM snapshots WHERE updated_at < datetime('now', ?1)",
+                    params![snapshot_cutoff],
+                )
+                .map_err(backend)? as u64;
+            let delivered = c
+                .execute(
+                    "DELETE FROM delivered WHERE delivered_at < datetime('now', ?1)",
+                    params![delivered_cutoff],
+                )
+                .map_err(backend)? as u64;
+            let pruned = Pruned {
+                snapshots,
+                delivered,
+            };
+            // Deleting leaves the pages allocated, so the file only shrinks on a
+            // VACUUM. It rewrites the whole database, so it is worth doing only when
+            // something actually went away.
+            if pruned.total() > 0 {
+                c.execute_batch("VACUUM").map_err(backend)?;
+            }
+            Ok(pruned)
+        })
+        .await
+        .map_err(join)?
+    }
+}
+
 /// Lock the connection, mapping a poisoned mutex to a backend error rather than
 /// panicking the whole daemon.
 fn lock(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>, StateError> {
@@ -427,6 +495,120 @@ mod tests {
         assert!(store.was_delivered("old", "slack").await.unwrap());
         assert!(store.was_delivered("new", "slack").await.unwrap());
         assert!(!store.was_delivered("new", "email").await.unwrap());
+    }
+
+    /// Backdate a snapshot and a dedup row by `days`, so retention can be exercised
+    /// without waiting.
+    fn age_rows(store: &SqliteStore, days: u32) {
+        let c = store.conn.lock().unwrap();
+        c.execute(
+            "UPDATE snapshots SET updated_at = datetime('now', ?1)",
+            params![format!("-{days} days")],
+        )
+        .unwrap();
+        c.execute(
+            "UPDATE delivered SET delivered_at = datetime('now', ?1)",
+            params![format!("-{days} days")],
+        )
+        .unwrap();
+    }
+
+    async fn seed(store: &SqliteStore) {
+        store
+            .put_snapshot("github", "acme/w#1", b"v1")
+            .await
+            .unwrap();
+        store.mark_delivered("k1", "slack").await.unwrap();
+        store.put_cursor("github", "etag", "abc").await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn prune_keeps_state_within_the_retention_window() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed(&store).await;
+        age_rows(&store, 30);
+
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+        assert!(store
+            .get_snapshot("github", "acme/w#1")
+            .await
+            .unwrap()
+            .is_some());
+        assert!(store.was_delivered("k1", "slack").await.unwrap());
+    }
+
+    /// The invariant that makes eviction safe: when a snapshot ages out, the dedup
+    /// rows that would suppress its re-derived events are still there. Only at twice
+    /// the horizon do those go too.
+    #[tokio::test]
+    async fn dedup_rows_outlive_the_snapshots_they_protect() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed(&store).await;
+        age_rows(&store, 100);
+
+        // Past the snapshot horizon (90) but not the dedup one (180).
+        let pruned = store.prune(90).await.unwrap();
+        assert_eq!(pruned.snapshots, 1);
+        assert_eq!(pruned.delivered, 0);
+        assert!(store
+            .get_snapshot("github", "acme/w#1")
+            .await
+            .unwrap()
+            .is_none());
+        assert!(
+            store.was_delivered("k1", "slack").await.unwrap(),
+            "the dedup row must survive its snapshot, or a re-derive would re-notify"
+        );
+
+        // Past both horizons: the dedup row goes too.
+        age_rows(&store, 200);
+        let pruned = store.prune(90).await.unwrap();
+        assert_eq!(pruned.delivered, 1);
+        assert!(!store.was_delivered("k1", "slack").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prune_is_disabled_at_zero_and_leaves_cursors_alone() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed(&store).await;
+        age_rows(&store, 10_000);
+
+        assert_eq!(store.prune(0).await.unwrap(), Pruned::default());
+        assert!(store
+            .get_snapshot("github", "acme/w#1")
+            .await
+            .unwrap()
+            .is_some());
+
+        // Enabled, everything aged out: cursors are still poll bookkeeping, not
+        // history, so they are never swept.
+        let pruned = store.prune(90).await.unwrap();
+        assert_eq!(pruned.total(), 2);
+        assert_eq!(
+            store.get_cursor("github", "etag").await.unwrap(),
+            Some("abc".to_string())
+        );
+    }
+
+    /// A second pass finds nothing left to do, and the store still works after the
+    /// VACUUM the first one ran.
+    #[tokio::test]
+    async fn prune_is_idempotent() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        seed(&store).await;
+        age_rows(&store, 10_000);
+
+        assert_eq!(store.prune(90).await.unwrap().total(), 2);
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+
+        store
+            .put_snapshot("github", "acme/w#2", b"v2")
+            .await
+            .unwrap();
+        assert_eq!(
+            store.get_snapshot("github", "acme/w#2").await.unwrap(),
+            Some(b"v2".to_vec())
+        );
     }
 
     #[tokio::test]
