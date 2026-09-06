@@ -97,17 +97,15 @@ fn get_value(doc: &DocumentMut, key: &str) -> Result<String> {
 /// be perfectly valid and simply not written yet, either because it postdates the
 /// user's `navi init` or because it is an `Option` that `init` never emits at all
 /// (`gitea.api_base`, `email.username`). So the write is validated against navi's
-/// own config schema instead, by [`known_key`].
+/// own config schema instead, by [`schema_checked_item`].
 fn set_value(doc: &mut DocumentMut, key: &str, value: &str) -> Result<()> {
     let parts: Vec<&str> = key.split('.').filter(|s| !s.is_empty()).collect();
     let Some((leaf, parents)) = parts.split_last() else {
         bail!("empty config key");
     };
+    let item = schema_checked_item(&parts, value)?;
 
-    // Write into a candidate first, so a rejected key leaves the real document
-    // untouched - including any section this would otherwise have created.
-    let mut candidate = doc.clone();
-    let mut table: &mut Table = candidate.as_table_mut();
+    let mut table: &mut Table = doc.as_table_mut();
     for part in parents {
         let entry = table.entry(part).or_insert_with(|| {
             let mut created = Table::new();
@@ -120,40 +118,115 @@ fn set_value(doc: &mut DocumentMut, key: &str, value: &str) -> Result<()> {
             anyhow!("`{part}` is not a config section; check the spelling or fix it in config.toml")
         })?;
     }
-    table[leaf] = infer_value(value);
-
-    known_key(&candidate, &parts)?;
-    *doc = candidate;
+    table[leaf] = item;
     Ok(())
 }
 
-/// Whether `path` is a key navi actually understands, decided by round-tripping the
-/// candidate document through [`Config`].
+/// The item to write at `path`, having checked navi's schema knows the key and
+/// accepts the value.
 ///
-/// serde drops unknown keys on the way in, so a typo is gone by the time the parsed
-/// config is written back out, while a real key survives. That makes the struct
-/// itself the schema, with no hand-maintained key list to drift from it.
-///
-/// Deserialization also type-checks, so `poll_interval_secs abc` is rejected here
-/// rather than written and left to break the next startup.
-fn known_key(candidate: &DocumentMut, path: &[&str]) -> Result<()> {
-    let key = path.join(".");
-    let parsed: Config = toml::from_str(&candidate.to_string())
-        .with_context(|| format!("`{key}` cannot be set to that value"))?;
-    let round_tripped =
-        toml::Value::try_from(&parsed).context("re-serializing the config to validate the key")?;
-
-    let mut item = &round_tripped;
-    for part in path {
-        match item.get(part) {
-            Some(next) => item = next,
-            None => bail!(
-                "no config key `{key}`; check the spelling (`navi config get {}` lists a section)",
-                path.first().copied().unwrap_or_default()
-            ),
+/// [`infer_value`] guesses the type from the text, which is wrong for a
+/// string-valued field whose value happens to look like a number or a bool. The
+/// documented example is `discord.dm_to`, which takes either a webhook URL or a
+/// Discord user id, and a user id is a bare snowflake. So a rejected guess is
+/// retried as a plain string before giving up, and the original error is what
+/// surfaces if that fails too.
+fn schema_checked_item(path: &[&str], value: &str) -> Result<Item> {
+    let inferred = infer_value(value);
+    let guessed_a_type = !matches!(inferred.as_value(), Some(Value::String(_)));
+    let rejected =
+        |err: anyhow::Error| anyhow!("`{}` does not accept `{value}`: {err}", path.join("."));
+    match schema_accepts(path, &inferred) {
+        Ok(true) => Ok(inferred),
+        Ok(false) => bail!(unknown_key(path)),
+        Err(type_err) => {
+            if !guessed_a_type {
+                return Err(rejected(type_err));
+            }
+            let as_string = toml_edit::value(value);
+            match schema_accepts(path, &as_string) {
+                Ok(true) => Ok(as_string),
+                Ok(false) => bail!(unknown_key(path)),
+                // Neither the guessed type nor a string fits: report the guess,
+                // which is the more informative of the two.
+                Err(_) => Err(rejected(type_err)),
+            }
         }
     }
-    Ok(())
+}
+
+/// Whether navi's config schema has `path` and accepts `item` there.
+///
+/// The probe document holds *only* this key, never the user's file. That keeps the
+/// check independent of whatever else is in config.toml: unrelated breakage
+/// elsewhere can't fail the write, and can't be reported against the key being set.
+/// It works because every config struct carries `#[serde(default)]`, so a document
+/// with one key deserializes.
+///
+/// `Ok(true)` known and accepted, `Ok(false)` not a key navi knows (serde dropped
+/// it, so it is gone from the round trip), `Err` the value was rejected.
+fn schema_accepts(path: &[&str], item: &Item) -> Result<bool> {
+    let Some((leaf, parents)) = path.split_last() else {
+        return Ok(false);
+    };
+    let mut probe = DocumentMut::new();
+    let mut table: &mut Table = probe.as_table_mut();
+    for part in parents {
+        table = table
+            .entry(part)
+            .or_insert_with(|| Item::Table(Table::new()))
+            .as_table_mut()
+            .expect("just inserted a table");
+    }
+    table[leaf] = item.clone();
+
+    // Only the message: the probe's line and column numbers refer to a document the
+    // user has never seen, so quoting them would point at the wrong place in their
+    // config.
+    let parsed: Config =
+        toml::from_str(&probe.to_string()).map_err(|e| anyhow!("{}", e.message()))?;
+    let round_tripped =
+        toml::Value::try_from(&parsed).context("re-serializing the config to validate the key")?;
+    let mut found = &round_tripped;
+    for part in path {
+        match found.get(part) {
+            Some(next) => found = next,
+            None => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+/// The error for a key navi doesn't know, naming what it could have meant.
+///
+/// Siblings come from the schema, not from the file, so the suggestion holds for a
+/// section the user hasn't written yet. Phrased as "did you mean" rather than a
+/// complete list, because `Option` fields are absent from the serialized defaults.
+fn unknown_key(path: &[&str]) -> String {
+    let key = path.join(".");
+    let Ok(schema) = toml::Value::try_from(Config::default()) else {
+        return format!("no config key `{key}`; check the spelling");
+    };
+    // Walk as far as the schema allows, so a misspelled section suggests sections
+    // and a misspelled leaf suggests that section's keys.
+    let mut level = &schema;
+    for part in &path[..path.len().saturating_sub(1)] {
+        match level.get(part) {
+            Some(next) => level = next,
+            None => break,
+        }
+    }
+    match level.as_table() {
+        Some(table) if !table.is_empty() => {
+            let mut names: Vec<&str> = table.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            format!(
+                "no config key `{key}`; did you mean one of: {}",
+                names.join(", ")
+            )
+        }
+        _ => format!("no config key `{key}`; check the spelling"),
+    }
 }
 
 /// Parse a string the way a user means it: `true`/`false` → bool, digits →
@@ -284,12 +357,104 @@ token_env = \"NAVI_GITHUB_TOKEN\"
         assert_eq!(d.to_string(), before);
     }
 
+    /// `infer_value` guesses from the text, so a string-valued field whose value
+    /// looks numeric must not become unsettable. `discord.dm_to` is the documented
+    /// case: it takes a webhook URL or a Discord user id, and an id is a bare
+    /// snowflake.
+    #[test]
+    fn a_numeric_looking_string_field_is_settable() {
+        let mut d = doc();
+        set_value(&mut d, "discord.dm_to", "123456789012345678").unwrap();
+        let out = d.to_string();
+        assert!(
+            out.contains(r#"dm_to = "123456789012345678""#),
+            "must be written as a string, not an integer: {out}"
+        );
+        let parsed: Config = toml::from_str(&d.to_string()).unwrap();
+        assert_eq!(parsed.discord.dm_to, "123456789012345678");
+
+        // Booleans too: a field that takes the literal text "true".
+        let mut d = doc();
+        set_value(&mut d, "discord.dm_to", "true").unwrap();
+        assert!(d.to_string().contains(r#"dm_to = "true""#));
+    }
+
+    /// Validation must not depend on the rest of the file. A config that fails to
+    /// deserialize elsewhere is exactly when `config set` should still work, since
+    /// such a config won't start.
+    #[test]
+    fn unrelated_breakage_does_not_block_or_get_blamed() {
+        let broken = format!(
+            "{SAMPLE}
+[[routes]]
+source = \"github\"
+"
+        );
+        let mut d: DocumentMut = broken.parse().unwrap();
+        // The file as a whole does not deserialize.
+        assert!(toml::from_str::<Config>(&broken).is_err());
+
+        // Setting an unrelated, valid key still works.
+        set_value(&mut d, "github.enabled", "false").unwrap();
+        assert!(d.to_string().contains("enabled = false"));
+        // And the pre-existing breakage is untouched, not silently repaired.
+        assert!(d.to_string().contains("[[routes]]"));
+
+        // A typo in the same file still errors, and names the key, not the routes.
+        let err = set_value(&mut d, "github.enabeld", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("github.enabeld"), "{err}");
+        assert!(!err.contains("destination"), "{err}");
+    }
+
+    /// The hint has to come from the schema, not the file: suggesting
+    /// `navi config get <section>` failed for any section not written yet.
+    #[test]
+    fn unknown_key_errors_suggest_real_siblings() {
+        let mut d = doc();
+
+        // Misspelled leaf: siblings of that section.
+        let err = set_value(&mut d, "github.enabeld", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("did you mean"), "{err}");
+        assert!(err.contains("enabled"), "{err}");
+
+        // Misspelled section: the sections, which the old hint could never give
+        // because the section isn't in the file to look up.
+        let err = set_value(&mut d, "nosuch.enabled", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("discord"), "{err}");
+        assert!(err.contains("general"), "{err}");
+        // Nothing suggested is a lie: every name offered is really settable.
+        for name in ["discord", "general", "rules"] {
+            assert!(
+                toml::Value::try_from(Config::default())
+                    .unwrap()
+                    .get(name)
+                    .is_some(),
+                "{name} suggested but not in the schema"
+            );
+        }
+    }
+
     /// Deserializing to validate the key type-checks it too, so a value that would
     /// break the next startup is refused now instead of written.
     #[test]
     fn set_of_a_wrongly_typed_value_errors() {
         let mut d = doc();
         assert!(set_value(&mut d, "general.poll_interval_secs", "abc").is_err());
+        assert!(d.to_string().contains("poll_interval_secs = 60"));
+
+        // The string retry is a fallback for string-valued fields, not an escape
+        // hatch: when neither the guessed type nor a string fits, the write is still
+        // refused rather than writing `poll_interval_secs = "true"`.
+        let err = set_value(&mut d, "general.poll_interval_secs", "true")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expected u64"), "{err}");
         assert!(d.to_string().contains("poll_interval_secs = 60"));
         // Enum fields are checked the same way.
         assert!(set_value(&mut d, "general.backfill", "sideways").is_err());
