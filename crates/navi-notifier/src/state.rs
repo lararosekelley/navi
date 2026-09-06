@@ -14,6 +14,7 @@ use navi_notifier_core::traits::StateStore;
 use navi_notifier_core::StateError;
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::task::spawn_blocking;
+use tracing::warn;
 
 pub struct SqliteStore {
     conn: Arc<Mutex<Connection>>,
@@ -129,7 +130,7 @@ impl SqliteStore {
     /// with the number of PRs it has ever seen. `0` disables it. Run once a day by
     /// the `run` daemon only; `once` polls and exits without sweeping.
     ///
-    /// Only cursors, and only these three kinds. Each is safe to lose because the
+    /// Only cursors, and only these two kinds. Both are safe to lose because the
     /// snapshot, which is *not* pruned, is what actually suppresses re-notification:
     ///
     /// - `pr:{scope}` gates the involved-PR sweep on the PR's `updated_at`. Without
@@ -137,9 +138,17 @@ impl SqliteStore {
     ///   no events.
     /// - `thread:{scope}` gates notification re-processing the same way, and the
     ///   source already notes the snapshot would suppress any duplicate.
-    /// - `mq:{scope}` holds the last-seen merge-queue state. A missing prior state is
-    ///   treated as first sight and deliberately does not back-fill a transition, so
-    ///   dropping it baselines rather than firing.
+    ///
+    /// `mq:{scope}` is deliberately **not** swept, though it is per-PR and grows the
+    /// same way. It holds the last-seen merge-queue state, and it is the one kind
+    /// whose loss costs an event rather than an API call: a missing prior state
+    /// baselines instead of firing, and GitHub does not always bump a PR's
+    /// `updated_at` on a queue change (`github/src/source.rs:499`), so a PR quiet by
+    /// every dated cursor can still have a live queue. Dating it by association with
+    /// those cursors would swallow a transition that landed while the baseline was
+    /// missing. Sweeping it needs the value to carry its own stamp, the way
+    /// `mqcfg:` already does; until then it stays, and it is a small population
+    /// bounded by the merge-queue repos in play.
     ///
     /// ## What this actually reclaims
     ///
@@ -177,45 +186,25 @@ impl SqliteStore {
             let c = lock(&conn)?;
             let tx = c.unchecked_transaction().map_err(backend)?;
 
-            // Merge-queue rows first, while the dated cursors that place them in
-            // time still exist: `mq:` values are states like "absent", not
-            // timestamps, so they are only prunable by association with a PR already
-            // known to be stale.
+            // Two independent guards, because either alone is a thin thread to hang
+            // a delete on.
             //
-            // Either sibling will do. With `track_prs = false` a PR reaches navi
-            // through notifications only and never gets a `pr:` cursor, so keying
-            // solely off that one would leave those `mq:` rows unprunable for ever.
-            // Requiring a stale sibling *and* no fresh one keeps the merge-queue
-            // baseline for a PR that is quiet by one measure but active by the other.
-            let mq = tx
-                .execute(
-                    "DELETE FROM cursors WHERE key LIKE 'mq:%'
-                       AND EXISTS (
-                         SELECT 1 FROM cursors d
-                          WHERE d.source_id = cursors.source_id
-                            AND d.key IN ('pr:' || substr(cursors.key, 4),
-                                          'thread:' || substr(cursors.key, 4))
-                            AND d.value LIKE ?1
-                            AND d.value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
-                       AND NOT EXISTS (
-                         SELECT 1 FROM cursors d
-                          WHERE d.source_id = cursors.source_id
-                            AND d.key IN ('pr:' || substr(cursors.key, 4),
-                                          'thread:' || substr(cursors.key, 4))
-                            AND d.value LIKE ?1
-                            AND d.value >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
-                    params![RFC3339_SHAPE, cutoff],
-                )
-                .map_err(backend)? as u64;
-
-            // The shape guard keeps this to values that really are RFC3339 instants.
-            // Slack's own `thread:` cursors share the prefix but hold a Slack `ts`
-            // (`1750000000.123456`), which would sort before any date and be deleted
-            // by a bare `<` comparison.
+            // The key guard: a destination's own thread cursor is
+            // `thread:{source}:{scope}` (`core::Event::thread_key`), so it carries a
+            // second colon that a source's `thread:{scope}` never does. Those belong
+            // to Slack and Discord, group a PR's alerts into one message thread, and
+            // are not this sweep's business.
+            //
+            // The value guard: those same cursors hold a Slack `ts`
+            // (`1750000000.123456`), which is all digits and therefore sorts before
+            // any date, so a bare `<` comparison would take every one of them. It
+            // also keeps the delete off dated global watermarks, which is why the key
+            // prefixes are listed explicitly rather than matching any dated value.
             let dated = tx
                 .execute(
                     "DELETE FROM cursors
-                      WHERE (key LIKE 'pr:%' OR key LIKE 'thread:%')
+                      WHERE (key LIKE 'pr:%'
+                             OR (key LIKE 'thread:%' AND instr(substr(key, 8), ':') = 0))
                         AND value LIKE ?1
                         AND value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)",
                     params![RFC3339_SHAPE, cutoff],
@@ -223,15 +212,18 @@ impl SqliteStore {
                 .map_err(backend)? as u64;
 
             tx.commit().map_err(backend)?;
-            let pruned = Pruned {
-                cursors: mq + dated,
-            };
+            let pruned = Pruned { cursors: dated };
             // Deleting leaves the pages allocated, so the file only shrinks on a
             // VACUUM. It rewrites the whole database, which at this size (single
             // digit MB) is cheap enough to run on any day that removed something,
             // and the re-arming described above means that is most days.
             if pruned.cursors > 0 {
-                c.execute_batch("VACUUM").map_err(backend)?;
+                // The delete is already committed, so a VACUUM failure costs disk,
+                // not correctness. Reporting it as a failed prune would understate
+                // what actually happened.
+                if let Err(err) = c.execute_batch("VACUUM") {
+                    warn!(%err, "pruned state but could not compact the database");
+                }
             }
             Ok(pruned)
         })
@@ -609,10 +601,11 @@ mod tests {
     #[tokio::test]
     async fn prune_drops_per_pr_cursors_for_long_quiet_prs() {
         let store = seeded_cursors();
-        assert_eq!(store.prune(90).await.unwrap().cursors, 3);
+        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
         assert_eq!(
             cursor_keys(&store),
             vec![
+                "github|mq:acme/w#1",
                 "github|mq:acme/w#2",
                 "github|mqcfg:acme/w",
                 "github|notif_since",
@@ -653,46 +646,87 @@ mod tests {
         assert_eq!(cursor_keys(&store).len(), 4);
     }
 
-    /// `mq:` has no date of its own, so it goes only with a PR the sweep has stopped
-    /// seeing. An active PR must keep its merge-queue baseline, or a transition
-    /// between the prune and the next poll would be missed.
+    /// `mq:` is never swept, even when every dated cursor for its PR is stale.
+    /// GitHub does not always bump `updated_at` on a queue change, so "quiet by the
+    /// dated cursors" does not mean "quiet queue", and a missing baseline swallows a
+    /// transition rather than duplicating one.
     #[tokio::test]
-    async fn prune_keeps_merge_queue_state_for_active_prs() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        put_raw(&store, "github", "pr:acme/w#2", "2999-01-01T00:00:00Z");
-        put_raw(&store, "github", "mq:acme/w#2", "queued");
-        // Nothing dates this one at all, so it cannot be shown to be stale.
-        put_raw(&store, "github", "mq:acme/w#3", "queued");
-        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
-        assert_eq!(cursor_keys(&store).len(), 3);
-    }
-
-    /// With `track_prs = false` a PR arrives through notifications only and never
-    /// gets a `pr:` cursor, so dating `mq:` off that alone leaves those rows
-    /// unprunable for ever. The `thread:` cursor dates them just as well.
-    #[tokio::test]
-    async fn prune_dates_merge_queue_state_by_the_notification_cursor_too() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
-        put_raw(&store, "github", "mq:acme/w#1", "absent");
-        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
-        assert!(cursor_keys(&store).is_empty());
-    }
-
-    /// Quiet by one measure, active by the other: the merge-queue baseline stays.
-    /// Losing it here could drop a real queue transition.
-    #[tokio::test]
-    async fn prune_keeps_merge_queue_state_when_any_sibling_is_fresh() {
+    async fn prune_never_touches_merge_queue_state() {
         let store = SqliteStore::open_in_memory().unwrap();
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
-        put_raw(&store, "github", "thread:acme/w#1", "2999-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#1", "queued");
 
-        // The stale `pr:` cursor still goes; the merge-queue baseline does not.
+        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
+        assert_eq!(
+            cursor_keys(&store),
+            vec!["github|mq:acme/w#1"],
+            "the merge-queue baseline is the one kind whose loss costs an event"
+        );
+    }
+
+    /// The exclusion has to come from the key, not from `mq:` values happening not
+    /// to look like dates. Sweeping it needs a self-dating value (the `mqcfg:`
+    /// pattern), and that change must not quietly enrol these rows in the sweep.
+    #[tokio::test]
+    async fn merge_queue_state_is_excluded_by_key_not_by_its_value() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        // A value in the shape the follow-up would give it.
+        put_raw(&store, "github", "mq:acme/w#1", "2020-01-01T00:00:00Z");
+
+        assert_eq!(store.prune(90).await.unwrap().cursors, 1);
+        assert_eq!(cursor_keys(&store), vec!["github|mq:acme/w#1"]);
+    }
+
+    /// The sweep deletes only rows it can actually date. The key guard alone would
+    /// take a `pr:`-prefixed row whatever its value, so this pins the second guard
+    /// independently: without it, a source that ever stored something other than a
+    /// timestamp under one of these prefixes would have it deleted on the first
+    /// sweep, since almost anything sorts below a date.
+    #[tokio::test]
+    async fn prune_only_deletes_rows_it_can_date() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "pr:acme/w#1", "not-a-timestamp");
+        put_raw(&store, "github", "thread:acme/w#1", "0");
+        put_raw(&store, "github", "pr:acme/w#2", "2020-01-01T00:00:00Z");
+
         assert_eq!(store.prune(90).await.unwrap().cursors, 1);
         assert_eq!(
             cursor_keys(&store),
-            vec!["github|mq:acme/w#1", "github|thread:acme/w#1"]
+            vec!["github|pr:acme/w#1", "github|thread:acme/w#1"]
+        );
+    }
+
+    /// A destination's thread cursor is `thread:{source}:{scope}`, so the extra colon
+    /// keeps it out even if its value ever started looking like a date.
+    #[tokio::test]
+    async fn prune_leaves_destination_thread_cursors() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Value guard alone would already exclude a Slack `ts`; give it a dated value
+        // so only the key guard can save it.
+        put_raw(
+            &store,
+            "slack",
+            "thread:github:acme/w#1",
+            "2020-01-01T00:00:00Z",
+        );
+        put_raw(
+            &store,
+            "discord",
+            "thread:github:acme/w#2",
+            "2020-01-01T00:00:00Z",
+        );
+        // The source's own cursor, same prefix, no second colon: this one goes.
+        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
+
+        assert_eq!(store.prune(90).await.unwrap().cursors, 1);
+        assert_eq!(
+            cursor_keys(&store),
+            vec![
+                "discord|thread:github:acme/w#2",
+                "slack|thread:github:acme/w#1"
+            ]
         );
     }
 
@@ -734,7 +768,7 @@ mod tests {
         assert_eq!(store.prune(0).await.unwrap(), Pruned::default());
         assert_eq!(cursor_keys(&store).len(), 9);
 
-        assert_eq!(store.prune(90).await.unwrap().cursors, 3);
+        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
         assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
         // Still usable after the VACUUM.
         store.put_cursor("github", "etag", "abc").await.unwrap();
