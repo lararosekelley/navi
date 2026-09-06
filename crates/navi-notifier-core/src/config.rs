@@ -131,8 +131,9 @@ pub(crate) fn pattern_matches(pattern: &str, full_name: &str) -> bool {
     owner_ok && name_ok
 }
 
-/// Quiet hours during which non-urgent events are suppressed. Times are `HH:MM` in
-/// the machine's local time. A window that wraps midnight (start > end) is honored.
+/// Quiet hours during which events are held rather than delivered, and released
+/// once the window ends. Nothing is lost to the window. Times are `HH:MM` in the
+/// machine's local time. A window that wraps midnight (start > end) is honored.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct QuietHours {
