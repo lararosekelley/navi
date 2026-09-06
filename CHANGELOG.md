@@ -8,11 +8,11 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 
 ### Added
 
-- **state:** sweep the poll cursors for PRs that have been quiet for
+- **state:** sweep the poll cursors for PRs navi hasn't diffed in
   `general.state_retention_days` (default 90) once a day while `navi run` is
-  going, so they stop accumulating one row per PR navi has ever seen. Snapshots,
+  going, so they stop accumulating one row per PR it has ever seen. Snapshots,
   delivery records and merge-queue state are never touched, so this can cost a
-  re-fetch but never a duplicate or a missed alert
+  re-fetch but never a duplicate
 
 ### Fixed
 

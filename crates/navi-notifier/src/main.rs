@@ -390,10 +390,10 @@ comment_min_age_secs = 0
 #                                 needs the involved-PR sweep: track_prs for github
 #                                 and gitea; gitlab always sweeps)
 backfill = "review_requests"
-# Days a PR can go untouched before navi forgets its poll cursors for it. Snapshots,
-# delivery records and merge-queue state are never dropped, so this can cost a
-# re-fetch of a PR that wakes up again but can never produce a duplicate or a missed
-# alert. Swept once a day by `navi run`; `navi once` polls without sweeping. Rows for
+# Days navi can go without diffing a PR before it forgets its poll cursors for it.
+# Snapshots, delivery records and merge-queue state are never dropped, so this can
+# cost a re-fetch of a PR that wakes up again but can never produce a duplicate.
+# Swept once a day by `navi run`; `navi once` polls without sweeping. Rows for
 # settled PRs stay gone; a PR that is still open but quiet is re-fetched once per
 # retention period, since the open-PR search has no date bound. 0 keeps everything.
 state_retention_days = 90
