@@ -104,6 +104,27 @@ pub struct DigestFlush {
     pub sent: usize,
     /// Events left in the buffer because a deferring rule still applies to them.
     pub held: usize,
+    /// A destination or the buffer write failed, so the batch is kept to retry.
+    /// Distinct from `held`, which is the window doing its job rather than an error.
+    pub failed: bool,
+}
+
+impl DigestFlush {
+    /// Whether the daemon should start its next digest interval.
+    ///
+    /// False only when a quiet window held everything back: that attempt could never
+    /// have sent, so retrying it on the next pass costs a buffer read, while waiting
+    /// a whole interval can strand the buffer entirely if the interval's phase falls
+    /// inside the window.
+    ///
+    /// A flush that sent anything starts the next interval even if it also held
+    /// something, so a partly-quiet buffer (a per-repo `quiet_hours` override) keeps
+    /// the configured cadence instead of emitting a one-event digest every pass. A
+    /// failure does too, so a wedged destination is retried slowly rather than every
+    /// pass.
+    pub fn starts_next_interval(&self) -> bool {
+        self.sent > 0 || self.held == 0 || self.failed
+    }
 }
 
 /// Most events either buffer will hold. Generous enough that a normal quiet window
@@ -499,10 +520,13 @@ impl Engine {
     }
 
     /// Flush the buffered digest: one batched message per destination (only the
-    /// events routed to it), then clear the buffer. Called by the daemon on the
-    /// digest interval. Returns how many events were flushed. If any destination
-    /// fails, the buffer is kept for the next interval (which may re-send to
-    /// destinations that already succeeded - acceptable for a low-priority digest).
+    /// events routed to it), then rewrite the buffer with whatever is left. Called
+    /// by the daemon on the digest interval, and again on the next poll pass if a
+    /// quiet window held everything back (see [`DigestFlush::starts_next_interval`]).
+    ///
+    /// If any destination fails, the batch is kept and retried on the next interval,
+    /// which may re-send to destinations that already succeeded - acceptable for a
+    /// low-priority path.
     ///
     /// Events a deferring rule currently holds back are left in the buffer, so a
     /// digest never breaks a quiet window. Without that, batching a kind would opt
@@ -553,6 +577,7 @@ impl Engine {
             return DigestFlush {
                 sent: 0,
                 held: hold.len(),
+                failed: false,
             };
         }
 
@@ -576,6 +601,7 @@ impl Engine {
             return DigestFlush {
                 sent: 0,
                 held: hold.len(),
+                failed: true,
             };
         }
         // If the buffer can't be rewritten, don't report success: the events are
@@ -586,6 +612,7 @@ impl Engine {
             return DigestFlush {
                 sent: 0,
                 held: hold.len(),
+                failed: true,
             };
         }
         info!(
@@ -597,6 +624,7 @@ impl Engine {
         DigestFlush {
             sent: pending.len(),
             held: hold.len(),
+            failed: false,
         }
     }
 
@@ -1439,7 +1467,14 @@ mod tests {
 
         // Held by the window: nothing sent, and the caller can tell why.
         let flush = engine.flush_digest(&INSIDE_WINDOW).await;
-        assert_eq!(flush, DigestFlush { sent: 0, held: 1 });
+        assert_eq!(
+            flush,
+            DigestFlush {
+                sent: 0,
+                held: 1,
+                failed: false
+            }
+        );
 
         // An empty buffer also sends nothing, but holds nothing, so the daemon may
         // start its next interval. That is the distinction the daemon needs.
@@ -1457,7 +1492,97 @@ mod tests {
 
         // Once the window ends, it sends and holds nothing.
         let flush = engine.flush_digest(&OUTSIDE_WINDOW).await;
-        assert_eq!(flush, DigestFlush { sent: 1, held: 0 });
+        assert_eq!(
+            flush,
+            DigestFlush {
+                sent: 1,
+                held: 0,
+                failed: false
+            }
+        );
+    }
+
+    /// A partly-held flush must still start the next interval, or a per-repo
+    /// `quiet_hours` override turns an hourly digest into a one-event digest every
+    /// poll pass for the rest of the window.
+    #[tokio::test]
+    async fn a_mixed_digest_flush_starts_the_next_interval() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let rules = RuleConfig {
+            quiet_hours: crate::config::QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            overrides: vec![crate::config::RuleOverride {
+                repos: vec!["loud/*".into()],
+                quiet_hours: crate::config::QuietHoursOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![
+                    ev_in(EventKind::Mentioned, "loud", "repo", "loud1"),
+                    ev_in(EventKind::Mentioned, "quiet", "repo", "quiet1"),
+                ],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
+        assert_eq!(flush.sent, 1);
+        assert_eq!(flush.held, 1);
+        assert!(
+            flush.starts_next_interval(),
+            "a flush that sent something must not re-run every pass"
+        );
+    }
+
+    /// Only a flush the window blocked entirely should retry on the next pass.
+    #[test]
+    fn only_a_fully_held_flush_skips_the_next_interval() {
+        // Nothing buffered, or everything dropped by a rule: nothing to wait for.
+        assert!(DigestFlush::default().starts_next_interval());
+        // Sent everything.
+        assert!(DigestFlush {
+            sent: 2,
+            held: 0,
+            failed: false
+        }
+        .starts_next_interval());
+        // Sent some, held some: keep the configured cadence.
+        assert!(DigestFlush {
+            sent: 1,
+            held: 1,
+            failed: false
+        }
+        .starts_next_interval());
+        // A wedged destination retries slowly, not every pass.
+        assert!(DigestFlush {
+            sent: 0,
+            held: 1,
+            failed: true
+        }
+        .starts_next_interval());
+        // The one case that must retry soon.
+        assert!(!DigestFlush {
+            sent: 0,
+            held: 1,
+            failed: false
+        }
+        .starts_next_interval());
     }
 
     /// Both buffers re-decide through the same call, so they must agree: a mute the
