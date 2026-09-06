@@ -148,10 +148,16 @@ impl SqliteStore {
     /// `updated_at` on a queue change (`github/src/source.rs:499`), so a PR quiet by
     /// every dated cursor can still have a live queue. Dating it by association with
     /// those cursors would swallow a transition that landed while the baseline was
-    /// missing. Sweeping it needs the value to carry its own stamp, the way
-    /// `mqcfg:` already does (#161); until then it stays. It is one row per
-    /// merge-queue PR, not per repo, so it does grow without bound - just slowly,
-    /// and a missed queue transition is worse than the row.
+    /// missing. Giving the value its own stamp, the way `mqcfg:` does, would not help
+    /// either: `merge_queue_event` runs inside `process_pr`, so the state is only
+    /// observed when the PR is diffed, which is the same gate the sibling cursors
+    /// use. That was tried and rejected in #161.
+    ///
+    /// It is one row per merge-queue PR, not per repo, so it does grow without bound,
+    /// just slowly, and a missed queue transition is worse than the row. The shape
+    /// that would be safe is sweeping only PRs the snapshot records as merged or
+    /// closed, since a settled PR cannot enter a queue; that needs the store to read
+    /// the snapshot it currently treats as opaque bytes.
     ///
     /// ## What this actually reclaims
     ///
