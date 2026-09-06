@@ -74,6 +74,11 @@ pub struct General {
     /// it has any stored state. `review_requests` (default) shows PRs awaiting your
     /// review; `none` baselines silently; `all_open` backfills every involved PR.
     pub backfill: Backfill,
+    /// Days a PR can go untouched before its poll bookkeeping is dropped. Only
+    /// affects cursors, never the snapshots or dedup records that keep delivery
+    /// exactly-once, so it can cost an extra API call but never a duplicate alert.
+    /// `0` keeps everything forever.
+    pub state_retention_days: u32,
 }
 
 impl Default for General {
@@ -84,6 +89,7 @@ impl Default for General {
             utc_offset_minutes: 0,
             comment_min_age_secs: 0,
             backfill: Backfill::default(),
+            state_retention_days: 90,
         }
     }
 }
