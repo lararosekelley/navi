@@ -1013,9 +1013,10 @@ fn parse_repo_url(url: &str) -> Option<(String, String)> {
 
 fn map_err(err: octocrab::Error) -> SourceError {
     // A structured GitHub error carries the status; its `Display` is just "GitHub",
-    // so the string classifier below cannot see it. 404 is the one status worth
-    // reading here, because it is the difference between "stop asking about this PR"
-    // and "ask again next poll".
+    // so the string classifier below cannot see it. The status is what separates
+    // "stop asking about this PR" from "ask again next poll", which the message
+    // never says, so it is read first and the classifier is the fallback for errors
+    // that arrive without one.
     if let octocrab::Error::GitHub { source, .. } = &err {
         let status = source.status_code.as_u16();
         if is_permanently_gone(status) {
