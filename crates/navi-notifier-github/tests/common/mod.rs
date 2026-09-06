@@ -32,6 +32,9 @@ impl StateStore for MemState {
             .insert(key(s, scope), b.to_vec());
         Ok(())
     }
+    async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+        self.was_delivered(k, sink).await
+    }
     async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
         Ok(self
             .delivered

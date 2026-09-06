@@ -86,7 +86,7 @@ const ANY_SINK: &str = "*";
 
 /// Widen `delivered` from one row per event to one row per (event, sink).
 ///
-/// Pre-0.4 databases have `dedup_key` as the sole primary key, so the table has to
+/// Pre-0.3.4 databases have `dedup_key` as the sole primary key, so the table has to
 /// be rebuilt rather than altered. Existing rows carry [`ANY_SINK`]: they record
 /// that the event was delivered to every destination routed at the time, which is
 /// what the old single-key semantics meant. Anything else would re-notify the whole
@@ -190,6 +190,26 @@ impl StateStore for SqliteStore {
                     "SELECT 1 FROM delivered
                      WHERE dedup_key = ?1 AND sink IN (?2, ?3)",
                     params![dedup_key, sink, ANY_SINK],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(backend)?;
+            Ok(found.is_some())
+        })
+        .await
+        .map_err(join)?
+    }
+
+    async fn was_delivered_exact(&self, dedup_key: &str, sink: &str) -> Result<bool, StateError> {
+        let conn = self.conn.clone();
+        let (dedup_key, sink) = (dedup_key.to_string(), sink.to_string());
+        spawn_blocking(move || {
+            let c = lock(&conn)?;
+            let found: Option<i64> = c
+                .query_row(
+                    // Deliberately without ANY_SINK: see the trait's doc comment.
+                    "SELECT 1 FROM delivered WHERE dedup_key = ?1 AND sink = ?2",
+                    params![dedup_key, sink],
                     |row| row.get(0),
                 )
                 .optional()
@@ -317,7 +337,7 @@ mod tests {
         assert!(!crate::config::DESTINATION_IDS.contains(&ANY_SINK));
     }
 
-    /// The pre-0.4 `delivered` table: `dedup_key` alone as the primary key.
+    /// The pre-0.3.4 `delivered` table: `dedup_key` alone as the primary key.
     const LEGACY_SCHEMA: &str = "CREATE TABLE delivered (
          dedup_key    TEXT PRIMARY KEY,
          delivered_at TEXT NOT NULL DEFAULT (datetime('now'))
@@ -361,6 +381,31 @@ mod tests {
             .unwrap()
         };
         assert_eq!(when, "2026-01-01 00:00:00");
+    }
+
+    /// The two lookups must disagree on a migrated record: it stands for every sink
+    /// when asking "should this be sent", and for none of them when asking "did this
+    /// sink get it". Conflating them either re-notifies on upgrade or silently drops
+    /// a buffered batch, depending on which way it collapses.
+    #[tokio::test]
+    async fn exact_lookup_ignores_the_migrated_sentinel() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("navi.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(LEGACY_SCHEMA).unwrap();
+        conn.execute("INSERT INTO delivered (dedup_key) VALUES ('old')", [])
+            .unwrap();
+        drop(conn);
+
+        let store = SqliteStore::open(&path).unwrap();
+        assert!(store.was_delivered("old", "slack").await.unwrap());
+        assert!(!store.was_delivered_exact("old", "slack").await.unwrap());
+
+        // A record written since the migration answers both the same way.
+        store.mark_delivered("new", "slack").await.unwrap();
+        assert!(store.was_delivered("new", "slack").await.unwrap());
+        assert!(store.was_delivered_exact("new", "slack").await.unwrap());
+        assert!(!store.was_delivered_exact("new", "email").await.unwrap());
     }
 
     /// Opening twice must not re-run the rebuild or lose rows.
