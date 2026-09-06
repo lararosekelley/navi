@@ -796,9 +796,22 @@ impl Engine {
         (sent, all_ok)
     }
 
-    /// [`Engine::send_digest_batches_checked`] without the success flag.
-    async fn send_digest_batches(&self, events: &[Event]) -> HashSet<String> {
-        self.send_digest_batches_checked(events).await.0
+    /// How many of `event`'s routed destinations still don't have it.
+    ///
+    /// `0` means there is nothing left to do for it, whether because every
+    /// destination took it or because none is routed to it any more.
+    async fn outstanding_destinations(&self, event: &Event) -> Result<usize, StateError> {
+        let mut outstanding = 0usize;
+        for dest in self.destinations_for(event) {
+            if !self
+                .state
+                .was_delivered_exact(&event.dedup_key, dest.id())
+                .await?
+            {
+                outstanding += 1;
+            }
+        }
+        Ok(outstanding)
     }
 
     /// Empty `pending` and move what the window held onto the held row, appending to
@@ -816,6 +829,21 @@ impl Engine {
                 .collect();
             if !fresh.is_empty() {
                 parked.extend(fresh);
+                // Same cap as `enqueue`, for the same reason. Held events used to sit
+                // in `pending` and be trimmed there; on their own row they accumulate
+                // across intervals instead, and every pass re-reads and rewrites the
+                // whole row, so an unbounded one is quadratic in exactly the case the
+                // cap exists for: a long window keeping a repo quiet at a short poll
+                // interval.
+                while parked.len() > MAX_BUFFERED {
+                    let dropped = parked.remove(0);
+                    error!(
+                        dedup_key = %dropped.dedup_key,
+                        buffer = "digest-held",
+                        cap = MAX_BUFFERED,
+                        "held digest row is full; dropping the oldest event"
+                    );
+                }
                 self.write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &parked)
                     .await?;
             }
@@ -870,20 +898,47 @@ impl Engine {
             return 0;
         }
 
-        let sent = self.send_digest_batches(&ready).await;
-        if sent.is_empty() {
-            // Nothing landed, so keep everything for the next pass.
-            return 0;
+        let (sent, _) = self.send_digest_batches_checked(&ready).await;
+
+        // "Reached at least one destination" is not done. An event stays on the row
+        // until every destination it routes to has it, so a partial failure retries
+        // next pass and reaches only the ones that missed it, exactly as an interval
+        // flush would. Counting it as sent instead would drop it here with nothing
+        // left in state to retry from.
+        //
+        // The same check clears events nothing can ever send: one whose routes were
+        // narrowed away, and one every routed destination already has. Both have no
+        // outstanding destination, so both come off the row rather than being
+        // re-read and re-decided on every pass for the life of the daemon.
+        let mut released = 0usize;
+        for event in ready {
+            match self.outstanding_destinations(&event).await {
+                Ok(0) => released += 1,
+                Ok(_) => keep.push(event),
+                Err(err) => {
+                    // Fail safe: keep it rather than risk dropping an undelivered event.
+                    warn!(dedup_key = %event.dedup_key, %err, "dedup check failed on release; keeping it held");
+                    keep.push(event);
+                }
+            }
         }
-        keep.extend(ready.into_iter().filter(|e| !sent.contains(&e.dedup_key)));
-        if let Err(err) = self
-            .write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &keep)
-            .await
-        {
-            warn!(%err, "released held digest events but could not rewrite the row; they may re-send");
+
+        if keep.len() != before {
+            if let Err(err) = self
+                .write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &keep)
+                .await
+            {
+                warn!(%err, "released held digest events but could not rewrite the row; they may re-send");
+            }
         }
-        info!(count = sent.len(), "released held digest events");
-        sent.len()
+        if released > 0 {
+            info!(
+                count = released,
+                sent = sent.len(),
+                "released held digest events"
+            );
+        }
+        released
     }
 
     /// Release events held by a deferring rule (quiet hours) now that the rule may
@@ -1091,6 +1146,35 @@ mod tests {
         }
         async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
             self.0.was_delivered_exact(k, sink).await
+        }
+        async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
+            self.0.mark_delivered(k, sink).await
+        }
+        async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
+            self.0.get_cursor(s, k).await
+        }
+        async fn put_cursor(&self, s: &str, k: &str, v: &str) -> Result<(), StateError> {
+            self.0.put_cursor(s, k, v).await
+        }
+    }
+
+    /// Wraps a store and fails every `was_delivered_exact`, so the release path's
+    /// fail-safe arm can be exercised.
+    struct DedupFails(Arc<MemState>);
+
+    #[async_trait]
+    impl StateStore for DedupFails {
+        async fn get_snapshot(&self, s: &str, scope: &str) -> Result<Option<Vec<u8>>, StateError> {
+            self.0.get_snapshot(s, scope).await
+        }
+        async fn put_snapshot(&self, s: &str, scope: &str, b: &[u8]) -> Result<(), StateError> {
+            self.0.put_snapshot(s, scope, b).await
+        }
+        async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            self.0.was_delivered(k, sink).await
+        }
+        async fn was_delivered_exact(&self, _: &str, _: &str) -> Result<bool, StateError> {
+            Err(StateError::Backend("database is locked".into()))
         }
         async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
             self.0.mark_delivered(k, sink).await
@@ -2386,6 +2470,211 @@ mod tests {
             1,
             "the next interval's batch is untouched"
         );
+    }
+
+    /// A release must not count "reached at least one destination" as done. With
+    /// slack and email both routed, a wedged email means the event has to stay on the
+    /// held row so the next pass retries it - and the per-destination dedup makes
+    /// that retry reach only email. Dropping it here would leave nothing in state to
+    /// retry from, which the interval flush deliberately avoids.
+    #[tokio::test]
+    async fn a_partial_failure_on_release_keeps_the_event_held() {
+        let good = Arc::new(MockDestination {
+            id: "good".into(),
+            ..Default::default()
+        });
+        let bad = Arc::new(MockDestination {
+            id: "bad".into(),
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![good.clone(), bad.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_HELD_SCOPE,
+                &[ev(EventKind::Mentioned, "k1")],
+            )
+            .await
+            .unwrap();
+
+        // good takes it, bad is wedged: not done, so it stays.
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(good.digests.lock().unwrap().len(), 1);
+        assert_eq!(digest_held(&engine).await, vec!["k1".to_string()]);
+
+        // The retry reaches only the destination that missed it.
+        bad.fail.store(false, Ordering::Relaxed);
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            good.digests.lock().unwrap().len(),
+            1,
+            "the destination that already had it must not be re-sent to"
+        );
+        assert_eq!(
+            bad.digests.lock().unwrap().as_slice(),
+            &[vec!["k1".to_string()]]
+        );
+        assert!(digest_held(&engine).await.is_empty());
+    }
+
+    /// An event nothing can send must come off the row rather than being re-read and
+    /// re-decided on every pass for the life of the daemon. Two ways that happens:
+    /// its routes were narrowed away, or every routed destination already has it.
+    #[tokio::test]
+    async fn a_release_clears_events_no_destination_still_needs() {
+        let dest = Arc::new(MockDestination {
+            id: "mock-notify".into(),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        // A route that covers no repo the events are in: nothing is routed to them.
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![Route {
+                source: "mock".into(),
+                destination: "mock-notify".into(),
+                repos: vec!["elsewhere/*".into()],
+                fallback: false,
+            }],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        // Unroutable, plus one every routed destination already has.
+        state
+            .delivered
+            .lock()
+            .unwrap()
+            .insert("already@mock-notify".to_string());
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_HELD_SCOPE,
+                &[
+                    ev(EventKind::Mentioned, "unroutable"),
+                    ev(EventKind::Mentioned, "already"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        engine.release_digest(&OUTSIDE_WINDOW).await;
+        assert!(
+            digest_held(&engine).await.is_empty(),
+            "events with no outstanding destination must not be re-parked for ever"
+        );
+        assert!(dest.digests.lock().unwrap().is_empty());
+    }
+
+    /// A rule that drops a held event must prune it even when the release sends
+    /// nothing, or the row keeps re-reading and re-deciding it every pass. The row is
+    /// rewritten whenever it shrank, not only when something went out.
+    #[tokio::test]
+    async fn a_release_prunes_dropped_events_even_when_nothing_sends() {
+        let dest = Arc::new(MockDestination {
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let mut rules = quiet_rules();
+        // `mentioned` is muted, `review_requested` is not.
+        rules.events.mentioned = false;
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_HELD_SCOPE,
+                &[
+                    ev(EventKind::Mentioned, "muted"),
+                    ev(EventKind::ReviewRequested, "wedged"),
+                ],
+            )
+            .await
+            .unwrap();
+
+        // Nothing is released: the only deliverable event's destination is wedged.
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(
+            digest_held(&engine).await,
+            vec!["wedged".to_string()],
+            "the muted event must be pruned even though the release sent nothing"
+        );
+    }
+
+    /// If the store can't answer whether a destination has the event, the release
+    /// must keep it. Guessing "done" would drop an event that may never have been
+    /// delivered, which is the failure this whole path exists to avoid.
+    #[tokio::test]
+    async fn a_dedup_failure_on_release_keeps_the_event_held() {
+        let dest = Arc::new(MockDestination::default());
+        let inner = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            Arc::new(DedupFails(inner.clone())),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_HELD_SCOPE,
+                &[ev(EventKind::Mentioned, "k1")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(
+            digest_held(&engine).await,
+            vec!["k1".to_string()],
+            "an unanswerable dedup check must not be read as delivered"
+        );
+    }
+
+    /// The held row is a third buffer, so it needs the same bound as the other two.
+    /// It accumulates across intervals rather than being trimmed inside `pending`,
+    /// and every pass rewrites the whole row.
+    #[tokio::test]
+    async fn the_held_digest_row_is_capped() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, _state) = engine_with(vec![], quiet_rules(), dest);
+
+        let seed: Vec<Event> = (0..MAX_BUFFERED)
+            .map(|i| ev(EventKind::Mentioned, &format!("k{i}")))
+            .collect();
+        engine
+            .write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &seed)
+            .await
+            .unwrap();
+        engine
+            .park_held(&[ev(EventKind::Mentioned, "newest")])
+            .await
+            .unwrap();
+
+        let held = digest_held(&engine).await;
+        assert_eq!(held.len(), MAX_BUFFERED);
+        assert_eq!(held.first().unwrap(), "k1", "the oldest is the one dropped");
+        assert_eq!(held.last().unwrap(), "newest");
     }
 
     #[tokio::test]
