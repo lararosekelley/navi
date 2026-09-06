@@ -299,3 +299,53 @@ async fn a_not_found_pr_does_advance_the_cursor() {
 async fn a_deleted_pr_does_advance_the_cursor() {
     assert_gone_status_advances(410).await;
 }
+
+/// #167: same guarantee as the github source. A PR whose fetch never succeeds is
+/// returned by every sweep and its cursor is deliberately held, so without a backoff
+/// it costs a re-fetch on every poll for the life of the daemon.
+#[tokio::test]
+async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
+    let server = Box::leak(Box::new(MockServer::start().await));
+    mock_sweep_hit_with_failing_pr(server, 500).await;
+
+    let state = MemState::default();
+    let source = sweeping_source(server);
+
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+    let after_first = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/4")
+        .count();
+    assert!(after_first > 0, "the first poll must actually try");
+
+    for _ in 0..3 {
+        assert!(source.poll(&state).await.expect("poll").is_empty());
+    }
+    let total = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/4")
+        .count();
+    assert_eq!(
+        total, after_first,
+        "three further polls inside the backoff window must cost no requests"
+    );
+
+    // The cursor is still held, so the PR is picked up again once it recovers.
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        state
+            .get_cursor("gitea", "pr:acme/widgets#4")
+            .await
+            .unwrap(),
+        None
+    );
+}

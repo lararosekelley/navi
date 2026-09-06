@@ -13,15 +13,15 @@ use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
 use navi_notifier_forge::{
-    diff, first_sight_watermark, team_key, ts_key, DiffContext, PrOutcome, PrSnapshot,
-    FIRST_SIGHT_LEEWAY,
+    diff, first_sight_watermark, team_key, ts_key, DiffContext, FetchBackoff, PrOutcome,
+    PrSnapshot, FIRST_SIGHT_LEEWAY,
 };
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// A team from `GET /user/teams`, reduced to what we need to match team requests.
 #[derive(Deserialize)]
@@ -107,6 +107,9 @@ pub struct GitHubSource {
     /// way: advancing it before delivery would skip a swept PR whose event never
     /// sent, losing it until the PR next changes.
     pending_pr_cursors: Mutex<HashMap<String, String>>,
+    /// Scopes whose fetch keeps failing, skipped for a growing interval so a PR that
+    /// can never be fetched doesn't cost a re-fetch on every poll for ever.
+    backoff: FetchBackoff,
 }
 
 impl GitHubSource {
@@ -133,6 +136,7 @@ impl GitHubSource {
             backfill: config.backfill,
             pending_mq: Mutex::new(HashMap::new()),
             pending_pr_cursors: Mutex::new(HashMap::new()),
+            backoff: FetchBackoff::default(),
         })
     }
 
@@ -330,18 +334,31 @@ impl GitHubSource {
         now: OffsetDateTime,
     ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{number}");
+        // Backed off from an earlier failure: report it as unfetched, which holds the
+        // cursor exactly as a fresh failure would, without spending the request.
+        if !self.backoff.ready(&scope, now) {
+            debug!(%scope, "skipping a PR that is backed off after repeated fetch failures");
+            return Ok(PrOutcome::Unfetched);
+        }
         let pr_data = match self.fetch_pr(owner, repo, number).await {
-            Ok(d) => d,
+            Ok(d) => {
+                self.backoff.clear(&scope);
+                d
+            }
             // One unfetchable PR shouldn't abort the poll, but the caller has to know
             // whether it may record this PR as seen: past a permanently gone one,
             // yes; past one that merely blipped, no, or the PR is skipped until its
             // timestamp moves and the failure outlives the poll it happened on.
             Err(e @ SourceError::Gone(_)) => {
+                // Permanently gone: the cursor advances, so there is nothing left to
+                // back off from.
+                self.backoff.clear(&scope);
                 warn!(%scope, error = %e, "PR is gone or not visible; skipping it for good");
                 return Ok(PrOutcome::Gone);
             }
             Err(e) => {
-                warn!(%scope, error = %e, "failed to fetch PR; will retry next poll");
+                let wait = self.backoff.failed(&scope, now);
+                warn!(%scope, error = %e, retry_in_secs = wait.whole_seconds(), "failed to fetch PR; backing off");
                 return Ok(PrOutcome::Unfetched);
             }
         };
