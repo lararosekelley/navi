@@ -712,7 +712,17 @@ impl Engine {
                 {
                     continue;
                 }
-                match self.state.was_delivered(&event.dedup_key, dest.id()).await {
+                // Exact, not the wildcard-tolerant check: an event already in the
+                // buffer when an older database was migrated carries a record that
+                // matches every sink, because the pre-per-sink code marked a digest
+                // event delivered as soon as it was enqueued. Folding that in here
+                // would empty every batch and then clear the buffer, silently losing
+                // exactly the events the user asked to have batched.
+                match self
+                    .state
+                    .was_delivered_exact(&event.dedup_key, dest.id())
+                    .await
+                {
                     Ok(false) => batch.push(event.clone()),
                     Ok(true) => {}
                     Err(err) => {
@@ -903,6 +913,11 @@ mod tests {
     use std::sync::Mutex;
     use time::OffsetDateTime;
 
+    /// The sentinel the SQLite store writes for records migrated from before
+    /// deliveries were tracked per sink. Mirrored here so the doubles answer the two
+    /// lookups the way the real store does.
+    const ANY: &str = "*";
+
     /// Minimal in-memory state store for exercising the engine.
     #[derive(Default)]
     struct MemState {
@@ -929,6 +944,12 @@ mod tests {
             Ok(())
         }
         async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            let d = self.delivered.lock().unwrap();
+            // Mirrors the SQLite store: a record written before deliveries were
+            // tracked per sink stands for every sink.
+            Ok(d.contains(&format!("{k}@{sink}")) || d.contains(&format!("{k}@{ANY}")))
+        }
+        async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
             Ok(self
                 .delivered
                 .lock()
@@ -970,6 +991,9 @@ mod tests {
         }
         async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
             self.0.was_delivered(k, sink).await
+        }
+        async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            self.0.was_delivered_exact(k, sink).await
         }
         async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
             self.0.mark_delivered(k, sink).await
@@ -2114,7 +2138,7 @@ mod tests {
         }
     }
 
-    /// Same for the deferred buffer.    /// Same for the deferred buffer.
+    /// Same for the deferred buffer.
     #[tokio::test]
     async fn dry_run_sees_an_event_already_deferred() {
         let dest = Arc::new(MockDestination::default());
@@ -2136,6 +2160,71 @@ mod tests {
             "already-held event previewed as new: {:?}",
             r.records[0].outcome
         );
+    }
+
+    /// The other half of the migration contract: a record carried over from before
+    /// per-sink tracking must still suppress live delivery, or upgrading re-notifies
+    /// the entire dedup history on the first poll.
+    #[tokio::test]
+    async fn a_migrated_record_still_suppresses_live_delivery() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            RuleConfig::default(),
+            dest.clone(),
+        );
+        state.delivered.lock().unwrap().insert(format!("k1@{ANY}"));
+
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(
+            matches!(r.records[0].outcome, EventOutcome::AlreadyDelivered),
+            "upgrade must not re-notify: {:?}",
+            r.records[0].outcome
+        );
+        assert!(dest.sent.lock().unwrap().is_empty());
+    }
+
+    /// Upgrading with a non-empty digest buffer must not empty it.
+    ///
+    /// Before deliveries were tracked per sink, a digest event was marked delivered
+    /// as soon as it was buffered, and the migration has to read those records as
+    /// "reached every destination" or an upgrade would re-notify. Inside the digest
+    /// flush that reading is wrong: the event was buffered, not sent. Folding it in
+    /// there empties every batch and the clean rewrite then clears the buffer, so
+    /// the events are lost rather than delayed - and the same record stops them
+    /// re-deriving.
+    #[tokio::test]
+    async fn a_migrated_record_does_not_empty_the_digest_buffer() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        // A database as an upgrade leaves it: the event is in the buffer, and its
+        // only delivery record is the migrated one that matches every sink.
+        let event = ev(EventKind::Mentioned, "k1");
+        engine
+            .write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, std::slice::from_ref(&event))
+            .await
+            .unwrap();
+        state.delivered.lock().unwrap().insert(format!("k1@{ANY}"));
+        // The live path still reads it as delivered everywhere, which is what keeps
+        // an upgrade from re-notifying.
+        assert!(state.was_delivered("k1", "mock-notify").await.unwrap());
+
+        let flush = engine.flush_digest(&FilterContext::default()).await;
+        assert_eq!(flush.sent, 1, "the buffered event must still go out");
+        assert_eq!(
+            dest.digests.lock().unwrap().as_slice(),
+            &[vec!["k1".to_string()]]
+        );
+        assert!(engine.read_digest().await.unwrap().is_empty());
     }
 
     #[tokio::test]
