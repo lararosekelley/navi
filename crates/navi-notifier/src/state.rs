@@ -158,14 +158,13 @@ impl SqliteStore {
     /// `updated:>=`, and old notifications fall behind the `notif_since` watermark,
     /// so neither comes back and the rows stay gone.
     ///
-    /// Not permanently, for a PR still open: `involved_open_prs` is
-    /// `is:open is:pr involves:{viewer}` with no date bound, so a quiet open PR is
-    /// returned by every sweep. Deleting its cursor means the next sweep re-diffs it
-    /// (a few REST calls, no events) and `commit_snapshots` writes the cursor back
-    /// with the same stale timestamp, so tomorrow's sweep deletes it again. On a
-    /// measured install about three quarters of stale `pr:` cursors belonged to
-    /// settled PRs and stayed gone; the rest re-arm daily. A small recurring cost
-    /// rather than a one-off, and the reason the VACUUM below runs most days.
+    /// Once per retention period, for a PR still open: `involved_open_prs` is
+    /// `is:open is:pr involves:{viewer}` with no date bound, so a quiet open PR keeps
+    /// being returned. Deleting its cursor costs one re-diff (a few REST calls, no
+    /// events), and that re-diff refreshes `snapshots.updated_at`, which is what this
+    /// dates off, so the row is not eligible again until another full period passes.
+    /// On a measured install about three quarters of stale `pr:` cursors belonged to
+    /// settled PRs, which are never re-diffed and so never come back at all.
     ///
     /// `snapshots` and `delivered` are left alone. Snapshots are the one table where
     /// eviction *can* re-notify (a first sight re-emits outstanding review requests,
@@ -188,8 +187,7 @@ impl SqliteStore {
             let c = lock(&conn)?;
             let tx = c.unchecked_transaction().map_err(backend)?;
 
-            // Two independent guards, because either alone is a thin thread to hang
-            // a delete on.
+            // Two guards, one per assumption the sweep makes.
             //
             // The key guard: a destination's own thread cursor is
             // `thread:{source}:{scope}` (`core::Event::thread_key`), so it carries a
@@ -197,34 +195,38 @@ impl SqliteStore {
             // to Slack and Discord, group a PR's alerts into one message thread, and
             // are not this sweep's business.
             //
-            // The value guard: those same cursors hold a Slack `ts`
-            // (`1750000000.123456`), which is all digits and therefore sorts before
-            // any date, so a bare `<` comparison would take every one of them. It
-            // also keeps the delete off dated global watermarks, which is why the key
-            // prefixes are listed explicitly rather than matching any dated value.
-            // The snapshot guard is the third, and the one the whole safety argument
-            // rests on: "the PR re-diffs against its unchanged snapshot and emits
-            // nothing" is only true when there *is* a snapshot. A source stages the
-            // `pr:` cursor even when the PR fetch failed (`github/src/source.rs:332`),
-            // so cursor-without-snapshot rows exist in practice. Dropping one turns
-            // the next sighting into a first sight, which re-emits an outstanding
-            // review request under a dedup key `delivered` has never seen, because
-            // the key is salted with the PR's `updated_at`.
+            // The snapshot guard carries the safety argument *and* the schedule. It
+            // has to exist at all because "the PR re-diffs against its unchanged
+            // snapshot and emits nothing" is only true when there is a snapshot, and
+            // a source stages the `pr:` cursor even when the PR fetch failed
+            // (`github/src/source.rs:332`), so cursor-without-snapshot rows are real.
+            // Dropping one would turn the next sighting into a first sight, which
+            // re-emits an outstanding review request under a dedup key `delivered`
+            // has never seen, since the key is salted with the PR's `updated_at`.
+            //
+            // Dating off `snapshots.updated_at` rather than off the cursor's own
+            // value is what keeps that re-diff from repeating. `put_snapshot`
+            // refreshes the column on every upsert, so it records when navi last
+            // actually diffed the PR, which is not the same as when the PR last
+            // changed. A quiet but still-open PR is returned by every involved-PR
+            // sweep (`is:open is:pr involves:{viewer}` has no date bound), so
+            // deleting its cursor causes one re-diff - and that re-diff writes a
+            // fresh `updated_at`, holding the row for another full retention period
+            // instead of it being deleted again tomorrow.
             let dated = tx
                 .execute(
                     "DELETE FROM cursors
-                      WHERE value LIKE ?1
-                        AND value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
-                        AND ((key LIKE 'pr:%'
-                              AND EXISTS (SELECT 1 FROM snapshots s
-                                           WHERE s.source_id = cursors.source_id
-                                             AND s.scope = substr(cursors.key, 4)))
-                          OR (key LIKE 'thread:%'
-                              AND instr(substr(key, 8), ':') = 0
-                              AND EXISTS (SELECT 1 FROM snapshots s
-                                           WHERE s.source_id = cursors.source_id
-                                             AND s.scope = substr(cursors.key, 8))))",
-                    params![RFC3339_SHAPE, cutoff],
+                      WHERE (key LIKE 'pr:%'
+                             OR (key LIKE 'thread:%' AND instr(substr(key, 8), ':') = 0))
+                        AND EXISTS (
+                          SELECT 1 FROM snapshots s
+                           WHERE s.source_id = cursors.source_id
+                             AND s.scope = CASE
+                                   WHEN cursors.key LIKE 'pr:%' THEN substr(cursors.key, 4)
+                                   ELSE substr(cursors.key, 8)
+                                 END
+                             AND s.updated_at < datetime('now', ?1))",
+                    params![cutoff],
                 )
                 .map_err(backend)? as u64;
 
@@ -248,10 +250,6 @@ impl SqliteStore {
         .map_err(join)?
     }
 }
-
-/// `LIKE` pattern matching the leading `YYYY-MM-DDT` of an RFC3339 instant. Used to
-/// tell cursors whose value is a date from ones that merely sort like one.
-const RFC3339_SHAPE: &str = "____-__-__T%";
 
 /// Lock the connection, mapping a poisoned mutex to a backend error rather than
 /// panicking the whole daemon.
@@ -593,24 +591,30 @@ mod tests {
 
     /// A realistic cursor table: one long-quiet PR and one touched today, each with
     /// the full set of per-PR bookkeeping, plus the global and per-repo rows.
-    /// Give a scope the snapshot the sweep now requires before it will drop a
-    /// cursor for it.
-    fn put_snapshot_raw(store: &SqliteStore, source: &str, scope: &str) {
+    /// Give a scope a snapshot last diffed `days` ago. The sweep dates off this,
+    /// not off the cursor's value, so this is what decides eligibility.
+    fn put_snapshot_aged(store: &SqliteStore, source: &str, scope: &str, days: u32) {
         store
             .conn
             .lock()
             .unwrap()
             .execute(
-                "INSERT INTO snapshots (source_id, scope, bytes) VALUES (?1, ?2, x'7b7d')",
-                params![source, scope],
+                "INSERT INTO snapshots (source_id, scope, bytes, updated_at)
+                 VALUES (?1, ?2, x'7b7d', datetime('now', ?3))",
+                params![source, scope, format!("-{days} days")],
             )
             .unwrap();
     }
 
+    /// Diffed just now: never eligible.
+    fn put_snapshot_fresh(store: &SqliteStore, source: &str, scope: &str) {
+        put_snapshot_aged(store, source, scope, 0);
+    }
+
     fn seeded_cursors() -> SqliteStore {
         let store = SqliteStore::open_in_memory().unwrap();
-        put_snapshot_raw(&store, "github", "acme/w#1");
-        put_snapshot_raw(&store, "github", "acme/w#2");
+        put_snapshot_aged(&store, "github", "acme/w#1", 400);
+        put_snapshot_fresh(&store, "github", "acme/w#2");
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#1", "absent");
@@ -686,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn prune_never_touches_merge_queue_state() {
         let store = SqliteStore::open_in_memory().unwrap();
-        put_snapshot_raw(&store, "github", "acme/w#1");
+        put_snapshot_aged(&store, "github", "acme/w#1", 400);
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#1", "queued");
@@ -705,7 +709,7 @@ mod tests {
     #[tokio::test]
     async fn merge_queue_state_is_excluded_by_key_not_by_its_value() {
         let store = SqliteStore::open_in_memory().unwrap();
-        put_snapshot_raw(&store, "github", "acme/w#1");
+        put_snapshot_aged(&store, "github", "acme/w#1", 400);
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         // A value in the shape the follow-up would give it.
         put_raw(&store, "github", "mq:acme/w#1", "2020-01-01T00:00:00Z");
@@ -727,7 +731,7 @@ mod tests {
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         // The same pair for a PR that was diffed successfully.
-        put_snapshot_raw(&store, "github", "acme/w#2");
+        put_snapshot_aged(&store, "github", "acme/w#2", 400);
         put_raw(&store, "github", "pr:acme/w#2", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#2", "2020-01-01T00:00:00Z");
 
@@ -740,24 +744,41 @@ mod tests {
         );
     }
 
-    /// The sweep deletes only rows it can actually date. The key guard alone would
-    /// take a `pr:`-prefixed row whatever its value, so this pins the second guard
-    /// independently: without it, a source that ever stored something other than a
-    /// timestamp under one of these prefixes would have it deleted on the first
-    /// sweep, since almost anything sorts below a date.
+    /// The sweep never reads the cursor's own value: the snapshot's age is what
+    /// decides. That is what stops a still-open quiet PR from being re-diffed every
+    /// day, since its value stays stale while the re-diff refreshes the snapshot.
     #[tokio::test]
-    async fn prune_only_deletes_rows_it_can_date() {
+    async fn eligibility_comes_from_the_snapshot_not_the_cursor_value() {
         let store = SqliteStore::open_in_memory().unwrap();
-        put_snapshot_raw(&store, "github", "acme/w#1");
-        put_snapshot_raw(&store, "github", "acme/w#2");
-        put_raw(&store, "github", "pr:acme/w#1", "not-a-timestamp");
-        put_raw(&store, "github", "thread:acme/w#1", "0");
-        put_raw(&store, "github", "pr:acme/w#2", "2020-01-01T00:00:00Z");
+        // Stale value, freshly diffed: the re-diff has already happened, so this
+        // must not be swept again.
+        put_snapshot_fresh(&store, "github", "acme/w#1");
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        // Value that is not a date at all, but long unvisited: still eligible.
+        put_snapshot_aged(&store, "github", "acme/w#2", 400);
+        put_raw(&store, "github", "pr:acme/w#2", "not-a-timestamp");
+
+        assert_eq!(store.prune(90).await.unwrap().cursors, 1);
+        assert_eq!(cursor_keys(&store), vec!["github|pr:acme/w#1"]);
+    }
+
+    /// The `EXISTS` is correlated on `source_id` as well as scope. GitHub and Gitea
+    /// both scope as `owner/repo#n`, so without it one source's fresh snapshot would
+    /// vouch for another source's stale cursor, or the reverse.
+    #[tokio::test]
+    async fn a_snapshot_only_vouches_for_its_own_source() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Same scope, two sources: gitea long-quiet, github diffed just now.
+        put_snapshot_aged(&store, "gitea", "acme/w#1", 400);
+        put_snapshot_fresh(&store, "github", "acme/w#1");
+        put_raw(&store, "gitea", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
 
         assert_eq!(store.prune(90).await.unwrap().cursors, 1);
         assert_eq!(
             cursor_keys(&store),
-            vec!["github|pr:acme/w#1", "github|thread:acme/w#1"]
+            vec!["github|pr:acme/w#1"],
+            "github's fresh snapshot must not vouch for gitea's cursor, or vice versa"
         );
     }
 
@@ -766,9 +787,15 @@ mod tests {
     #[tokio::test]
     async fn prune_leaves_destination_thread_cursors() {
         let store = SqliteStore::open_in_memory().unwrap();
-        put_snapshot_raw(&store, "github", "acme/w#1");
-        put_snapshot_raw(&store, "github", "acme/w#2");
-        // Value guard alone would already exclude a Slack `ts`; give it a dated value
+        put_snapshot_aged(&store, "github", "acme/w#1", 400);
+        put_snapshot_aged(&store, "github", "acme/w#2", 400);
+        // Contrived, so that only the key guard is left to save these rows: give the
+        // destination namespaces the snapshots the other guard would otherwise miss.
+        // Destinations never write snapshots, so this state cannot arise; the point
+        // is to test one guard rather than two.
+        put_snapshot_aged(&store, "slack", "github:acme/w#1", 400);
+        put_snapshot_aged(&store, "discord", "github:acme/w#2", 400);
+        // Give these a dated value
         // so only the key guard can save it.
         put_raw(
             &store,
