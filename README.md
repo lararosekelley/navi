@@ -50,8 +50,9 @@ re-review"; for GitLab it reads the Todos feed. GitHub also polls your involved 
 default), so reviews on your own PRs and activity in muted repos reach you even when GitHub creates no notification.
 State lives in a local SQLite database, so delivery is idempotent (tracked per destination, so a retry after one
 destination fails never re-pings the others) and your read/unread state on the source is never touched. Poll
-bookkeeping for PRs that have been quiet for `general.state_retention_days` is swept once a day, so the database
-doesn't grow forever with every PR navi has ever seen.
+bookkeeping for PRs that have been quiet for `general.state_retention_days` is swept once a day by `navi run`, so the
+database doesn't grow forever with every PR navi has ever seen. Rows for settled PRs stay gone; a still-open but quiet
+PR is re-fetched by each sweep, which costs a few API calls and no alerts.
 
 ## Install
 
@@ -182,7 +183,7 @@ knowing about:
 | `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.                           |
 | `general`            | `comment_min_age_secs`   | Hold comments back this long so bots that edit in place settle first. |
 | `general`            | `backfill`               | First-poll behavior: `review_requests`, `none`, or `all_open`.        |
-| `general`            | `state_retention_days`   | Days before a quiet PR's poll bookkeeping is dropped. `0` keeps all.  |
+| `general`            | `state_retention_days`   | Days before a quiet PR's poll bookkeeping is dropped (`run` only).    |
 | `general`            | `log_level`              | `tracing` filter, e.g. `info` or `navi=debug`.                        |
 | `github`             | `token_env` / `api_base` | Source. Token env var; API base for GitHub Enterprise.                |
 | `github`             | `track_prs`              | Also poll your involved open PRs, not just the notifications inbox.   |
