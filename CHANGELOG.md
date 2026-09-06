@@ -4,6 +4,16 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.5
+
+### Fixed
+
+- **source:** don't record a pull request as seen when it couldn't be fetched.
+  A momentary API failure used to advance the per-PR cursor anyway, so the PR
+  was skipped until something moved its timestamp again, and its cursor was left
+  sitting ahead of its snapshot. A PR the forge reports as gone still advances,
+  so a deleted or now-invisible one isn't re-fetched on every poll
+
 ## 0.3.4
 
 ### Added

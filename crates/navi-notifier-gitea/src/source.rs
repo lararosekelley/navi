@@ -11,7 +11,7 @@ use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::PrData;
 use navi_notifier_forge::{
-    diff, first_sight_watermark, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
+    diff, first_sight_watermark, DiffContext, PrOutcome, PrSnapshot, FIRST_SIGHT_LEEWAY,
 };
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
@@ -204,13 +204,21 @@ impl GiteaSource {
         first_sight_backfill: Option<Backfill>,
         viewer: &str,
         now: OffsetDateTime,
-    ) -> Result<Vec<Event>, SourceError> {
+    ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{index}");
         let pr_data = match self.fetch_pr(owner, repo, index).await {
             Ok(d) => d,
+            // One unfetchable PR shouldn't abort the poll, but the caller has to know
+            // whether it may record this PR as seen: past a permanently gone one,
+            // yes; past one that merely blipped, no, or the PR is skipped until its
+            // timestamp moves and the failure outlives the poll it happened on.
+            Err(e @ SourceError::NotFound(_)) => {
+                warn!(%scope, error = %e, "gitea PR is gone or not visible; skipping it for good");
+                return Ok(PrOutcome::Gone);
+            }
             Err(e) => {
-                warn!(%scope, error = %e, "failed to fetch gitea PR; skipping");
-                return Ok(Vec::new());
+                warn!(%scope, error = %e, "failed to fetch gitea PR; will retry next poll");
+                return Ok(PrOutcome::Unfetched);
             }
         };
         let old: PrSnapshot = match state.get_snapshot(SOURCE_ID, &scope).await? {
@@ -236,7 +244,7 @@ impl GiteaSource {
         let bytes = serde_json::to_vec(&new_snapshot)
             .map_err(|e| SourceError::Parse(format!("serialize snapshot {scope}: {e}")))?;
         self.pending_snapshots.lock().unwrap().insert(scope, bytes);
-        Ok(evs)
+        Ok(PrOutcome::Diffed(evs))
     }
 
     /// Open PRs the viewer is involved in (author, assignee, mentioned, or a
@@ -343,7 +351,7 @@ impl GiteaSource {
                     continue;
                 }
             }
-            let evs = self
+            let outcome = self
                 .process_pr(
                     state,
                     &owner,
@@ -357,11 +365,15 @@ impl GiteaSource {
                 )
                 .await?;
             // Defer the cursor advance to `commit_snapshots` (after delivery).
-            self.pending_pr_cursors
-                .lock()
-                .unwrap()
-                .insert(scope.clone(), updated_at);
-            events.extend(evs);
+            // Skipped entirely when the PR wasn't fetched: advancing then would leave
+            // the cursor ahead of the snapshot and hide the PR until it changes again.
+            if outcome.may_advance_cursor() {
+                self.pending_pr_cursors
+                    .lock()
+                    .unwrap()
+                    .insert(scope.clone(), updated_at);
+            }
+            events.extend(outcome.into_events());
             processed.insert(scope);
         }
         Ok(())
@@ -406,7 +418,7 @@ impl Source for GiteaSource {
                 continue;
             };
             let scope = format!("{owner}/{repo}#{index}");
-            let evs = self
+            let outcome = self
                 .process_pr(
                     state,
                     owner,
@@ -420,7 +432,9 @@ impl Source for GiteaSource {
                     poll_start,
                 )
                 .await?;
-            events.extend(evs);
+            // No cursor to guard here: gitea's notification pass is bounded by the
+            // global `notif_since` watermark, not by a per-thread one.
+            events.extend(outcome.into_events());
             processed.insert(scope);
         }
 
@@ -559,6 +573,10 @@ fn map_status(resp: &reqwest::Response) -> Result<(), SourceError> {
         return Ok(());
     }
     match status.as_u16() {
+        // Permanent: the PR is deleted, or in a repo this token can no longer see.
+        // Kept distinct from a 5xx so callers can stop asking instead of retrying it
+        // on every poll for ever.
+        404 => Err(SourceError::NotFound("gitea returned 404".into())),
         401 => Err(SourceError::Auth("invalid Gitea token".into())),
         403 => Err(SourceError::Auth(
             "Gitea returned 403; the token may lack the needed scopes".into(),

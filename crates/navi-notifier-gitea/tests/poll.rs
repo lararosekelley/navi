@@ -192,3 +192,100 @@ async fn self_merged_pr_caught_by_the_closed_sweep() {
         "commit advances the cursor once delivery is confirmed"
     );
 }
+
+/// Mount an empty inbox plus an open-sweep hit for `acme/widgets#4`, with the PR
+/// fetch answering `status`.
+async fn mock_sweep_hit_with_failing_pr(server: &MockServer, status: u16) {
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "number": 4,
+            "updated_at": "2024-02-02T00:00:00Z",
+            "repository": { "full_name": "acme/widgets", "html_url": "https://gitea.test/acme/widgets" }
+        }])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/4"))
+        .respond_with(ResponseTemplate::new(status))
+        .mount(server)
+        .await;
+}
+
+fn sweeping_source(server: &MockServer) -> GiteaSource {
+    GiteaSource::new(GiteaSourceConfig {
+        token: "test-token".into(),
+        api_base: Some(server.uri()),
+        comment_min_age_secs: 0,
+        track_prs: true,
+        backfill: Default::default(),
+    })
+    .expect("build")
+}
+
+/// #162: a PR that couldn't be fetched was never compared against its snapshot, so
+/// recording it as seen hides it until its timestamp moves again.
+#[tokio::test]
+async fn a_transient_fetch_failure_does_not_advance_the_pr_cursor() {
+    let server = MockServer::start().await;
+    mock_sweep_hit_with_failing_pr(&server, 500).await;
+
+    let state = MemState::default();
+    let source = sweeping_source(&server);
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state
+            .get_cursor("gitea", "pr:acme/widgets#4")
+            .await
+            .unwrap(),
+        None,
+        "a PR that was never fetched must be retried, not skipped until it changes"
+    );
+}
+
+/// And the other half: a gone PR is skipped for good rather than re-fetched for ever.
+#[tokio::test]
+async fn a_missing_pr_does_advance_the_cursor() {
+    let server = MockServer::start().await;
+    mock_sweep_hit_with_failing_pr(&server, 404).await;
+
+    let state = MemState::default();
+    let source = sweeping_source(&server);
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state
+            .get_cursor("gitea", "pr:acme/widgets#4")
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("2024-02-02T00:00:00Z"),
+        "a deleted or invisible PR is skipped for good"
+    );
+}
