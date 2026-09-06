@@ -336,7 +336,12 @@ impl Engine {
                 Ok(pending) if pending.is_empty() && !targets.is_empty() => {
                     EventOutcome::AlreadyDelivered
                 }
-                Ok(_) => EventOutcome::WouldDeliver { to: target_ids },
+                // The pending subset, not every routed destination: after a partial
+                // failure the live retry sends to the ones that missed it, so naming
+                // all of them would preview a send that will not happen.
+                Ok(pending) => EventOutcome::WouldDeliver {
+                    to: pending.iter().map(|d| d.id().to_string()).collect(),
+                },
                 Err(err) => {
                     warn!(dedup_key = %event.dedup_key, %err, "dedup check failed; previewing as deliverable");
                     EventOutcome::WouldDeliver { to: target_ids }
@@ -2081,7 +2086,35 @@ mod tests {
         ));
     }
 
-    /// Same for the deferred buffer.
+    /// After a partial failure the preview must name only the destinations the retry
+    /// will actually reach.
+    #[tokio::test]
+    async fn dry_run_names_only_the_destinations_still_pending() {
+        let good = Arc::new(MockDestination {
+            id: "good".into(),
+            ..Default::default()
+        });
+        let bad = Arc::new(MockDestination {
+            id: "bad".into(),
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let (engine, _state) = engine_fanning_out(good.clone(), bad.clone());
+
+        // good takes it, bad fails.
+        engine.run_once(FilterContext::default(), false).await;
+        assert_eq!(good.sent.lock().unwrap().len(), 1);
+
+        let r = engine.run_once(FilterContext::default(), true).await;
+        match &r.records[0].outcome {
+            EventOutcome::WouldDeliver { to } => {
+                assert_eq!(to, &["bad".to_string()], "preview must not re-list good")
+            }
+            other => panic!("expected WouldDeliver, got {other:?}"),
+        }
+    }
+
+    /// Same for the deferred buffer.    /// Same for the deferred buffer.
     #[tokio::test]
     async fn dry_run_sees_an_event_already_deferred() {
         let dest = Arc::new(MockDestination::default());
