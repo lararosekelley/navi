@@ -265,11 +265,11 @@ async fn a_transient_fetch_failure_does_not_advance_the_pr_cursor() {
     );
 }
 
-/// And the other half: a gone PR is skipped for good rather than re-fetched for ever.
-#[tokio::test]
-async fn a_missing_pr_does_advance_the_cursor() {
+/// And the other half: a gone PR is skipped for good rather than re-fetched for
+/// ever. 404 and 410 (the deleted-resource response) are both permanent.
+async fn assert_gone_status_advances(status: u16) {
     let server = MockServer::start().await;
-    mock_sweep_hit_with_failing_pr(&server, 404).await;
+    mock_sweep_hit_with_failing_pr(&server, status).await;
 
     let state = MemState::default();
     let source = sweeping_source(&server);
@@ -288,4 +288,14 @@ async fn a_missing_pr_does_advance_the_cursor() {
         Some("2024-02-02T00:00:00Z"),
         "a deleted or invisible PR is skipped for good"
     );
+}
+
+#[tokio::test]
+async fn a_not_found_pr_does_advance_the_cursor() {
+    assert_gone_status_advances(404).await;
+}
+
+#[tokio::test]
+async fn a_deleted_pr_does_advance_the_cursor() {
+    assert_gone_status_advances(410).await;
 }
