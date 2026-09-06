@@ -2227,6 +2227,40 @@ mod tests {
         assert!(engine.read_digest().await.unwrap().is_empty());
     }
 
+    /// A poll that produces no events must still flush snapshots.
+    ///
+    /// The cursor sweep in `navi-notifier` dates off `snapshots.updated_at` and
+    /// relies on this: deleting a quiet PR's cursor causes one event-free re-diff,
+    /// and that re-diff has to refresh the column or the row is eligible again
+    /// tomorrow and the PR is re-fetched daily for ever. `commit_snapshots` is
+    /// called once per source outside the per-event loop, which is what makes that
+    /// true - and from in here, skipping the flush when a pass found nothing reads
+    /// like a free optimisation.
+    #[tokio::test]
+    async fn snapshots_are_committed_even_when_a_poll_finds_nothing() {
+        let source = Arc::new(MockSource {
+            events: vec![],
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![source.clone()],
+            vec![Arc::new(MockDestination::default())],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state,
+        );
+
+        let report = engine.run_once(FilterContext::default(), false).await;
+        assert!(report.records.is_empty());
+        assert_eq!(
+            source.committed.lock().unwrap().as_slice(),
+            &[HashSet::new()],
+            "an event-free pass must still commit, or the cursor sweep re-fetches \
+             every quiet PR daily"
+        );
+    }
+
     #[tokio::test]
     async fn routes_scope_by_repo() {
         // dest-a is limited to acme/*; dest-b takes everything.

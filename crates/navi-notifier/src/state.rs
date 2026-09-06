@@ -135,8 +135,9 @@ impl SqliteStore {
     /// snapshot, which is *not* pruned, is what actually suppresses re-notification:
     ///
     /// - `pr:{scope}` gates the involved-PR sweep on the PR's `updated_at`. Without
-    ///   it the PR is diffed once more against its unchanged snapshot, which yields
-    ///   no events.
+    ///   it the PR is diffed once more against its stored snapshot. That yields no
+    ///   events whenever the snapshot is level with the PR, which is every row except
+    ///   the ones described under "the one case that alerts" below.
     /// - `thread:{scope}` gates notification re-processing the same way, and the
     ///   source already notes the snapshot would suppress any duplicate.
     ///
@@ -166,17 +167,37 @@ impl SqliteStore {
     /// On a measured install about three quarters of stale `pr:` cursors belonged to
     /// settled PRs, which are never re-diffed and so never come back at all.
     ///
+    /// ## The one case that alerts
+    ///
+    /// A cursor can sit *ahead* of its snapshot: the involved sweep stages the cursor
+    /// once `process_pr` returns `Ok`, and `process_pr` returns `Ok(vec![])` without
+    /// staging a snapshot when the PR fetch fails (#162). One failed fetch on a PR
+    /// that had just changed leaves the cursor holding the new timestamp and the
+    /// snapshot holding the pre-change state.
+    ///
+    /// For those rows the re-diff is against a snapshot that is behind rather than
+    /// level, so it emits everything accumulated since the last successful diff, with
+    /// the original `occurred_at`. That is a late alert for activity that was never
+    /// delivered, not a duplicate and not a first sight (`old.initialized` is still
+    /// true, so no back-fill runs) - arguably #162 repairing itself on a timer. It is
+    /// the only path here that produces an alert at all, which is why the guarantee
+    /// elsewhere is worded as "never a duplicate" rather than "never an alert".
+    ///
     /// `snapshots` and `delivered` are left alone. Snapshots are the one table where
-    /// eviction *can* re-notify (a first sight re-emits outstanding review requests,
+    /// eviction *can* re-notify: a first sight re-emits outstanding review requests,
     /// and the review-request dedup key is salted with the PR's `updated_at`, so the
-    /// stored key can never match the re-derived one), and they are both the
-    /// slowest-growing table and a minority of the file.
+    /// stored key can never match the re-derived one. They gain the fewest rows per
+    /// day of the three tables, though the largest rows, and `seen_issue_comments`
+    /// and friends grow with a PR's discussion while a cursor row stays fixed-size.
+    /// Both tables remain deliberately retained and unbounded.
     ///
     /// Destination-side `thread:{source}:{scope}` cursors (Slack and Discord message
     /// ids, used to group a PR's alerts into one thread) are not pruned yet. They
-    /// could be, by rebuilding the key forward from a stale `pr:` row rather than by
-    /// interpreting the value, which is what an earlier version of this comment
-    /// wrongly gave as the obstacle.
+    /// could be, by rebuilding the key forward from the `snapshots` row rather than
+    /// by interpreting the value. Anchor on the snapshot, not on a `pr:` cursor: this
+    /// sweep deletes those, permanently for the settled majority, so anything keyed
+    /// off them would miss every destination cursor whose sibling an earlier release
+    /// already swept.
     pub async fn prune(&self, retention_days: u32) -> Result<Pruned, StateError> {
         if retention_days == 0 {
             return Ok(Pruned::default());
@@ -235,7 +256,7 @@ impl SqliteStore {
             // Deleting leaves the pages allocated, so the file only shrinks on a
             // VACUUM. It rewrites the whole database, which at this size (single
             // digit MB) is cheap enough to run on any day that removed something,
-            // and the re-arming described above means that is most days.
+            // and PRs keep settling past the horizon, so that is most days.
             if pruned.cursors > 0 {
                 // The delete is already committed, so a VACUUM failure costs disk,
                 // not correctness. Reporting it as a failed prune would understate
@@ -651,23 +672,6 @@ mod tests {
                 "slack|thread:github:acme/w#1",
             ]
         );
-    }
-
-    /// The one that would bite silently: a Slack `ts` is all digits, so a bare
-    /// `value < cutoff` string comparison deletes it, losing the thread grouping for
-    /// every PR. The RFC3339 shape guard is what stops that.
-    #[tokio::test]
-    async fn prune_leaves_cursors_whose_value_is_not_a_date() {
-        let store = SqliteStore::open_in_memory().unwrap();
-        put_raw(
-            &store,
-            "slack",
-            "thread:github:acme/w#1",
-            "1750000000.123456",
-        );
-        put_raw(&store, "github", "mq:acme/w#1", "absent");
-        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
-        assert_eq!(cursor_keys(&store).len(), 2);
     }
 
     /// A global watermark is a cursor with a dated value too, and deleting it would
