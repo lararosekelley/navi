@@ -215,15 +215,13 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
         // Flush the digest on its own cadence, independent of the poll interval.
         if config.digest.enabled && last_digest.elapsed() >= digest_interval {
             let flush = engine.flush_digest(&filter_context(&config)).await;
-            // Only start the next interval once the window has stopped holding
-            // events back. Otherwise an attempt that could never send still burns
-            // the whole period, and a digest whose phase lands inside the quiet
-            // window never flushes at all: at `interval_secs = 86400` the phase is
-            // pinned to the daemon's start time, so a daemon started at 23:00 with a
-            // 22:00-08:00 window would retry at 23:00 for ever, and the buffer would
-            // grow to its cap and start discarding events that are already marked
-            // delivered. Retrying next pass is a buffer read, so it is cheap.
-            if flush.held == 0 {
+            // A flush a quiet window held back entirely is retried next pass rather
+            // than burning the interval: at `interval_secs = 86400` the phase is
+            // pinned to the daemon's start time, so a daemon started inside the
+            // window would otherwise retry there for ever and never flush at all.
+            // Anything else, including a partly-held or failed flush, starts the next
+            // interval normally.
+            if flush.starts_next_interval() {
                 last_digest = std::time::Instant::now();
             }
         }
