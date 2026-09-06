@@ -78,20 +78,29 @@ Keep it tight. One good comment beats five obvious ones.
 
 ## Confidence score (0 to 100)
 
-**Definition:** likelihood this reaches production without introducing a defect.
+**Definition:** likelihood this reaches production without introducing a defect. Capped at 100, floored at 0.
+
+Score against the numbered priorities in "What to look for" rather than a second list, so the two can't drift apart as
+that section changes.
 
 - Start at **95**.
-- Subtract heavily for the things that break navi's promise: an event that can fire twice or on first sight, a dedup
-  key that can't match what it is meant to suppress, a change that makes navi ping more often by default, a filter
-  that fails open, a break in the `mark_delivered` / source `commit` / `commit_snapshots` ordering, a token that can
-  reach a log or an error message, blocking I/O on the async path, or a state migration that can re-notify.
-- Subtract for high blast radius, a behaviour change with no test change, and provider specifics leaking into
-  `navi-notifier-core`.
+- Subtract heavily for a confirmed finding under priorities 1, 2, 3, or 6: an event that can fire twice or on first
+  sight, a dedup key that can't match what it is meant to suppress, anything that makes navi ping more by default, a
+  filter that fails open, a break in the `mark_delivered` / source `commit` / `commit_snapshots` ordering, or a token
+  that can reach a log. These break navi's promise directly.
+- Subtract moderately for priorities 4, 5, 7, 8, and 9: layering leaks, a half-landed event kind or config knob,
+  blocking I/O on the async path, a behaviour change with no test change, and user-facing surface drift.
+- Subtract for high blast radius, and for a state migration that can re-notify.
 - Add back modestly for clear intent, low blast radius, targeted tests that would actually catch the regression, and
   passing CI.
 - In follow-ups, include the new score and the delta against the prior one.
 
-## Final output (your only top-level response)
+## Final output
+
+This is your only top-level response, and it applies to a **full review** (the `pull_request` event). A run triggered
+by a comment is a conversation: answer what was asked, in whatever shape fits, and do not re-run the review or repeat
+the template unless asked to. If a comment does ask for a re-review, use the template and report the new score with
+its delta against the previous one.
 
 ### If findings exist
 
