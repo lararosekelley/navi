@@ -183,7 +183,7 @@ knowing about:
 | `general`            | `utc_offset_minutes`     | Your UTC offset, used only for quiet hours.                           |
 | `general`            | `comment_min_age_secs`   | Hold comments back this long so bots that edit in place settle first. |
 | `general`            | `backfill`               | First-poll behavior: `review_requests`, `none`, or `all_open`.        |
-| `general`            | `state_retention_days`   | Days before a quiet PR's poll bookkeeping is dropped (`run` only).    |
+| `general`            | `state_retention_days`   | Days before a quiet PR's poll cursors are dropped; `0` keeps all.     |
 | `general`            | `log_level`              | `tracing` filter, e.g. `info` or `navi=debug`.                        |
 | `github`             | `token_env` / `api_base` | Source. Token env var; API base for GitHub Enterprise.                |
 | `github`             | `track_prs`              | Also poll your involved open PRs, not just the notifications inbox.   |
