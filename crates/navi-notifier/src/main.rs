@@ -392,9 +392,11 @@ comment_min_age_secs = 0
 backfill = "review_requests"
 # Days a PR can go untouched before navi forgets its poll bookkeeping. Only the
 # per-PR cursors are dropped, never the snapshots or delivery records that keep
-# alerts exactly-once, so this can cost one extra API call for a PR that wakes up
-# again but can never produce a duplicate alert. Swept once a day. 0 keeps
-# everything forever.
+# alerts exactly-once, so this can cost a re-fetch of a PR that wakes up again but
+# can never produce a duplicate alert. Swept once a day by `navi run`; `navi once`
+# polls without sweeping. Rows for settled PRs stay gone; a PR that is still open
+# but quiet is re-fetched by each sweep, since the open-PR search has no date bound.
+# 0 keeps everything forever.
 state_retention_days = 90
 
 # Every provider starts disabled. `navi init` walks you through enabling the ones

@@ -126,25 +126,47 @@ pub struct Pruned {
 impl SqliteStore {
     /// Drop per-PR cursors for pull requests that have been quiet for
     /// `retention_days`, so a long-running daemon's database stops growing purely
-    /// with the number of PRs it has ever seen. `0` disables it.
+    /// with the number of PRs it has ever seen. `0` disables it. Run once a day by
+    /// the `run` daemon only; `once` polls and exits without sweeping.
     ///
     /// Only cursors, and only these three kinds. Each is safe to lose because the
     /// snapshot, which is *not* pruned, is what actually suppresses re-notification:
     ///
     /// - `pr:{scope}` gates the involved-PR sweep on the PR's `updated_at`. Without
     ///   it the PR is diffed once more against its unchanged snapshot, which yields
-    ///   no events; the cost is one API call, once.
+    ///   no events.
     /// - `thread:{scope}` gates notification re-processing the same way, and the
     ///   source already notes the snapshot would suppress any duplicate.
     /// - `mq:{scope}` holds the last-seen merge-queue state. A missing prior state is
     ///   treated as first sight and deliberately does not back-fill a transition, so
     ///   dropping it baselines rather than firing.
     ///
+    /// ## What this actually reclaims
+    ///
+    /// Permanently, for a PR that has settled: the closed-PR sweep is bounded by
+    /// `updated:>=`, and old notifications fall behind the `notif_since` watermark,
+    /// so neither comes back and the rows stay gone.
+    ///
+    /// Not permanently, for a PR still open: `involved_open_prs` is
+    /// `is:open is:pr involves:{viewer}` with no date bound, so a quiet open PR is
+    /// returned by every sweep. Deleting its cursor means the next sweep re-diffs it
+    /// (a few REST calls, no events) and `commit_snapshots` writes the cursor back
+    /// with the same stale timestamp, so tomorrow's sweep deletes it again. On a
+    /// measured install about three quarters of stale `pr:` cursors belonged to
+    /// settled PRs and stayed gone; the rest re-arm daily. A small recurring cost
+    /// rather than a one-off, and the reason the VACUUM below runs most days.
+    ///
     /// `snapshots` and `delivered` are left alone. Snapshots are the one table where
     /// eviction *can* re-notify (a first sight re-emits outstanding review requests,
     /// and the review-request dedup key is salted with the PR's `updated_at`, so the
     /// stored key can never match the re-derived one), and they are both the
     /// slowest-growing table and a minority of the file.
+    ///
+    /// Destination-side `thread:{source}:{scope}` cursors (Slack and Discord message
+    /// ids, used to group a PR's alerts into one thread) are not pruned yet. They
+    /// could be, by rebuilding the key forward from a stale `pr:` row rather than by
+    /// interpreting the value, which is what an earlier version of this comment
+    /// wrongly gave as the obstacle.
     pub async fn prune(&self, retention_days: u32) -> Result<Pruned, StateError> {
         if retention_days == 0 {
             return Ok(Pruned::default());
@@ -155,17 +177,33 @@ impl SqliteStore {
             let c = lock(&conn)?;
             let tx = c.unchecked_transaction().map_err(backend)?;
 
-            // Merge-queue rows first, while the `pr:` cursor that dates them still
-            // exists: `mq:` values are states like "absent", not timestamps, so they
-            // are only prunable by association with a PR known to be stale.
+            // Merge-queue rows first, while the dated cursors that place them in
+            // time still exist: `mq:` values are states like "absent", not
+            // timestamps, so they are only prunable by association with a PR already
+            // known to be stale.
+            //
+            // Either sibling will do. With `track_prs = false` a PR reaches navi
+            // through notifications only and never gets a `pr:` cursor, so keying
+            // solely off that one would leave those `mq:` rows unprunable for ever.
+            // Requiring a stale sibling *and* no fresh one keeps the merge-queue
+            // baseline for a PR that is quiet by one measure but active by the other.
             let mq = tx
                 .execute(
-                    "DELETE FROM cursors WHERE key LIKE 'mq:%' AND EXISTS (
-                         SELECT 1 FROM cursors p
-                          WHERE p.source_id = cursors.source_id
-                            AND p.key = 'pr:' || substr(cursors.key, 4)
-                            AND p.value LIKE ?1
-                            AND p.value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
+                    "DELETE FROM cursors WHERE key LIKE 'mq:%'
+                       AND EXISTS (
+                         SELECT 1 FROM cursors d
+                          WHERE d.source_id = cursors.source_id
+                            AND d.key IN ('pr:' || substr(cursors.key, 4),
+                                          'thread:' || substr(cursors.key, 4))
+                            AND d.value LIKE ?1
+                            AND d.value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))
+                       AND NOT EXISTS (
+                         SELECT 1 FROM cursors d
+                          WHERE d.source_id = cursors.source_id
+                            AND d.key IN ('pr:' || substr(cursors.key, 4),
+                                          'thread:' || substr(cursors.key, 4))
+                            AND d.value LIKE ?1
+                            AND d.value >= strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
                     params![RFC3339_SHAPE, cutoff],
                 )
                 .map_err(backend)? as u64;
@@ -189,7 +227,9 @@ impl SqliteStore {
                 cursors: mq + dated,
             };
             // Deleting leaves the pages allocated, so the file only shrinks on a
-            // VACUUM. It rewrites the whole database, so only when something went.
+            // VACUUM. It rewrites the whole database, which at this size (single
+            // digit MB) is cheap enough to run on any day that removed something,
+            // and the re-arming described above means that is most days.
             if pruned.cursors > 0 {
                 c.execute_batch("VACUUM").map_err(backend)?;
             }
@@ -621,10 +661,39 @@ mod tests {
         let store = SqliteStore::open_in_memory().unwrap();
         put_raw(&store, "github", "pr:acme/w#2", "2999-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#2", "queued");
-        // An mq cursor with no pr cursor at all is left alone too: nothing dates it.
+        // Nothing dates this one at all, so it cannot be shown to be stale.
         put_raw(&store, "github", "mq:acme/w#3", "queued");
         assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
         assert_eq!(cursor_keys(&store).len(), 3);
+    }
+
+    /// With `track_prs = false` a PR arrives through notifications only and never
+    /// gets a `pr:` cursor, so dating `mq:` off that alone leaves those rows
+    /// unprunable for ever. The `thread:` cursor dates them just as well.
+    #[tokio::test]
+    async fn prune_dates_merge_queue_state_by_the_notification_cursor_too() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "mq:acme/w#1", "absent");
+        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
+        assert!(cursor_keys(&store).is_empty());
+    }
+
+    /// Quiet by one measure, active by the other: the merge-queue baseline stays.
+    /// Losing it here could drop a real queue transition.
+    #[tokio::test]
+    async fn prune_keeps_merge_queue_state_when_any_sibling_is_fresh() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#1", "2999-01-01T00:00:00Z");
+        put_raw(&store, "github", "mq:acme/w#1", "queued");
+
+        // The stale `pr:` cursor still goes; the merge-queue baseline does not.
+        assert_eq!(store.prune(90).await.unwrap().cursors, 1);
+        assert_eq!(
+            cursor_keys(&store),
+            vec!["github|mq:acme/w#1", "github|thread:acme/w#1"]
+        );
     }
 
     /// Pruning must never touch the two tables that make delivery exactly-once.
