@@ -33,6 +33,9 @@ impl StateStore for MemState {
     async fn put_snapshot(&self, _: &str, _: &str, _: &[u8]) -> Result<(), StateError> {
         Ok(())
     }
+    async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+        self.was_delivered(k, sink).await
+    }
     async fn was_delivered(&self, _: &str, _: &str) -> Result<bool, StateError> {
         Ok(false)
     }

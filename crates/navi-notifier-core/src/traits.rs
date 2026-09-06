@@ -45,6 +45,16 @@ pub trait StateStore: Send + Sync {
     /// Record that `dedup_key` reached `sink`. Idempotent.
     async fn mark_delivered(&self, dedup_key: &str, sink: &str) -> Result<(), StateError>;
 
+    /// True if `dedup_key` was recorded against `sink` specifically.
+    ///
+    /// [`was_delivered`](Self::was_delivered) may also answer true for a delivery a
+    /// store only knows about collectively - an implementation that migrated older
+    /// records without knowing which sinks they reached has to treat them as having
+    /// reached all of them, or an upgrade would re-notify. That is the right answer
+    /// for "should this be sent", and the wrong one for "did *this* sink get it",
+    /// which is what a batched flush needs before it drops an event from a batch.
+    async fn was_delivered_exact(&self, dedup_key: &str, sink: &str) -> Result<bool, StateError>;
+
     async fn get_cursor(&self, source_id: &str, key: &str) -> Result<Option<String>, StateError>;
 
     async fn put_cursor(&self, source_id: &str, key: &str, value: &str) -> Result<(), StateError>;
