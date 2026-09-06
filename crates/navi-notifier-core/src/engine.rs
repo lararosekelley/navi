@@ -292,22 +292,55 @@ impl Engine {
         let target_ids: Vec<String> = targets.iter().map(|n| n.id().to_string()).collect();
 
         if dry_run {
-            if let Some(reason) = deferred {
-                return EventRecord {
-                    event,
-                    outcome: EventOutcome::WouldDefer(reason),
-                };
+            // Ask the same dedup question the live path asks, against the same sink,
+            // or the preview claims it would send things that are already handled.
+            // Sources legitimately re-derive delivered events every pass - the GitLab
+            // todos feed has no snapshot at all - so without this a dry run against a
+            // live database reports the whole backlog as outgoing.
+            //
+            // Which sink depends on where the live path would put it, so this mirrors
+            // the branch order below: a digest kind goes to the digest buffer, an
+            // event a rule defers goes to the deferred buffer, and anything else is
+            // checked per destination.
+            let digested = self.digest_kinds.contains(event.kind.tag());
+            let buffer_sink = if digested {
+                Some(DIGEST_SINK)
+            } else {
+                deferred.as_ref().map(|_| DEFERRED_SINK)
+            };
+            if let Some(sink) = buffer_sink {
+                match self.state.was_delivered(&event.dedup_key, sink).await {
+                    Ok(true) => {
+                        return EventRecord {
+                            event,
+                            outcome: EventOutcome::AlreadyDelivered,
+                        };
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        warn!(dedup_key = %event.dedup_key, %err, "dedup check failed; previewing as deliverable");
+                    }
+                }
             }
-            // Ask the same dedup question the live path asks below, or the preview
-            // claims it would send things every destination already has. Sources
-            // legitimately re-derive delivered events every pass - the GitLab todos
-            // feed has no snapshot at all - so without this a dry run against a live
-            // database reports the entire backlog as outgoing.
+            // A digest kind is reported by where it ends up, not by the window: the
+            // live path buffers it for the digest regardless of the deferral.
+            if let Some(reason) = deferred {
+                if !digested {
+                    return EventRecord {
+                        event,
+                        outcome: EventOutcome::WouldDefer(reason),
+                    };
+                }
+            }
             let outcome = match self.undelivered_targets(&event, targets).await {
                 Ok(pending) if pending.is_empty() && !targets.is_empty() => {
                     EventOutcome::AlreadyDelivered
                 }
-                _ => EventOutcome::WouldDeliver { to: target_ids },
+                Ok(_) => EventOutcome::WouldDeliver { to: target_ids },
+                Err(err) => {
+                    warn!(dedup_key = %event.dedup_key, %err, "dedup check failed; previewing as deliverable");
+                    EventOutcome::WouldDeliver { to: target_ids }
+                }
             };
             return EventRecord { event, outcome };
         }
@@ -2009,6 +2042,67 @@ mod tests {
         assert!(dest.digests.lock().unwrap().is_empty());
         // Discarded, not left to retry for ever.
         assert!(engine.read_digest().await.unwrap().is_empty());
+    }
+
+    /// The preview has to check the sink the live path would use, not just the
+    /// destinations. An event sitting in the digest buffer has only `__digest__`
+    /// marked, so a per-destination check alone still previews it as outgoing.
+    #[tokio::test]
+    async fn dry_run_sees_an_event_already_in_a_buffer() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let events = vec![ev(EventKind::Mentioned, "k1")];
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: events.clone(),
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        let r = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
+
+        // The live pass now answers AlreadyDelivered, so the preview must too.
+        let r = engine.run_once(FilterContext::default(), true).await;
+        assert!(
+            matches!(r.records[0].outcome, EventOutcome::AlreadyDelivered),
+            "buffered event previewed as outgoing: {:?}",
+            r.records[0].outcome
+        );
+        let live = engine.run_once(FilterContext::default(), false).await;
+        assert!(matches!(
+            live.records[0].outcome,
+            EventOutcome::AlreadyDelivered
+        ));
+    }
+
+    /// Same for the deferred buffer.
+    #[tokio::test]
+    async fn dry_run_sees_an_event_already_deferred() {
+        let dest = Arc::new(MockDestination::default());
+        let (engine, _state) = engine_with(
+            vec![ev(EventKind::ReviewRequested, "k1")],
+            quiet_rules(),
+            dest.clone(),
+        );
+
+        let r = engine.run_once(INSIDE_WINDOW, false).await;
+        assert!(matches!(
+            r.records[0].outcome,
+            EventOutcome::Deferred(DeferReason::QuietHours)
+        ));
+
+        let r = engine.run_once(INSIDE_WINDOW, true).await;
+        assert!(
+            matches!(r.records[0].outcome, EventOutcome::AlreadyDelivered),
+            "already-held event previewed as new: {:?}",
+            r.records[0].outcome
+        );
     }
 
     #[tokio::test]
