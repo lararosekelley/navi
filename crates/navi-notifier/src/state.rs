@@ -117,6 +117,93 @@ fn migrate_delivered_to_per_sink(conn: &Connection) -> Result<(), StateError> {
     Ok(())
 }
 
+/// How many rows a [`SqliteStore::prune`] pass removed.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Pruned {
+    pub cursors: u64,
+}
+
+impl SqliteStore {
+    /// Drop per-PR cursors for pull requests that have been quiet for
+    /// `retention_days`, so a long-running daemon's database stops growing purely
+    /// with the number of PRs it has ever seen. `0` disables it.
+    ///
+    /// Only cursors, and only these three kinds. Each is safe to lose because the
+    /// snapshot, which is *not* pruned, is what actually suppresses re-notification:
+    ///
+    /// - `pr:{scope}` gates the involved-PR sweep on the PR's `updated_at`. Without
+    ///   it the PR is diffed once more against its unchanged snapshot, which yields
+    ///   no events; the cost is one API call, once.
+    /// - `thread:{scope}` gates notification re-processing the same way, and the
+    ///   source already notes the snapshot would suppress any duplicate.
+    /// - `mq:{scope}` holds the last-seen merge-queue state. A missing prior state is
+    ///   treated as first sight and deliberately does not back-fill a transition, so
+    ///   dropping it baselines rather than firing.
+    ///
+    /// `snapshots` and `delivered` are left alone. Snapshots are the one table where
+    /// eviction *can* re-notify (a first sight re-emits outstanding review requests,
+    /// and the review-request dedup key is salted with the PR's `updated_at`, so the
+    /// stored key can never match the re-derived one), and they are both the
+    /// slowest-growing table and a minority of the file.
+    pub async fn prune(&self, retention_days: u32) -> Result<Pruned, StateError> {
+        if retention_days == 0 {
+            return Ok(Pruned::default());
+        }
+        let conn = self.conn.clone();
+        spawn_blocking(move || {
+            let cutoff = format!("-{retention_days} days");
+            let c = lock(&conn)?;
+            let tx = c.unchecked_transaction().map_err(backend)?;
+
+            // Merge-queue rows first, while the `pr:` cursor that dates them still
+            // exists: `mq:` values are states like "absent", not timestamps, so they
+            // are only prunable by association with a PR known to be stale.
+            let mq = tx
+                .execute(
+                    "DELETE FROM cursors WHERE key LIKE 'mq:%' AND EXISTS (
+                         SELECT 1 FROM cursors p
+                          WHERE p.source_id = cursors.source_id
+                            AND p.key = 'pr:' || substr(cursors.key, 4)
+                            AND p.value LIKE ?1
+                            AND p.value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2))",
+                    params![RFC3339_SHAPE, cutoff],
+                )
+                .map_err(backend)? as u64;
+
+            // The shape guard keeps this to values that really are RFC3339 instants.
+            // Slack's own `thread:` cursors share the prefix but hold a Slack `ts`
+            // (`1750000000.123456`), which would sort before any date and be deleted
+            // by a bare `<` comparison.
+            let dated = tx
+                .execute(
+                    "DELETE FROM cursors
+                      WHERE (key LIKE 'pr:%' OR key LIKE 'thread:%')
+                        AND value LIKE ?1
+                        AND value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)",
+                    params![RFC3339_SHAPE, cutoff],
+                )
+                .map_err(backend)? as u64;
+
+            tx.commit().map_err(backend)?;
+            let pruned = Pruned {
+                cursors: mq + dated,
+            };
+            // Deleting leaves the pages allocated, so the file only shrinks on a
+            // VACUUM. It rewrites the whole database, so only when something went.
+            if pruned.cursors > 0 {
+                c.execute_batch("VACUUM").map_err(backend)?;
+            }
+            Ok(pruned)
+        })
+        .await
+        .map_err(join)?
+    }
+}
+
+/// `LIKE` pattern matching the leading `YYYY-MM-DDT` of an RFC3339 instant. Used to
+/// tell cursors whose value is a date from ones that merely sort like one.
+const RFC3339_SHAPE: &str = "____-__-__T%";
+
 /// Lock the connection, mapping a poisoned mutex to a backend error rather than
 /// panicking the whole daemon.
 fn lock(conn: &Mutex<Connection>) -> Result<std::sync::MutexGuard<'_, Connection>, StateError> {
@@ -427,6 +514,165 @@ mod tests {
         assert!(store.was_delivered("old", "slack").await.unwrap());
         assert!(store.was_delivered("new", "slack").await.unwrap());
         assert!(!store.was_delivered("new", "email").await.unwrap());
+    }
+
+    /// Write a cursor directly, so a value can be dated into the past.
+    fn put_raw(store: &SqliteStore, source: &str, key: &str, value: &str) {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO cursors (source_id, key, value) VALUES (?1, ?2, ?3)",
+                params![source, key, value],
+            )
+            .unwrap();
+    }
+
+    fn cursor_keys(store: &SqliteStore) -> Vec<String> {
+        let c = store.conn.lock().unwrap();
+        let mut stmt = c
+            .prepare("SELECT source_id || '|' || key FROM cursors ORDER BY 1")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        rows
+    }
+
+    /// A realistic cursor table: one long-quiet PR and one touched today, each with
+    /// the full set of per-PR bookkeeping, plus the global and per-repo rows.
+    fn seeded_cursors() -> SqliteStore {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "mq:acme/w#1", "absent");
+        put_raw(&store, "github", "pr:acme/w#2", "2999-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#2", "2999-01-01T00:00:00Z");
+        put_raw(&store, "github", "mq:acme/w#2", "queued");
+        // Not per-PR: a global watermark and a per-repo capability flag.
+        put_raw(&store, "github", "notif_since", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "mqcfg:acme/w", "true");
+        // Slack's own thread cursor shares the `thread:` prefix but holds a Slack
+        // `ts`, which sorts before any RFC3339 date.
+        put_raw(
+            &store,
+            "slack",
+            "thread:github:acme/w#1",
+            "1750000000.123456",
+        );
+        store
+    }
+
+    #[tokio::test]
+    async fn prune_drops_per_pr_cursors_for_long_quiet_prs() {
+        let store = seeded_cursors();
+        assert_eq!(store.prune(90).await.unwrap().cursors, 3);
+        assert_eq!(
+            cursor_keys(&store),
+            vec![
+                "github|mq:acme/w#2",
+                "github|mqcfg:acme/w",
+                "github|notif_since",
+                "github|pr:acme/w#2",
+                "github|thread:acme/w#2",
+                "slack|thread:github:acme/w#1",
+            ]
+        );
+    }
+
+    /// The one that would bite silently: a Slack `ts` is all digits, so a bare
+    /// `value < cutoff` string comparison deletes it, losing the thread grouping for
+    /// every PR. The RFC3339 shape guard is what stops that.
+    #[tokio::test]
+    async fn prune_leaves_cursors_whose_value_is_not_a_date() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(
+            &store,
+            "slack",
+            "thread:github:acme/w#1",
+            "1750000000.123456",
+        );
+        put_raw(&store, "github", "mq:acme/w#1", "absent");
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+        assert_eq!(cursor_keys(&store).len(), 2);
+    }
+
+    /// A global watermark is a cursor with a dated value too, and deleting it would
+    /// force a full re-poll.
+    #[tokio::test]
+    async fn prune_leaves_global_and_per_repo_cursors() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "notif_since", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "pr_closed_since", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "backfilled", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "mqcfg:acme/w", "true");
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+        assert_eq!(cursor_keys(&store).len(), 4);
+    }
+
+    /// `mq:` has no date of its own, so it goes only with a PR the sweep has stopped
+    /// seeing. An active PR must keep its merge-queue baseline, or a transition
+    /// between the prune and the next poll would be missed.
+    #[tokio::test]
+    async fn prune_keeps_merge_queue_state_for_active_prs() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        put_raw(&store, "github", "pr:acme/w#2", "2999-01-01T00:00:00Z");
+        put_raw(&store, "github", "mq:acme/w#2", "queued");
+        // An mq cursor with no pr cursor at all is left alone too: nothing dates it.
+        put_raw(&store, "github", "mq:acme/w#3", "queued");
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+        assert_eq!(cursor_keys(&store).len(), 3);
+    }
+
+    /// Pruning must never touch the two tables that make delivery exactly-once.
+    #[tokio::test]
+    async fn prune_never_touches_snapshots_or_delivered() {
+        let store = seeded_cursors();
+        store
+            .put_snapshot("github", "acme/w#1", b"v1")
+            .await
+            .unwrap();
+        store.mark_delivered("k1", "slack").await.unwrap();
+        {
+            let c = store.conn.lock().unwrap();
+            c.execute(
+                "UPDATE snapshots SET updated_at = '2020-01-01 00:00:00'",
+                [],
+            )
+            .unwrap();
+            c.execute(
+                "UPDATE delivered SET delivered_at = '2020-01-01 00:00:00'",
+                [],
+            )
+            .unwrap();
+        }
+
+        assert!(store.prune(90).await.unwrap().cursors > 0);
+        assert_eq!(
+            store.get_snapshot("github", "acme/w#1").await.unwrap(),
+            Some(b"v1".to_vec()),
+            "a snapshot is what suppresses a re-derived event; it must survive"
+        );
+        assert!(store.was_delivered("k1", "slack").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn prune_is_disabled_at_zero_and_is_idempotent() {
+        let store = seeded_cursors();
+        assert_eq!(store.prune(0).await.unwrap(), Pruned::default());
+        assert_eq!(cursor_keys(&store).len(), 9);
+
+        assert_eq!(store.prune(90).await.unwrap().cursors, 3);
+        assert_eq!(store.prune(90).await.unwrap(), Pruned::default());
+        // Still usable after the VACUUM.
+        store.put_cursor("github", "etag", "abc").await.unwrap();
+        assert_eq!(
+            store.get_cursor("github", "etag").await.unwrap(),
+            Some("abc".to_string())
+        );
     }
 
     #[tokio::test]
