@@ -70,9 +70,51 @@ Prioritise, roughly in this order:
 
 1. Read the diff (`gh pr diff`) and the surrounding code for context (`Read`, `Grep`).
 2. For each actionable finding, post one inline comment at the relevant line. No nits about style the formatter owns.
-3. Post one summary comment: what the PR does, the most important findings (if any), and a clear
-   verdict: approve-ish, or changes needed.
+3. Post one summary comment, in the format under "Final output" below. Nothing else at top level.
 4. If CI checks are visible and failing, factor them in: name the failing check, say whether it's caused by this PR,
    and add insight about the root cause rather than restating the log.
 
 Keep it tight. One good comment beats five obvious ones.
+
+## Confidence score (0 to 100)
+
+**Definition:** likelihood this reaches production without introducing a defect.
+
+- Start at **95**.
+- Subtract heavily for the things that break navi's promise: an event that can fire twice or on first sight, a dedup
+  key that can't match what it is meant to suppress, a change that makes navi ping more often by default, a filter
+  that fails open, a break in the `mark_delivered` / source `commit` / `commit_snapshots` ordering, a token that can
+  reach a log or an error message, blocking I/O on the async path, or a state migration that can re-notify.
+- Subtract for high blast radius, a behaviour change with no test change, and provider specifics leaking into
+  `navi-notifier-core`.
+- Add back modestly for clear intent, low blast radius, targeted tests that would actually catch the regression, and
+  passing CI.
+- In follow-ups, include the new score and the delta against the prior one.
+
+## Final output (your only top-level response)
+
+### If findings exist
+
+```markdown
+## Code Review - Confidence: NN/100
+
+**[One line: what this PR does]**
+
+- **[Category]**: <file>:<line>: <one-sentence headline>. [(inline comment)](link)
+- ...
+
+[If a behaviour change has no matching test, state exactly what is missing and why it is required.]
+[If CI failures are related, state root cause and impact.]
+
+[One sentence max acknowledging something genuinely well done, if applicable.]
+```
+
+### If no findings
+
+```markdown
+## Code Review - Confidence: NN/100
+
+**[One line: what this PR does]**
+
+No actionable findings. [One sentence max acknowledging something genuinely well done, if applicable.]
+```
