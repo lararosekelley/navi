@@ -96,6 +96,16 @@ const DIGEST_SCOPE: &str = "pending";
 const DEFERRED_SOURCE: &str = "__deferred__";
 const DEFERRED_SCOPE: &str = "pending";
 
+/// What one digest flush did, so the caller can tell an attempt that had nothing
+/// to send from one a quiet window prevented from sending.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct DigestFlush {
+    /// Events that reached at least one destination.
+    pub sent: usize,
+    /// Events left in the buffer because a deferring rule still applies to them.
+    pub held: usize,
+}
+
 /// Most events either buffer will hold. Generous enough that a normal quiet window
 /// never reaches it, low enough that a wedged destination can't grow one state row
 /// without limit. See [`Engine::enqueue`].
@@ -307,8 +317,8 @@ impl Engine {
         // Marked delivered so they don't re-derive; the flush handles routing.
         // Checked before the quiet-hours buffer below: a kind the user chose to
         // batch is already deferred by their own choice, so it keeps the digest's
-        // cadence rather than being double-handled. (The digest flush itself still
-        // ignores quiet hours; that predates this and is left alone.)
+        // cadence rather than being double-handled. The window is still honoured,
+        // by `flush_digest` re-deciding each event before it sends.
         if self.digest_kinds.contains(event.kind.tag()) {
             if let Err(err) = self.enqueue_digest(&event).await {
                 warn!(dedup_key = %event.dedup_key, %err, "failed to buffer digest event");
@@ -498,21 +508,34 @@ impl Engine {
     /// digest never breaks a quiet window. Without that, batching a kind would opt
     /// it out of quiet hours: the flush runs on its own interval and would happily
     /// fire at 02:00.
-    pub async fn flush_digest(&self, ctx: &FilterContext) -> usize {
+    pub async fn flush_digest(&self, ctx: &FilterContext) -> DigestFlush {
         let buffered = match self.read_digest().await {
             Ok(p) => p,
             Err(err) => {
                 warn!(%err, "could not read the digest buffer; leaving it in place");
-                return 0;
+                return DigestFlush::default();
             }
         };
         if buffered.is_empty() {
-            return 0;
+            return DigestFlush::default();
         }
-        let held = buffered.len();
-        let (pending, hold): (Vec<Event>, Vec<Event>) = buffered
-            .into_iter()
-            .partition(|e| !matches!(self.rules.decide(e, ctx), Decision::Defer(_)));
+        // Re-decided exactly as `flush_deferred` does, and for the same reasons: a
+        // rule the user changed while events sat in the buffer applies on the way
+        // out. Deferred events wait for the window; dropped ones are discarded, so
+        // an overnight mute is honoured here too and not only on the deferred path.
+        let mut pending = Vec::new();
+        let mut hold = Vec::new();
+        let mut dropped = 0usize;
+        for event in buffered {
+            match self.rules.decide(&event, ctx) {
+                Decision::Deliver => pending.push(event),
+                Decision::Defer(_) => hold.push(event),
+                Decision::Drop(reason) => {
+                    debug!(dedup_key = %event.dedup_key, ?reason, "digest event dropped on flush");
+                    dropped += 1;
+                }
+            }
+        }
         if !hold.is_empty() {
             debug!(
                 count = hold.len(),
@@ -520,7 +543,17 @@ impl Engine {
             );
         }
         if pending.is_empty() {
-            return 0;
+            // Nothing to send, but a rule may have shrunk the buffer, so it still
+            // has to be written back.
+            if dropped > 0 {
+                if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &hold).await {
+                    warn!(%err, "could not rewrite the digest buffer after dropping events");
+                }
+            }
+            return DigestFlush {
+                sent: 0,
+                held: hold.len(),
+            };
         }
 
         let mut all_ok = true;
@@ -540,21 +573,31 @@ impl Engine {
         }
 
         if !all_ok {
-            return 0;
+            return DigestFlush {
+                sent: 0,
+                held: hold.len(),
+            };
         }
         // If the buffer can't be rewritten, don't report success: the events are
         // still buffered and would re-send next flush, so surface it as a non-clean
         // flush. What was held back for quiet hours stays.
         if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &hold).await {
             warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
-            return 0;
+            return DigestFlush {
+                sent: 0,
+                held: hold.len(),
+            };
         }
         info!(
             count = pending.len(),
-            held = held - pending.len(),
+            held = hold.len(),
+            dropped,
             "digest flushed"
         );
-        pending.len()
+        DigestFlush {
+            sent: pending.len(),
+            held: hold.len(),
+        }
     }
 
     /// Release events held by a deferring rule (quiet hours) now that the rule may
@@ -569,6 +612,11 @@ impl Engine {
     /// discarded; one still inside its window stays buffered.
     ///
     /// Returns how many events were delivered.
+    ///
+    /// Note the source's `commit` hook does not run for a released event, so with
+    /// `github.mark_read = true` a deferred notification's thread is not marked read
+    /// on the forge. The digest path has always behaved the same way. Deliberate,
+    /// not an oversight: `commit` needs the `Source`, which a flush does not have.
     pub async fn flush_deferred(&self, ctx: &FilterContext) -> usize {
         let pending = match self
             .read_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred")
@@ -944,14 +992,14 @@ mod tests {
 
         // Flushing sends the batch via send_digest, once.
         let flushed = engine.flush_digest(&FilterContext::default()).await;
-        assert_eq!(flushed, 1);
+        assert_eq!(flushed.sent, 1);
         assert_eq!(
             dest.digests.lock().unwrap().as_slice(),
             &[vec!["k1".to_string()]]
         );
 
         // A second flush finds an empty buffer and does nothing.
-        assert_eq!(engine.flush_digest(&FilterContext::default()).await, 0);
+        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
         assert_eq!(dest.digests.lock().unwrap().len(), 1);
     }
 
@@ -1289,19 +1337,19 @@ mod tests {
         assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
 
         // A flush inside the window sends nothing and keeps the batch.
-        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await, 0);
+        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await.sent, 0);
         assert!(
             dest.digests.lock().unwrap().is_empty(),
             "a digest must not break the quiet window"
         );
 
         // Once the window is over it goes out, exactly once.
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 1);
         assert_eq!(
             dest.digests.lock().unwrap().as_slice(),
             &[vec!["k1".to_string()]]
         );
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 0);
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 0);
     }
 
     /// A flush that sends some of the buffer and holds the rest must write back what
@@ -1345,7 +1393,7 @@ mod tests {
         engine.run_once(INSIDE_WINDOW, false).await;
 
         // Inside the window: only the override'd repo's event goes out.
-        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await, 1);
+        assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await.sent, 1);
         assert_eq!(
             dest.digests.lock().unwrap().as_slice(),
             &[vec!["loud1".to_string()]]
@@ -1361,11 +1409,98 @@ mod tests {
         );
 
         // And it goes out once the window ends.
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 1);
         assert_eq!(
             dest.digests.lock().unwrap().last().unwrap(),
             &vec!["quiet1".to_string()]
         );
+    }
+
+    /// The daemon resets its digest interval only when nothing is still held, so a
+    /// flush that sent nothing *because of the window* must report `held`. Without
+    /// that signal a digest phased inside the window burns its whole period on an
+    /// attempt that could never send, and at a daily interval never flushes at all.
+    #[tokio::test]
+    async fn a_held_digest_flush_reports_what_it_is_holding() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // Held by the window: nothing sent, and the caller can tell why.
+        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
+        assert_eq!(flush, DigestFlush { sent: 0, held: 1 });
+
+        // An empty buffer also sends nothing, but holds nothing, so the daemon may
+        // start its next interval. That is the distinction the daemon needs.
+        let empty = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            Arc::new(MemState::default()),
+        );
+        assert_eq!(
+            empty.flush_digest(&INSIDE_WINDOW).await,
+            DigestFlush::default()
+        );
+
+        // Once the window ends, it sends and holds nothing.
+        let flush = engine.flush_digest(&OUTSIDE_WINDOW).await;
+        assert_eq!(flush, DigestFlush { sent: 1, held: 0 });
+    }
+
+    /// Both buffers re-decide through the same call, so they must agree: a mute the
+    /// user adds while events sit in a buffer has to be honoured on the digest path
+    /// too, not only on the deferred one.
+    #[tokio::test]
+    async fn digest_drops_events_a_rule_now_rejects() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(RuleConfig::default()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(FilterContext::default(), false).await;
+
+        // The user disables the kind overnight; same state, so the same buffer.
+        let mut rules = RuleConfig::default();
+        rules.events.mentioned = false;
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        let flush = engine.flush_digest(&FilterContext::default()).await;
+        assert_eq!(
+            flush,
+            DigestFlush::default(),
+            "muted event must not be sent"
+        );
+        assert!(dest.digests.lock().unwrap().is_empty());
+        // Discarded, not left to retry for ever.
+        assert!(engine.read_digest().await.unwrap().is_empty());
     }
 
     #[tokio::test]
