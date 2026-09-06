@@ -125,10 +125,11 @@ pub struct Pruned {
 }
 
 impl SqliteStore {
-    /// Drop per-PR cursors for pull requests that have been quiet for
-    /// `retention_days`, so a long-running daemon's database stops growing purely
-    /// with the number of PRs it has ever seen. `0` disables it. Run once a day by
-    /// the `run` daemon only; `once` polls and exits without sweeping.
+    /// Drop poll cursors for pull requests that have been quiet for
+    /// `retention_days`, so they stop accumulating one row per PR the daemon has
+    /// ever seen. The database still grows per PR through `snapshots`, which this
+    /// deliberately leaves alone. `0` disables it. Run once a day by the `run`
+    /// daemon only; `once` polls and exits without sweeping.
     ///
     /// Only cursors, and only these two kinds. Both are safe to lose because the
     /// snapshot, which is *not* pruned, is what actually suppresses re-notification:
@@ -147,8 +148,9 @@ impl SqliteStore {
     /// every dated cursor can still have a live queue. Dating it by association with
     /// those cursors would swallow a transition that landed while the baseline was
     /// missing. Sweeping it needs the value to carry its own stamp, the way
-    /// `mqcfg:` already does; until then it stays, and it is a small population
-    /// bounded by the merge-queue repos in play.
+    /// `mqcfg:` already does (#161); until then it stays. It is one row per
+    /// merge-queue PR, not per repo, so it does grow without bound - just slowly,
+    /// and a missed queue transition is worse than the row.
     ///
     /// ## What this actually reclaims
     ///
@@ -200,13 +202,28 @@ impl SqliteStore {
             // any date, so a bare `<` comparison would take every one of them. It
             // also keeps the delete off dated global watermarks, which is why the key
             // prefixes are listed explicitly rather than matching any dated value.
+            // The snapshot guard is the third, and the one the whole safety argument
+            // rests on: "the PR re-diffs against its unchanged snapshot and emits
+            // nothing" is only true when there *is* a snapshot. A source stages the
+            // `pr:` cursor even when the PR fetch failed (`github/src/source.rs:332`),
+            // so cursor-without-snapshot rows exist in practice. Dropping one turns
+            // the next sighting into a first sight, which re-emits an outstanding
+            // review request under a dedup key `delivered` has never seen, because
+            // the key is salted with the PR's `updated_at`.
             let dated = tx
                 .execute(
                     "DELETE FROM cursors
-                      WHERE (key LIKE 'pr:%'
-                             OR (key LIKE 'thread:%' AND instr(substr(key, 8), ':') = 0))
-                        AND value LIKE ?1
-                        AND value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)",
+                      WHERE value LIKE ?1
+                        AND value < strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?2)
+                        AND ((key LIKE 'pr:%'
+                              AND EXISTS (SELECT 1 FROM snapshots s
+                                           WHERE s.source_id = cursors.source_id
+                                             AND s.scope = substr(cursors.key, 4)))
+                          OR (key LIKE 'thread:%'
+                              AND instr(substr(key, 8), ':') = 0
+                              AND EXISTS (SELECT 1 FROM snapshots s
+                                           WHERE s.source_id = cursors.source_id
+                                             AND s.scope = substr(cursors.key, 8))))",
                     params![RFC3339_SHAPE, cutoff],
                 )
                 .map_err(backend)? as u64;
@@ -576,8 +593,24 @@ mod tests {
 
     /// A realistic cursor table: one long-quiet PR and one touched today, each with
     /// the full set of per-PR bookkeeping, plus the global and per-repo rows.
+    /// Give a scope the snapshot the sweep now requires before it will drop a
+    /// cursor for it.
+    fn put_snapshot_raw(store: &SqliteStore, source: &str, scope: &str) {
+        store
+            .conn
+            .lock()
+            .unwrap()
+            .execute(
+                "INSERT INTO snapshots (source_id, scope, bytes) VALUES (?1, ?2, x'7b7d')",
+                params![source, scope],
+            )
+            .unwrap();
+    }
+
     fn seeded_cursors() -> SqliteStore {
         let store = SqliteStore::open_in_memory().unwrap();
+        put_snapshot_raw(&store, "github", "acme/w#1");
+        put_snapshot_raw(&store, "github", "acme/w#2");
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#1", "absent");
@@ -653,6 +686,7 @@ mod tests {
     #[tokio::test]
     async fn prune_never_touches_merge_queue_state() {
         let store = SqliteStore::open_in_memory().unwrap();
+        put_snapshot_raw(&store, "github", "acme/w#1");
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
         put_raw(&store, "github", "mq:acme/w#1", "queued");
@@ -671,12 +705,39 @@ mod tests {
     #[tokio::test]
     async fn merge_queue_state_is_excluded_by_key_not_by_its_value() {
         let store = SqliteStore::open_in_memory().unwrap();
+        put_snapshot_raw(&store, "github", "acme/w#1");
         put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
         // A value in the shape the follow-up would give it.
         put_raw(&store, "github", "mq:acme/w#1", "2020-01-01T00:00:00Z");
 
         assert_eq!(store.prune(90).await.unwrap().cursors, 1);
         assert_eq!(cursor_keys(&store), vec!["github|mq:acme/w#1"]);
+    }
+
+    /// The safety argument is "the PR re-diffs against its unchanged snapshot and
+    /// emits nothing", which needs a snapshot to exist. A source stages the `pr:`
+    /// cursor even when the PR fetch failed, so these rows are real: five of them on
+    /// the install this PR was measured against. Dropping one makes the next sighting
+    /// a first sight, which re-emits an outstanding review request under a dedup key
+    /// `delivered` has never seen.
+    #[tokio::test]
+    async fn prune_keeps_cursors_whose_snapshot_is_missing() {
+        let store = SqliteStore::open_in_memory().unwrap();
+        // Cursor staged by a failed fetch: no snapshot was ever written.
+        put_raw(&store, "github", "pr:acme/w#1", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#1", "2020-01-01T00:00:00Z");
+        // The same pair for a PR that was diffed successfully.
+        put_snapshot_raw(&store, "github", "acme/w#2");
+        put_raw(&store, "github", "pr:acme/w#2", "2020-01-01T00:00:00Z");
+        put_raw(&store, "github", "thread:acme/w#2", "2020-01-01T00:00:00Z");
+
+        assert_eq!(store.prune(90).await.unwrap().cursors, 2);
+        assert_eq!(
+            cursor_keys(&store),
+            vec!["github|pr:acme/w#1", "github|thread:acme/w#1"],
+            "without a snapshot to diff against, the cursor is the only thing \
+             stopping a first sight"
+        );
     }
 
     /// The sweep deletes only rows it can actually date. The key guard alone would
@@ -687,6 +748,8 @@ mod tests {
     #[tokio::test]
     async fn prune_only_deletes_rows_it_can_date() {
         let store = SqliteStore::open_in_memory().unwrap();
+        put_snapshot_raw(&store, "github", "acme/w#1");
+        put_snapshot_raw(&store, "github", "acme/w#2");
         put_raw(&store, "github", "pr:acme/w#1", "not-a-timestamp");
         put_raw(&store, "github", "thread:acme/w#1", "0");
         put_raw(&store, "github", "pr:acme/w#2", "2020-01-01T00:00:00Z");
@@ -703,6 +766,8 @@ mod tests {
     #[tokio::test]
     async fn prune_leaves_destination_thread_cursors() {
         let store = SqliteStore::open_in_memory().unwrap();
+        put_snapshot_raw(&store, "github", "acme/w#1");
+        put_snapshot_raw(&store, "github", "acme/w#2");
         // Value guard alone would already exclude a Slack `ts`; give it a dated value
         // so only the key guard can save it.
         put_raw(
