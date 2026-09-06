@@ -11,7 +11,10 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 - **cli:** let `config set` write a known key that isn't in config.toml yet,
   creating its section if needed, so `Option` fields and fields added after your
   `navi init` no longer need hand-editing. Unknown keys and wrongly typed values
-  are still refused
+  are still refused, and an unknown one now suggests the valid siblings
+- **cli:** `config set` accepts a numeric-looking value for a string field (a
+  Discord user id in `discord.dm_to`), and no longer fails a valid write because
+  something unrelated in config.toml doesn't parse
 - **core:** hold events that land during quiet hours and deliver them once the
   window ends, instead of dropping them for good
 - **core:** hold the digest inside a quiet window too, so batching a kind no
