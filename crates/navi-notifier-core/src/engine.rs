@@ -119,7 +119,7 @@ const DEFERRED_SINK: &str = "__deferred__";
 pub struct DigestFlush {
     /// Events that reached at least one destination.
     pub sent: usize,
-    /// Events left in the buffer because a deferring rule still applies to them.
+    /// Events moved to the held row because a deferring rule still applies to them.
     pub held: usize,
     /// A destination or the buffer write failed, so the batch is kept to retry.
     /// Distinct from `held`, which is the window doing its job rather than an error.
@@ -675,8 +675,12 @@ impl Engine {
             // Nothing to send this interval, but the buffer still has to be rewritten:
             // a rule may have dropped events, and anything the window held moves to
             // the held row, which `release_digest` retries every pass.
-            if let Err(err) = self.park_held(&hold).await {
-                warn!(%err, "could not park the held digest events");
+            let parked = self.park_held(&hold).await;
+            // Nothing was attempted, so `pending` is emptied either way; what was
+            // held is on the held row and what a rule dropped is gone.
+            let cleared = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await;
+            if let Err(err) = parked.and(cleared) {
+                warn!(%err, "could not rewrite the digest buffer");
                 return DigestFlush {
                     sent: 0,
                     held: hold.len(),
@@ -692,9 +696,33 @@ impl Engine {
 
         let (sent, all_ok) = self.send_digest_batches_checked(&pending).await;
 
-        if !all_ok {
+        // Park before the failure check. The held events were not part of the send,
+        // so a failed destination is no reason to keep them on the interval clock:
+        // leaving them in `pending` would strand them until an interval flush
+        // succeeds, which at a daily interval is another day and, with a wedged
+        // destination, indefinitely. One `was_delivered_exact` error is enough to
+        // reach here, so this is not a rare path.
+        if let Err(err) = self.park_held(&hold).await {
+            warn!(%err, "could not park the held digest events");
             return DigestFlush {
-                sent: 0,
+                sent: sent.len(),
+                held: hold.len(),
+                failed: true,
+            };
+        }
+
+        if !all_ok {
+            // Keep the attempted batch for the next interval. The per-destination
+            // sinks make that retry reach only the destinations that missed it, and
+            // rewriting rather than leaving the row prunes what a rule dropped.
+            if let Err(err) = self
+                .write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &pending)
+                .await
+            {
+                warn!(%err, "could not rewrite the digest buffer after a failed flush");
+            }
+            return DigestFlush {
+                sent: sent.len(),
                 held: hold.len(),
                 failed: true,
             };
@@ -702,10 +730,10 @@ impl Engine {
         // If the buffer can't be rewritten, don't report success: the events are
         // still buffered and would re-send next flush, so surface it as a non-clean
         // flush. What was held back for quiet hours stays.
-        if let Err(err) = self.park_held(&hold).await {
+        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
             warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
             return DigestFlush {
-                sent: 0,
+                sent: sent.len(),
                 held: hold.len(),
                 failed: true,
             };
@@ -814,8 +842,14 @@ impl Engine {
         Ok(outstanding)
     }
 
-    /// Empty `pending` and move what the window held onto the held row, appending to
-    /// whatever is already parked there.
+    /// Move what the window held onto the held row, appending to whatever is already
+    /// parked there.
+    ///
+    /// Deliberately does not touch `pending`. Parking is unconditional, because these
+    /// events were never attempted, and leaving them in `pending` would put them back
+    /// on the interval clock - the stranding this split exists to prevent, reached
+    /// through the failure path instead of the phase. Clearing `pending` is the part
+    /// that depends on the send having succeeded, so it lives at the call sites.
     async fn park_held(&self, hold: &[Event]) -> Result<(), StateError> {
         if !hold.is_empty() {
             let mut parked = self
@@ -848,7 +882,7 @@ impl Engine {
                     .await?;
             }
         }
-        self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await
+        Ok(())
     }
 
     /// Send digest events a quiet window held back, as soon as it stops applying.
@@ -911,9 +945,16 @@ impl Engine {
         // outstanding destination, so both come off the row rather than being
         // re-read and re-decided on every pass for the life of the daemon.
         let mut released = 0usize;
+        let mut cleared = 0usize;
         for event in ready {
             match self.outstanding_destinations(&event).await {
-                Ok(0) => released += 1,
+                // Nothing left to do for it. Only count it as released if it
+                // actually reached somewhere on this pass: an event that came off
+                // the row because it was unroutable, or because every destination
+                // already had it, was not sent, and `flush_digest` makes the same
+                // distinction for the same reason.
+                Ok(0) if sent.contains(&event.dedup_key) => released += 1,
+                Ok(0) => cleared += 1,
                 Ok(_) => keep.push(event),
                 Err(err) => {
                     // Fail safe: keep it rather than risk dropping an undelivered event.
@@ -931,11 +972,12 @@ impl Engine {
                 warn!(%err, "released held digest events but could not rewrite the row; they may re-send");
             }
         }
-        if released > 0 {
+        if released > 0 || cleared > 0 {
             info!(
-                count = released,
-                sent = sent.len(),
-                "released held digest events"
+                released,
+                cleared,
+                still_held = keep.len(),
+                "processed held digest events"
             );
         }
         released
@@ -2064,12 +2106,15 @@ mod tests {
         .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
         engine.run_once(FilterContext::default(), false).await;
 
-        // First flush: good takes the batch, bad fails, so the buffer is kept.
-        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
+        // First flush: good takes the batch, bad fails, so the buffer is kept. `sent`
+        // reports what really landed; `failed` is what says the flush wasn't clean.
+        let flush = engine.flush_digest(&FilterContext::default()).await;
+        assert_eq!((flush.sent, flush.failed), (1, true));
         assert_eq!(good.digests.lock().unwrap().len(), 1);
 
         // Retry with bad still down: good must not get the batch again.
-        assert_eq!(engine.flush_digest(&FilterContext::default()).await.sent, 0);
+        let flush = engine.flush_digest(&FilterContext::default()).await;
+        assert_eq!((flush.sent, flush.failed), (0, true));
         assert_eq!(good.digests.lock().unwrap().len(), 1);
 
         // bad recovers and gets it once.
@@ -2569,7 +2614,11 @@ mod tests {
             .await
             .unwrap();
 
-        engine.release_digest(&OUTSIDE_WINDOW).await;
+        assert_eq!(
+            engine.release_digest(&OUTSIDE_WINDOW).await,
+            0,
+            "coming off the row is not the same as being sent"
+        );
         assert!(
             digest_held(&engine).await.is_empty(),
             "events with no outstanding destination must not be re-parked for ever"
@@ -2648,6 +2697,79 @@ mod tests {
             digest_held(&engine).await,
             vec!["k1".to_string()],
             "an unanswerable dedup check must not be read as delivered"
+        );
+    }
+
+    /// A failed send must not strand the events the window held. They were never
+    /// part of the attempt, so leaving them in `pending` puts them back on the
+    /// interval clock: at a daily interval that is another day, and indefinitely
+    /// while a destination is wedged. This is the same stranding #158 is about,
+    /// reached through the failure path rather than the interval's phase.
+    #[tokio::test]
+    async fn a_failed_flush_still_parks_the_events_the_window_held() {
+        let dest = Arc::new(MockDestination {
+            fail: AtomicBool::new(true),
+            ..Default::default()
+        });
+        let state = Arc::new(MemState::default());
+        let rules = RuleConfig {
+            quiet_hours: crate::config::QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            overrides: vec![crate::config::RuleOverride {
+                repos: vec!["loud/*".into()],
+                quiet_hours: crate::config::QuietHoursOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![
+                    ev_in(EventKind::Mentioned, "loud", "repo", "loud1"),
+                    ev_in(EventKind::Mentioned, "quiet", "repo", "quiet1"),
+                ],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // The destination is wedged, so the loud batch fails.
+        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
+        assert!(flush.failed);
+
+        // The quiet event was never attempted, so it is on the held row regardless,
+        // and only the failed batch waits for the next interval.
+        assert_eq!(digest_held(&engine).await, vec!["quiet1".to_string()]);
+        assert_eq!(
+            engine
+                .read_digest()
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["loud1"],
+            "only the attempted batch is kept for the next interval"
+        );
+
+        // So when the window lifts it goes out on the release clock, without needing
+        // the wedged destination to recover first.
+        dest.fail.store(false, Ordering::Relaxed);
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().last().unwrap(),
+            &vec!["quiet1".to_string()]
         );
     }
 
