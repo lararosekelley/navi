@@ -145,7 +145,7 @@ impl SqliteStore {
     /// same way. It holds the last-seen merge-queue state, and it is the one kind
     /// whose loss costs an event rather than an API call: a missing prior state
     /// baselines instead of firing, and GitHub does not always bump a PR's
-    /// `updated_at` on a queue change (`github/src/source.rs:499`), so a PR quiet by
+    /// `updated_at` on a queue change (`merge_queue_event` in the github source), so a PR quiet by
     /// every dated cursor can still have a live queue. Dating it by association with
     /// those cursors would swallow a transition that landed while the baseline was
     /// missing. Giving the value its own stamp, the way `mqcfg:` does, would not help
