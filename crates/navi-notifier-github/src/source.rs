@@ -1025,9 +1025,6 @@ fn map_err(err: octocrab::Error) -> SourceError {
     classify_github_error(&err.to_string())
 }
 
-/// Classify a GitHub error message. A 403 is only a rate limit when the message
-/// says so (an unauthenticated or over-quota call); a plain 403 is a permission
-/// problem, not something to silently retry.
 /// Statuses that will not resolve on their own, so a caller may stop asking.
 ///
 /// 410 is what GitHub returns for a deleted issue or PR, and 451 for a
@@ -1038,6 +1035,9 @@ fn is_permanently_gone(status: u16) -> bool {
     matches!(status, 404 | 410 | 451)
 }
 
+/// Classify a GitHub error message. A 403 is only a rate limit when the message
+/// says so (an unauthenticated or over-quota call); a plain 403 is a permission
+/// problem, not something to silently retry.
 fn classify_github_error(msg: &str) -> SourceError {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("rate limit") {
