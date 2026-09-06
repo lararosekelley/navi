@@ -13,6 +13,11 @@ published into that release's GitHub notes by `dist`, so the headings must stay
   was skipped until something moved its timestamp again, and its cursor was left
   sitting ahead of its snapshot. A PR the forge reports as gone still advances,
   so a deleted or now-invisible one isn't re-fetched on every poll
+- **core:** release digest events a quiet window held back as soon as the window
+  ends, rather than at the next digest interval. With a long `interval_secs` and
+  a per-repo quiet-hours override the held part of a batch could otherwise wait
+  a further interval each time, or never go out at all if the interval's phase
+  fell inside the window
 
 ## 0.3.4
 
