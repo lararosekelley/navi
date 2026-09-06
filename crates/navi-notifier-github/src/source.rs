@@ -336,7 +336,7 @@ impl GitHubSource {
             // whether it may record this PR as seen: past a permanently gone one,
             // yes; past one that merely blipped, no, or the PR is skipped until its
             // timestamp moves and the failure outlives the poll it happened on.
-            Err(e @ SourceError::NotFound(_)) => {
+            Err(e @ SourceError::Gone(_)) => {
                 warn!(%scope, error = %e, "PR is gone or not visible; skipping it for good");
                 return Ok(PrOutcome::Gone);
             }
@@ -1017,8 +1017,9 @@ fn map_err(err: octocrab::Error) -> SourceError {
     // reading here, because it is the difference between "stop asking about this PR"
     // and "ask again next poll".
     if let octocrab::Error::GitHub { source, .. } = &err {
-        if source.status_code.as_u16() == 404 {
-            return SourceError::NotFound(format!("GitHub returned 404: {}", source.message));
+        let status = source.status_code.as_u16();
+        if is_permanently_gone(status) {
+            return SourceError::Gone(format!("GitHub returned {status}: {}", source.message));
         }
     }
     classify_github_error(&err.to_string())
@@ -1027,6 +1028,16 @@ fn map_err(err: octocrab::Error) -> SourceError {
 /// Classify a GitHub error message. A 403 is only a rate limit when the message
 /// says so (an unauthenticated or over-quota call); a plain 403 is a permission
 /// problem, not something to silently retry.
+/// Statuses that will not resolve on their own, so a caller may stop asking.
+///
+/// 410 is what GitHub returns for a deleted issue or PR, and 451 for a
+/// DMCA-blocked repo. Both are as permanent as a 404; folding them in with 5xx
+/// would mean re-fetching them on every poll for the life of the daemon, which is
+/// the cost the old unconditional cursor advance was avoiding.
+fn is_permanently_gone(status: u16) -> bool {
+    matches!(status, 404 | 410 | 451)
+}
+
 fn classify_github_error(msg: &str) -> SourceError {
     let lower = msg.to_ascii_lowercase();
     if lower.contains("rate limit") {
@@ -1042,7 +1053,7 @@ fn classify_github_error(msg: &str) -> SourceError {
         // Permanent: the PR is deleted, or in a repo this token can no longer see.
         // Kept distinct from a 5xx so callers can stop asking instead of retrying it
         // on every poll for ever.
-        SourceError::NotFound(msg.to_string())
+        SourceError::Gone(msg.to_string())
     } else if lower.contains("forbidden")
         || lower.contains("resource not accessible")
         || lower.contains("403")
@@ -1059,8 +1070,8 @@ fn classify_github_error(msg: &str) -> SourceError {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_github_error, is_fresh_no_queue, merge_queue_change, parse_pr_url, parse_repo_url,
-        GitHubSource, MQ_ABSENT,
+        classify_github_error, is_fresh_no_queue, is_permanently_gone, merge_queue_change,
+        parse_pr_url, parse_repo_url, GitHubSource, MQ_ABSENT,
     };
     use navi_notifier_core::model::{EventKind, MergeQueueRemoval};
     use navi_notifier_core::SourceError;
@@ -1162,6 +1173,19 @@ mod tests {
         );
         assert_eq!(parse_repo_url("https://api.github.com/user"), None);
         assert_eq!(parse_repo_url("nonsense"), None);
+    }
+
+    #[test]
+    fn permanently_gone_statuses_are_distinct_from_transient_ones() {
+        // A deleted PR, a deleted resource, and a blocked repo: none resolve on
+        // their own, so the cursor may advance past them.
+        for status in [404, 410, 451] {
+            assert!(is_permanently_gone(status), "{status} should be permanent");
+        }
+        // Anything that might succeed on the next poll must be retried instead.
+        for status in [500, 502, 503, 504, 429] {
+            assert!(!is_permanently_gone(status), "{status} should be retried");
+        }
     }
 
     #[test]

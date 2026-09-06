@@ -212,7 +212,7 @@ impl GiteaSource {
             // whether it may record this PR as seen: past a permanently gone one,
             // yes; past one that merely blipped, no, or the PR is skipped until its
             // timestamp moves and the failure outlives the poll it happened on.
-            Err(e @ SourceError::NotFound(_)) => {
+            Err(e @ SourceError::Gone(_)) => {
                 warn!(%scope, error = %e, "gitea PR is gone or not visible; skipping it for good");
                 return Ok(PrOutcome::Gone);
             }
@@ -575,8 +575,8 @@ fn map_status(resp: &reqwest::Response) -> Result<(), SourceError> {
     match status.as_u16() {
         // Permanent: the PR is deleted, or in a repo this token can no longer see.
         // Kept distinct from a 5xx so callers can stop asking instead of retrying it
-        // on every poll for ever.
-        404 => Err(SourceError::NotFound("gitea returned 404".into())),
+        // on every poll for ever. 410 is the deleted-resource response.
+        404 | 410 => Err(SourceError::Gone(format!("gitea returned {status}"))),
         401 => Err(SourceError::Auth("invalid Gitea token".into())),
         403 => Err(SourceError::Auth(
             "Gitea returned 403; the token may lack the needed scopes".into(),

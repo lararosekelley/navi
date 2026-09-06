@@ -850,3 +850,57 @@ async fn a_missing_pr_does_advance_the_cursor() {
         "a deleted or invisible PR is skipped for good rather than re-fetched for ever"
     );
 }
+
+/// The notification path's `thread:` cursor is a different mechanism from the
+/// sweep's: it is written inline with `put_cursor` rather than staged and flushed by
+/// `commit_snapshots`, so `failed_scopes` never covers it and the sweep test cannot
+/// reach it. It also has a tighter recovery window - `notif_since` advances by
+/// `poll_start - SINCE_OVERLAP` regardless, so holding the thread cursor back only
+/// buys a retry while the notification is still inside that overlap.
+#[tokio::test]
+async fn a_transient_fetch_failure_does_not_advance_the_thread_cursor() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": "42",
+            "reason": "review_requested",
+            "updated_at": "2024-01-02T03:04:05Z",
+            "subject": {
+                "title": "Add gadget",
+                "type": "PullRequest",
+                "url": format!("{}/repos/acme/widgets/pulls/2", server.uri())
+            },
+            "repository": {
+                "name": "widgets",
+                "owner": { "login": "acme" },
+                "html_url": "https://github.com/acme/widgets"
+            }
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/2"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "message": "Server Error",
+            "documentation_url": "https://docs.github.com/rest"
+        })))
+        .mount(&server)
+        .await;
+
+    let state = MemState::default();
+    // track_prs off, so only the notification path runs.
+    let source = source_for(&server);
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+
+    assert_eq!(
+        cursor(&state, "thread:acme/widgets#2").await,
+        None,
+        "a notification whose PR could not be fetched must be retried, not marked seen"
+    );
+}

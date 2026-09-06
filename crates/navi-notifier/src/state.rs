@@ -225,12 +225,14 @@ impl SqliteStore {
             //
             // The snapshot guard carries the safety argument *and* the schedule. It
             // has to exist at all because "the PR re-diffs against its unchanged
-            // snapshot and emits nothing" is only true when there is a snapshot, and
-            // a source stages the `pr:` cursor even when the PR fetch failed
-            // (`github/src/source.rs:332`), so cursor-without-snapshot rows are real.
-            // Dropping one would turn the next sighting into a first sight, which
-            // re-emits an outstanding review request under a dedup key `delivered`
-            // has never seen, since the key is salted with the PR's `updated_at`.
+            // snapshot and emits nothing" is only true when there is a snapshot. A
+            // source advances the `pr:` cursor for a PR the forge reports as
+            // permanently gone without ever staging one (`PrOutcome::Gone`), and
+            // databases written before #162 hold the same shape from any failed
+            // fetch, so these rows are real. Dropping one would turn the next
+            // sighting into a first sight, which re-emits an outstanding review
+            // request under a dedup key `delivered` has never seen, since the key
+            // is salted with the PR's `updated_at`.
             //
             // Dating off `snapshots.updated_at` rather than off the cursor's own
             // value is what keeps that re-diff from repeating. `put_snapshot`
