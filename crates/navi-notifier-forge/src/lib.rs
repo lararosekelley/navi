@@ -5,10 +5,12 @@
 //! the pure [`diff`] engine. A source crate deserializes or maps its provider's
 //! payloads into [`model::PrData`] and calls [`diff::diff`].
 
+pub mod backoff;
 pub mod diff;
 pub mod model;
 pub mod snapshot;
 
+pub use backoff::FetchBackoff;
 pub use diff::{
     diff, excerpt, first_sight_watermark, is_settled, team_key, ts_key, DiffContext,
     FIRST_SIGHT_LEEWAY,

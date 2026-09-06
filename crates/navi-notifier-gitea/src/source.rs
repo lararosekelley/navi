@@ -11,13 +11,14 @@ use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::PrData;
 use navi_notifier_forge::{
-    diff, first_sight_watermark, DiffContext, PrOutcome, PrSnapshot, FIRST_SIGHT_LEEWAY,
+    diff, first_sight_watermark, DiffContext, FetchBackoff, PrOutcome, PrSnapshot,
+    FIRST_SIGHT_LEEWAY,
 };
 use serde::Deserialize;
 use time::format_description::well_known::Rfc3339;
 use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::api::{GiteaIssueComment, GiteaPull, GiteaReview, GiteaUser, Notification};
 
@@ -55,6 +56,9 @@ pub struct GiteaSource {
     /// scope (`owner/repo#n`) -> involved-sweep `pr:` cursor value, deferred until
     /// `commit_snapshots` so a failed delivery re-derives the PR instead of skipping.
     pending_pr_cursors: Mutex<HashMap<String, String>>,
+    /// Scopes whose fetch keeps failing, skipped for a growing interval so a PR that
+    /// can never be fetched doesn't cost a re-fetch on every poll for ever.
+    backoff: FetchBackoff,
 }
 
 impl GiteaSource {
@@ -81,6 +85,7 @@ impl GiteaSource {
             track_prs: config.track_prs,
             backfill: config.backfill,
             pending_pr_cursors: Mutex::new(HashMap::new()),
+            backoff: FetchBackoff::default(),
         })
     }
 
@@ -206,18 +211,31 @@ impl GiteaSource {
         now: OffsetDateTime,
     ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{index}");
+        // Backed off from an earlier failure: report it as unfetched, which holds the
+        // cursor exactly as a fresh failure would, without spending the request.
+        if !self.backoff.ready(&scope, now) {
+            debug!(%scope, "skipping a gitea PR that is backed off after repeated fetch failures");
+            return Ok(PrOutcome::Unfetched);
+        }
         let pr_data = match self.fetch_pr(owner, repo, index).await {
-            Ok(d) => d,
+            Ok(d) => {
+                self.backoff.clear(&scope);
+                d
+            }
             // One unfetchable PR shouldn't abort the poll, but the caller has to know
             // whether it may record this PR as seen: past a permanently gone one,
             // yes; past one that merely blipped, no, or the PR is skipped until its
             // timestamp moves and the failure outlives the poll it happened on.
             Err(e @ SourceError::Gone(_)) => {
+                // Permanently gone: the cursor advances, so there is nothing left to
+                // back off from.
+                self.backoff.clear(&scope);
                 warn!(%scope, error = %e, "gitea PR is gone or not visible; skipping it for good");
                 return Ok(PrOutcome::Gone);
             }
             Err(e) => {
-                warn!(%scope, error = %e, "failed to fetch gitea PR; will retry next poll");
+                let wait = self.backoff.failed(&scope, now);
+                warn!(%scope, error = %e, retry_in_secs = wait.whole_seconds(), "failed to fetch gitea PR; backing off");
                 return Ok(PrOutcome::Unfetched);
             }
         };

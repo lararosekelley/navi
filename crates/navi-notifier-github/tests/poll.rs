@@ -904,3 +904,52 @@ async fn a_transient_fetch_failure_does_not_advance_the_thread_cursor() {
         "a notification whose PR could not be fetched must be retried, not marked seen"
     );
 }
+
+/// #167: the point of the backoff. A PR whose fetch never succeeds is returned by
+/// every involved sweep (the search has no date bound) and its cursor is
+/// deliberately held, so without this it is re-fetched on every poll for the life of
+/// the daemon. Backing off must suppress the requests while still holding the
+/// cursor, so nothing is given up: only the retry rate changes.
+///
+/// Asserted as "no further requests after the first poll" rather than an absolute
+/// count, because octocrab retries a 5xx internally, so one `fetch_pr` is already
+/// several requests. That multiplier is the reason this is worth bounding.
+#[tokio::test]
+async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
+    let server = MockServer::start().await;
+    mock_search_hit_with_failing_pr(&server, 500).await;
+
+    let fetches = |server: &'static MockServer| async move {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/2")
+            .count()
+    };
+    let server = Box::leak(Box::new(server));
+
+    let state = MemState::default();
+    let source = source_with(server, true);
+
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+    let after_first = fetches(server).await;
+    assert!(after_first > 0, "the first poll must actually try");
+
+    for _ in 0..3 {
+        assert!(source.poll(&state).await.expect("poll").is_empty());
+    }
+    assert_eq!(
+        fetches(server).await,
+        after_first,
+        "three further polls inside the backoff window must cost no requests"
+    );
+
+    // And the cursor is still held, so the PR is picked up again once it recovers.
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(cursor(&state, "pr:acme/widgets#2").await, None);
+}
