@@ -751,3 +751,102 @@ async fn merge_on_a_queued_pr_does_not_double_report_removal() {
         "a merge must not also report removal from the queue, got {kinds:?}"
     );
 }
+
+/// Mount a `/user`, an empty inbox and a search hit for `acme/widgets#2`, with the
+/// PR fetch itself answering `status`. Used to drive the two failure paths.
+async fn mock_search_hit_with_failing_pr(server: &MockServer, status: u16) {
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "repository_url": format!("{}/repos/acme/widgets", server.uri()),
+                "number": 2,
+                "updated_at": "2024-01-02T03:04:05Z"
+            }]
+        })))
+        .mount(server)
+        .await;
+    // With a GitHub-shaped error body: a bodyless response makes octocrab fail while
+    // parsing instead, which is not what a real 404 looks like.
+    let message = if status == 404 {
+        "Not Found"
+    } else {
+        "Server Error"
+    };
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/2"))
+        .respond_with(ResponseTemplate::new(status).set_body_json(json!({
+            "message": message,
+            "documentation_url": "https://docs.github.com/rest"
+        })))
+        .mount(server)
+        .await;
+}
+
+/// #162: a PR that couldn't be fetched was never compared against its snapshot, so
+/// recording it as seen hides it until its timestamp moves again. One 500 would
+/// otherwise cost far more than the poll it happened on, and leaves the cursor
+/// sitting ahead of the snapshot, which is the state that makes a later cursor
+/// sweep re-emit stale activity.
+#[tokio::test]
+async fn a_transient_fetch_failure_does_not_advance_the_pr_cursor() {
+    let server = MockServer::start().await;
+    mock_search_hit_with_failing_pr(&server, 500).await;
+
+    let state = MemState::default();
+    let source = source_with(&server, true);
+    let events = source.poll(&state).await.expect("poll survives one bad PR");
+    assert!(events.is_empty());
+
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor(&state, "pr:acme/widgets#2").await,
+        None,
+        "a PR that was never fetched must be retried, not skipped until it changes"
+    );
+    assert_eq!(
+        state
+            .get_snapshot("github", "acme/widgets#2")
+            .await
+            .unwrap(),
+        None,
+        "and no snapshot was written, so cursor and snapshot stay consistent"
+    );
+}
+
+/// The other half: a PR that is genuinely gone must not be re-fetched every poll
+/// for ever. Retrying it is what the eager cursor advance was buying, so the fix
+/// has to keep that for the permanent case.
+#[tokio::test]
+async fn a_missing_pr_does_advance_the_cursor() {
+    let server = MockServer::start().await;
+    mock_search_hit_with_failing_pr(&server, 404).await;
+
+    let state = MemState::default();
+    let source = source_with(&server, true);
+    let events = source.poll(&state).await.expect("poll survives a gone PR");
+    assert!(events.is_empty());
+
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+    assert_eq!(
+        cursor(&state, "pr:acme/widgets#2").await.as_deref(),
+        Some("2024-01-02T03:04:05Z"),
+        "a deleted or invisible PR is skipped for good rather than re-fetched for ever"
+    );
+}

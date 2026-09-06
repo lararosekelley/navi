@@ -11,6 +11,11 @@ pub enum SourceError {
     RateLimited { retry_after_secs: u64 },
     #[error("provider request failed: {0}")]
     Request(String),
+    /// The thing asked for is gone, or invisible to this token. Distinct from
+    /// [`SourceError::Request`] because it is permanent: retrying will not help, so a
+    /// caller may safely stop asking rather than treating it as a transient blip.
+    #[error("not found: {0}")]
+    NotFound(String),
     #[error("failed to parse provider payload: {0}")]
     Parse(String),
     #[error(transparent)]

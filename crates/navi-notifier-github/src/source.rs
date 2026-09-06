@@ -13,7 +13,8 @@ use navi_notifier_core::traits::{Source, StateStore};
 use navi_notifier_core::{Backfill, SourceError};
 use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, ReviewComment, User};
 use navi_notifier_forge::{
-    diff, first_sight_watermark, team_key, ts_key, DiffContext, PrSnapshot, FIRST_SIGHT_LEEWAY,
+    diff, first_sight_watermark, team_key, ts_key, DiffContext, PrOutcome, PrSnapshot,
+    FIRST_SIGHT_LEEWAY,
 };
 use octocrab::Octocrab;
 use serde::{Deserialize, Serialize};
@@ -327,14 +328,21 @@ impl GitHubSource {
         viewer: &str,
         viewer_teams: &HashSet<String>,
         now: OffsetDateTime,
-    ) -> Result<Vec<Event>, SourceError> {
+    ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{number}");
         let pr_data = match self.fetch_pr(owner, repo, number).await {
             Ok(d) => d,
+            // One unfetchable PR shouldn't abort the poll, but the caller has to know
+            // whether it may record this PR as seen: past a permanently gone one,
+            // yes; past one that merely blipped, no, or the PR is skipped until its
+            // timestamp moves and the failure outlives the poll it happened on.
+            Err(e @ SourceError::NotFound(_)) => {
+                warn!(%scope, error = %e, "PR is gone or not visible; skipping it for good");
+                return Ok(PrOutcome::Gone);
+            }
             Err(e) => {
-                // One inaccessible PR (deleted, perms) shouldn't abort the poll.
-                warn!(%scope, error = %e, "failed to fetch PR; skipping");
-                return Ok(Vec::new());
+                warn!(%scope, error = %e, "failed to fetch PR; will retry next poll");
+                return Ok(PrOutcome::Unfetched);
             }
         };
         let old: PrSnapshot = match state.get_snapshot(SOURCE_ID, &scope).await? {
@@ -377,7 +385,7 @@ impl GitHubSource {
             Ok(None) => {}
             Err(e) => warn!(%scope, error = %e, "merge-queue check failed; skipping"),
         }
-        Ok(evs)
+        Ok(PrOutcome::Diffed(evs))
     }
 
     /// Diff a batch of swept PRs (from the open or closed involved-PR search),
@@ -409,7 +417,7 @@ impl GitHubSource {
                     continue;
                 }
             }
-            let evs = self
+            let outcome = self
                 .process_pr(
                     state,
                     &owner,
@@ -425,11 +433,15 @@ impl GitHubSource {
                 .await?;
             // Defer the cursor advance to `commit_snapshots` (after delivery), so a
             // failed send leaves the cursor in place and this PR re-derives next poll.
-            self.pending_pr_cursors
-                .lock()
-                .unwrap()
-                .insert(scope.clone(), updated_at);
-            events.extend(evs);
+            // Skipped entirely when the PR wasn't fetched: advancing then would leave
+            // the cursor ahead of the snapshot and hide the PR until it changes again.
+            if outcome.may_advance_cursor() {
+                self.pending_pr_cursors
+                    .lock()
+                    .unwrap()
+                    .insert(scope.clone(), updated_at);
+            }
+            events.extend(outcome.into_events());
             processed.insert(scope);
         }
         Ok(())
@@ -727,7 +739,7 @@ impl Source for GitHubSource {
                     .insert(scope.clone(), n.id.clone());
             }
 
-            let evs = self
+            let outcome = self
                 .process_pr(
                     state,
                     &owner,
@@ -742,10 +754,12 @@ impl Source for GitHubSource {
                     poll_start,
                 )
                 .await?;
-            if let Some(updated) = &n.updated_at {
-                state.put_cursor(SOURCE_ID, &seen_key, updated).await?;
+            if outcome.may_advance_cursor() {
+                if let Some(updated) = &n.updated_at {
+                    state.put_cursor(SOURCE_ID, &seen_key, updated).await?;
+                }
             }
-            events.extend(evs);
+            events.extend(outcome.into_events());
             processed.insert(scope);
         }
 
@@ -998,6 +1012,15 @@ fn parse_repo_url(url: &str) -> Option<(String, String)> {
 }
 
 fn map_err(err: octocrab::Error) -> SourceError {
+    // A structured GitHub error carries the status; its `Display` is just "GitHub",
+    // so the string classifier below cannot see it. 404 is the one status worth
+    // reading here, because it is the difference between "stop asking about this PR"
+    // and "ask again next poll".
+    if let octocrab::Error::GitHub { source, .. } = &err {
+        if source.status_code.as_u16() == 404 {
+            return SourceError::NotFound(format!("GitHub returned 404: {}", source.message));
+        }
+    }
     classify_github_error(&err.to_string())
 }
 
@@ -1015,6 +1038,11 @@ fn classify_github_error(msg: &str) -> SourceError {
         || lower.contains("401")
     {
         SourceError::Auth(format!("invalid GitHub token: {msg}"))
+    } else if lower.contains("404") || lower.contains("not found") {
+        // Permanent: the PR is deleted, or in a repo this token can no longer see.
+        // Kept distinct from a 5xx so callers can stop asking instead of retrying it
+        // on every poll for ever.
+        SourceError::NotFound(msg.to_string())
     } else if lower.contains("forbidden")
         || lower.contains("resource not accessible")
         || lower.contains("403")

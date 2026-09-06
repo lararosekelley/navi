@@ -169,11 +169,12 @@ impl SqliteStore {
     ///
     /// ## The one case that alerts
     ///
-    /// A cursor can sit *ahead* of its snapshot: the involved sweep stages the cursor
-    /// once `process_pr` returns `Ok`, and `process_pr` returns `Ok(vec![])` without
-    /// staging a snapshot when the PR fetch fails (#162). One failed fetch on a PR
-    /// that had just changed leaves the cursor holding the new timestamp and the
-    /// snapshot holding the pre-change state.
+    /// A cursor can sit *ahead* of its snapshot. The sources no longer create that
+    /// state (#162: a cursor only advances past a PR that was actually diffed), but
+    /// databases written before that fix still hold such rows, left by a failed PR
+    /// fetch on a PR that had just changed: the cursor holds the new timestamp while
+    /// the snapshot holds the pre-change state. They resolve themselves the first
+    /// time the PR is diffed successfully.
     ///
     /// For those rows the re-diff is against a snapshot that is behind rather than
     /// level, so it emits everything accumulated since the last successful diff, with
