@@ -675,12 +675,21 @@ impl Engine {
             // Nothing to send this interval, but the buffer still has to be rewritten:
             // a rule may have dropped events, and anything the window held moves to
             // the held row, which `release_digest` retries every pass.
-            let parked = self.park_held(&hold).await;
-            // Nothing was attempted, so `pending` is emptied either way; what was
-            // held is on the held row and what a rule dropped is gone.
-            let cleared = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await;
-            if let Err(err) = parked.and(cleared) {
-                warn!(%err, "could not rewrite the digest buffer");
+            // Nothing was attempted, so `pending` can be emptied - but only once the
+            // held events are safely on the other row. Clearing first, or awaiting
+            // both and merely picking an error to log, would put them on neither row
+            // if the held write failed and this one succeeded. That is the one
+            // failure here with nothing left to retry from.
+            if let Err(err) = self.park_held(&hold).await {
+                warn!(%err, "could not park the held digest events; keeping them pending");
+                return DigestFlush {
+                    sent: 0,
+                    held: hold.len(),
+                    failed: true,
+                };
+            }
+            if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
+                warn!(%err, "held digest events were parked but the buffer could not be cleared; they may be parked again");
                 return DigestFlush {
                     sent: 0,
                     held: hold.len(),
@@ -1197,6 +1206,41 @@ mod tests {
         }
         async fn put_cursor(&self, s: &str, k: &str, v: &str) -> Result<(), StateError> {
             self.0.put_cursor(s, k, v).await
+        }
+    }
+
+    /// Wraps a store and fails writes to one scope, so a partial state failure can
+    /// be aimed at a single row.
+    struct ScopedWriteFails {
+        inner: Arc<MemState>,
+        scope: &'static str,
+    }
+
+    #[async_trait]
+    impl StateStore for ScopedWriteFails {
+        async fn get_snapshot(&self, s: &str, scope: &str) -> Result<Option<Vec<u8>>, StateError> {
+            self.inner.get_snapshot(s, scope).await
+        }
+        async fn put_snapshot(&self, s: &str, scope: &str, b: &[u8]) -> Result<(), StateError> {
+            if scope == self.scope {
+                return Err(StateError::Backend("database is locked".into()));
+            }
+            self.inner.put_snapshot(s, scope, b).await
+        }
+        async fn was_delivered(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            self.inner.was_delivered(k, sink).await
+        }
+        async fn was_delivered_exact(&self, k: &str, sink: &str) -> Result<bool, StateError> {
+            self.inner.was_delivered_exact(k, sink).await
+        }
+        async fn mark_delivered(&self, k: &str, sink: &str) -> Result<(), StateError> {
+            self.inner.mark_delivered(k, sink).await
+        }
+        async fn get_cursor(&self, s: &str, k: &str) -> Result<Option<String>, StateError> {
+            self.inner.get_cursor(s, k).await
+        }
+        async fn put_cursor(&self, s: &str, k: &str, v: &str) -> Result<(), StateError> {
+            self.inner.put_cursor(s, k, v).await
         }
     }
 
@@ -2770,6 +2814,48 @@ mod tests {
         assert_eq!(
             dest.digests.lock().unwrap().last().unwrap(),
             &vec!["quiet1".to_string()]
+        );
+    }
+
+    /// Moving events between the two rows is two writes, so the second must not run
+    /// when the first failed. Clearing `pending` after a failed park would leave the
+    /// events on neither row, which is the one failure on this path with nothing left
+    /// to retry from. The window covering every repo is the common case here, so this
+    /// is the branch a quiet window takes on every flush.
+    #[tokio::test]
+    async fn a_failed_park_does_not_clear_the_pending_row() {
+        let dest = Arc::new(MockDestination::default());
+        let inner = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![ev(EventKind::Mentioned, "k1")],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            Arc::new(ScopedWriteFails {
+                inner: inner.clone(),
+                scope: DIGEST_HELD_SCOPE,
+            }),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // Everything is held, and parking it fails.
+        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
+        assert!(flush.failed);
+        assert!(digest_held(&engine).await.is_empty(), "the park did fail");
+        assert_eq!(
+            engine
+                .read_digest()
+                .await
+                .unwrap()
+                .iter()
+                .map(|e| e.dedup_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["k1"],
+            "the event must stay pending rather than land on neither row"
         );
     }
 
