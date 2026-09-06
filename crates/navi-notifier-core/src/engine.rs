@@ -90,6 +90,16 @@ impl RunReport {
 const DIGEST_SOURCE: &str = "__digest__";
 const DIGEST_SCOPE: &str = "pending";
 
+/// Where the digest parks events a deferring rule held back.
+///
+/// Separate from `pending` because the two are on different clocks. `pending`
+/// accumulates and is emptied once per `digest.interval_secs`; what the window held
+/// back is retried every poll pass, so it goes out as soon as the window ends rather
+/// than waiting for the next interval. Sharing one row forced a single clock to do
+/// both jobs, which either stranded the held events or emitted a one-event digest
+/// every pass.
+const DIGEST_HELD_SCOPE: &str = "held";
+
 /// State-store keys under which deferred (quiet-hours) events are buffered. A
 /// separate bucket from the digest: these are ordinary alerts waiting for the
 /// window to end, not events the user asked to have batched.
@@ -114,24 +124,6 @@ pub struct DigestFlush {
     /// A destination or the buffer write failed, so the batch is kept to retry.
     /// Distinct from `held`, which is the window doing its job rather than an error.
     pub failed: bool,
-}
-
-impl DigestFlush {
-    /// Whether the daemon should start its next digest interval.
-    ///
-    /// False only when a quiet window held everything back: that attempt could never
-    /// have sent, so retrying it on the next pass costs a buffer read, while waiting
-    /// a whole interval can strand the buffer entirely if the interval's phase falls
-    /// inside the window.
-    ///
-    /// A flush that sent anything starts the next interval even if it also held
-    /// something, so a partly-quiet buffer (a per-repo `quiet_hours` override) keeps
-    /// the configured cadence instead of emitting a one-event digest every pass. A
-    /// failure does too, so a wedged destination is retried slowly rather than every
-    /// pass.
-    pub fn starts_next_interval(&self) -> bool {
-        self.sent > 0 || self.held == 0 || self.failed
-    }
 }
 
 /// Most events either buffer will hold. Generous enough that a normal quiet window
@@ -633,8 +625,9 @@ impl Engine {
 
     /// Flush the buffered digest: one batched message per destination (only the
     /// events routed to it), then rewrite the buffer with whatever is left. Called
-    /// by the daemon on the digest interval, and again on the next poll pass if a
-    /// quiet window held everything back (see [`DigestFlush::starts_next_interval`]).
+    /// by the daemon once per `digest.interval_secs`. Events a deferring rule holds
+    /// back move to the held row, which [`Engine::release_digest`] retries every poll
+    /// pass, so the interval never gates their release.
     ///
     /// If any destination fails, the batch is kept and retried on the next interval;
     /// the per-destination dedup sinks mean that retry only reaches the destinations
@@ -679,12 +672,16 @@ impl Engine {
             );
         }
         if pending.is_empty() {
-            // Nothing to send, but a rule may have shrunk the buffer, so it still
-            // has to be written back.
-            if dropped > 0 {
-                if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &hold).await {
-                    warn!(%err, "could not rewrite the digest buffer after dropping events");
-                }
+            // Nothing to send this interval, but the buffer still has to be rewritten:
+            // a rule may have dropped events, and anything the window held moves to
+            // the held row, which `release_digest` retries every pass.
+            if let Err(err) = self.park_held(&hold).await {
+                warn!(%err, "could not park the held digest events");
+                return DigestFlush {
+                    sent: 0,
+                    held: hold.len(),
+                    failed: true,
+                };
             }
             return DigestFlush {
                 sent: 0,
@@ -693,9 +690,51 @@ impl Engine {
             };
         }
 
+        let (sent, all_ok) = self.send_digest_batches_checked(&pending).await;
+
+        if !all_ok {
+            return DigestFlush {
+                sent: 0,
+                held: hold.len(),
+                failed: true,
+            };
+        }
+        // If the buffer can't be rewritten, don't report success: the events are
+        // still buffered and would re-send next flush, so surface it as a non-clean
+        // flush. What was held back for quiet hours stays.
+        if let Err(err) = self.park_held(&hold).await {
+            warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
+            return DigestFlush {
+                sent: 0,
+                held: hold.len(),
+                failed: true,
+            };
+        }
+        info!(
+            count = sent.len(),
+            held = hold.len(),
+            dropped,
+            "digest flushed"
+        );
+        // `sent`, not `pending`: an event every routed destination already had is
+        // dropped from the batch, so counting the buffer would report a send that
+        // never happened.
+        DigestFlush {
+            sent: sent.len(),
+            held: hold.len(),
+            failed: false,
+        }
+    }
+
+    /// Batch `events` per destination and send. Shared by the interval flush and the
+    /// held-event release so both route, dedup and record identically.
+    ///
+    /// Returns the keys that reached at least one destination, and whether every
+    /// attempt succeeded.
+    async fn send_digest_batches_checked(&self, events: &[Event]) -> (HashSet<String>, bool) {
         let mut all_ok = true;
-        // Keys that reached at least one destination, so the return value counts
-        // what was actually sent rather than what happened to be in the buffer.
+        // Keys that reached at least one destination, so callers count what was
+        // actually sent rather than what happened to be in the buffer.
         let mut sent: HashSet<String> = HashSet::new();
         for dest in &self.destinations {
             // Routed here, and not already sent here. The second half matters
@@ -704,7 +743,7 @@ impl Engine {
             // user, re-derives and buffers with only its `__digest__` sink marked.
             // Without this filter the flush would send it a second time.
             let mut batch = Vec::new();
-            for event in &pending {
+            for event in events {
                 if !self
                     .destinations_for(event)
                     .iter()
@@ -754,39 +793,97 @@ impl Engine {
                 }
             }
         }
+        (sent, all_ok)
+    }
 
-        if !all_ok {
-            return DigestFlush {
-                sent: 0,
-                held: hold.len(),
-                failed: true,
-            };
+    /// [`Engine::send_digest_batches_checked`] without the success flag.
+    async fn send_digest_batches(&self, events: &[Event]) -> HashSet<String> {
+        self.send_digest_batches_checked(events).await.0
+    }
+
+    /// Empty `pending` and move what the window held onto the held row, appending to
+    /// whatever is already parked there.
+    async fn park_held(&self, hold: &[Event]) -> Result<(), StateError> {
+        if !hold.is_empty() {
+            let mut parked = self
+                .read_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, "digest-held")
+                .await?;
+            let known: HashSet<&str> = parked.iter().map(|e| e.dedup_key.as_str()).collect();
+            let fresh: Vec<Event> = hold
+                .iter()
+                .filter(|e| !known.contains(e.dedup_key.as_str()))
+                .cloned()
+                .collect();
+            if !fresh.is_empty() {
+                parked.extend(fresh);
+                self.write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &parked)
+                    .await?;
+            }
         }
-        // If the buffer can't be rewritten, don't report success: the events are
-        // still buffered and would re-send next flush, so surface it as a non-clean
-        // flush. What was held back for quiet hours stays.
-        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &hold).await {
-            warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
-            return DigestFlush {
-                sent: 0,
-                held: hold.len(),
-                failed: true,
-            };
+        self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await
+    }
+
+    /// Send digest events a quiet window held back, as soon as it stops applying.
+    ///
+    /// Called every poll pass, unlike [`Engine::flush_digest`], which runs on
+    /// `digest.interval_secs`. The interval governs how often a *new* batch is sent;
+    /// it is the wrong clock for releasing one the window has already delayed. With a
+    /// daily interval whose phase falls inside the window, one clock for both jobs
+    /// left the held events waiting a further day each time, or indefinitely.
+    ///
+    /// Returns how many events were released.
+    pub async fn release_digest(&self, ctx: &FilterContext) -> usize {
+        let parked = match self
+            .read_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, "digest-held")
+            .await
+        {
+            Ok(p) => p,
+            Err(err) => {
+                warn!(%err, "could not read the held digest events; leaving them in place");
+                return 0;
+            }
+        };
+        if parked.is_empty() {
+            return 0;
         }
-        info!(
-            count = sent.len(),
-            held = hold.len(),
-            dropped,
-            "digest flushed"
-        );
-        // `sent`, not `pending`: an event every routed destination already had is
-        // dropped from the batch, so counting the buffer would report a send that
-        // never happened.
-        DigestFlush {
-            sent: sent.len(),
-            held: hold.len(),
-            failed: false,
+        let before = parked.len();
+        let mut keep = Vec::new();
+        let mut ready = Vec::new();
+        for event in parked {
+            match self.rules.decide(&event, ctx) {
+                Decision::Deliver => ready.push(event),
+                Decision::Defer(_) => keep.push(event),
+                Decision::Drop(reason) => {
+                    debug!(dedup_key = %event.dedup_key, ?reason, "held digest event dropped on release")
+                }
+            }
         }
+        if ready.is_empty() {
+            if keep.len() != before {
+                if let Err(err) = self
+                    .write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &keep)
+                    .await
+                {
+                    warn!(%err, "could not rewrite the held digest events");
+                }
+            }
+            return 0;
+        }
+
+        let sent = self.send_digest_batches(&ready).await;
+        if sent.is_empty() {
+            // Nothing landed, so keep everything for the next pass.
+            return 0;
+        }
+        keep.extend(ready.into_iter().filter(|e| !sent.contains(&e.dedup_key)));
+        if let Err(err) = self
+            .write_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, &keep)
+            .await
+        {
+            warn!(%err, "released held digest events but could not rewrite the row; they may re-send");
+        }
+        info!(count = sent.len(), "released held digest events");
+        sent.len()
     }
 
     /// Release events held by a deferring rule (quiet hours) now that the rule may
@@ -1095,6 +1192,17 @@ mod tests {
             excerpt: None,
             dedup_key: key.into(),
         }
+    }
+
+    /// The dedup keys parked on the digest's held row.
+    async fn digest_held(engine: &Engine) -> Vec<String> {
+        engine
+            .read_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, "digest-held")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.dedup_key)
+            .collect()
     }
 
     /// Like [`ev`], but in a named repo, so per-repo rule overrides can be exercised.
@@ -1686,20 +1794,24 @@ mod tests {
         let r = engine.run_once(INSIDE_WINDOW, false).await;
         assert!(matches!(r.records[0].outcome, EventOutcome::Digested));
 
-        // A flush inside the window sends nothing and keeps the batch.
+        // A flush inside the window sends nothing and parks the batch on the held
+        // row, which is retried every pass rather than on the digest interval.
         assert_eq!(engine.flush_digest(&INSIDE_WINDOW).await.sent, 0);
         assert!(
             dest.digests.lock().unwrap().is_empty(),
             "a digest must not break the quiet window"
         );
+        assert_eq!(digest_held(&engine).await, vec!["k1".to_string()]);
+        assert_eq!(engine.release_digest(&INSIDE_WINDOW).await, 0);
 
         // Once the window is over it goes out, exactly once.
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 1);
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
         assert_eq!(
             dest.digests.lock().unwrap().as_slice(),
             &[vec!["k1".to_string()]]
         );
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 0);
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 0);
+        assert!(digest_held(&engine).await.is_empty());
     }
 
     /// A flush that sends some of the buffer and holds the rest must write back what
@@ -1749,17 +1861,13 @@ mod tests {
             &[vec!["loud1".to_string()]]
         );
 
-        // The quiet one must still be buffered, not wiped with the batch.
-        let left = engine.read_digest().await.unwrap();
-        assert_eq!(
-            left.iter()
-                .map(|e| e.dedup_key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["quiet1"]
-        );
+        // The quiet one moves to the held row rather than being wiped with the
+        // batch, and `pending` is emptied so the next interval starts clean.
+        assert!(engine.read_digest().await.unwrap().is_empty());
+        assert_eq!(digest_held(&engine).await, vec!["quiet1".to_string()]);
 
-        // And it goes out once the window ends.
-        assert_eq!(engine.flush_digest(&OUTSIDE_WINDOW).await.sent, 1);
+        // And it goes out once the window ends, without waiting for an interval.
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
         assert_eq!(
             dest.digests.lock().unwrap().last().unwrap(),
             &vec!["quiet1".to_string()]
@@ -1936,99 +2044,9 @@ mod tests {
             DigestFlush::default()
         );
 
-        // Once the window ends, it sends and holds nothing.
-        let flush = engine.flush_digest(&OUTSIDE_WINDOW).await;
-        assert_eq!(
-            flush,
-            DigestFlush {
-                sent: 1,
-                held: 0,
-                failed: false
-            }
-        );
-    }
-
-    /// A partly-held flush must still start the next interval, or a per-repo
-    /// `quiet_hours` override turns an hourly digest into a one-event digest every
-    /// poll pass for the rest of the window.
-    #[tokio::test]
-    async fn a_mixed_digest_flush_starts_the_next_interval() {
-        let dest = Arc::new(MockDestination::default());
-        let state = Arc::new(MemState::default());
-        let rules = RuleConfig {
-            quiet_hours: crate::config::QuietHours {
-                enabled: true,
-                start: "22:00".into(),
-                end: "08:00".into(),
-            },
-            overrides: vec![crate::config::RuleOverride {
-                repos: vec!["loud/*".into()],
-                quiet_hours: crate::config::QuietHoursOverride {
-                    enabled: Some(false),
-                    ..Default::default()
-                },
-                ..Default::default()
-            }],
-            ..Default::default()
-        };
-        let engine = Engine::new(
-            vec![Arc::new(MockSource {
-                events: vec![
-                    ev_in(EventKind::Mentioned, "loud", "repo", "loud1"),
-                    ev_in(EventKind::Mentioned, "quiet", "repo", "quiet1"),
-                ],
-                ..Default::default()
-            })],
-            vec![dest.clone()],
-            vec![],
-            RuleEngine::new(rules).unwrap(),
-            state.clone(),
-        )
-        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
-        engine.run_once(INSIDE_WINDOW, false).await;
-
-        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
-        assert_eq!(flush.sent, 1);
-        assert_eq!(flush.held, 1);
-        assert!(
-            flush.starts_next_interval(),
-            "a flush that sent something must not re-run every pass"
-        );
-    }
-
-    /// Only a flush the window blocked entirely should retry on the next pass.
-    #[test]
-    fn only_a_fully_held_flush_skips_the_next_interval() {
-        // Nothing buffered, or everything dropped by a rule: nothing to wait for.
-        assert!(DigestFlush::default().starts_next_interval());
-        // Sent everything.
-        assert!(DigestFlush {
-            sent: 2,
-            held: 0,
-            failed: false
-        }
-        .starts_next_interval());
-        // Sent some, held some: keep the configured cadence.
-        assert!(DigestFlush {
-            sent: 1,
-            held: 1,
-            failed: false
-        }
-        .starts_next_interval());
-        // A wedged destination retries slowly, not every pass.
-        assert!(DigestFlush {
-            sent: 0,
-            held: 1,
-            failed: true
-        }
-        .starts_next_interval());
-        // The one case that must retry soon.
-        assert!(!DigestFlush {
-            sent: 0,
-            held: 1,
-            failed: false
-        }
-        .starts_next_interval());
+        // Once the window ends the release sends it. The interval flush is not
+        // involved, which is the point of keeping the two rows on separate clocks.
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
     }
 
     /// Both buffers re-decide through the same call, so they must agree: a mute the
@@ -2258,6 +2276,115 @@ mod tests {
             &[HashSet::new()],
             "an event-free pass must still commit, or the cursor sweep re-fetches \
              every quiet PR daily"
+        );
+    }
+
+    /// #158: the interval must not be the clock for releasing what the window held.
+    ///
+    /// The scenario the issue describes: a per-repo override makes one repo loud and
+    /// another quiet, so an interval flush sends the loud events and holds the quiet
+    /// ones. With one clock for both jobs, the held remainder waited for the *next*
+    /// interval, which at `interval_secs = 86400` is a day later and, if the phase
+    /// falls inside the window, never. Releasing is now checked every pass instead.
+    #[tokio::test]
+    async fn a_held_batch_is_released_without_waiting_for_the_next_interval() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let rules = RuleConfig {
+            quiet_hours: crate::config::QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            overrides: vec![crate::config::RuleOverride {
+                repos: vec!["loud/*".into()],
+                quiet_hours: crate::config::QuietHoursOverride {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let engine = Engine::new(
+            vec![Arc::new(MockSource {
+                events: vec![
+                    ev_in(EventKind::Mentioned, "loud", "repo", "loud1"),
+                    ev_in(EventKind::Mentioned, "quiet", "repo", "quiet1"),
+                ],
+                ..Default::default()
+            })],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(rules).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+        engine.run_once(INSIDE_WINDOW, false).await;
+
+        // The one interval flush this scenario gets: loud goes, quiet is parked.
+        let flush = engine.flush_digest(&INSIDE_WINDOW).await;
+        assert_eq!((flush.sent, flush.held), (1, 1));
+        assert_eq!(digest_held(&engine).await, vec!["quiet1".to_string()]);
+
+        // No further flush happens for a day. Releases run every pass, and do
+        // nothing until the window lifts.
+        assert_eq!(engine.release_digest(&INSIDE_WINDOW).await, 0);
+        assert_eq!(dest.digests.lock().unwrap().len(), 1);
+
+        // The moment it lifts, the held batch goes, with no interval in between.
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().last().unwrap(),
+            &vec!["quiet1".to_string()]
+        );
+        assert!(digest_held(&engine).await.is_empty());
+    }
+
+    /// The other half of the split: a released batch must not drag the *next*
+    /// interval's events out with it. `pending` and the held row are separate, so
+    /// events buffered after a flush wait for the interval as configured.
+    #[tokio::test]
+    async fn releasing_held_events_does_not_send_the_next_batch_early() {
+        let dest = Arc::new(MockDestination::default());
+        let state = Arc::new(MemState::default());
+        let engine = Engine::new(
+            vec![Arc::new(MockSource::default())],
+            vec![dest.clone()],
+            vec![],
+            RuleEngine::new(quiet_rules()).unwrap(),
+            state.clone(),
+        )
+        .with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+
+        // One event parked by the window, one freshly buffered for the next interval.
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_HELD_SCOPE,
+                &[ev(EventKind::Mentioned, "held1")],
+            )
+            .await
+            .unwrap();
+        engine
+            .write_buffer(
+                DIGEST_SOURCE,
+                DIGEST_SCOPE,
+                &[ev(EventKind::Mentioned, "new1")],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(engine.release_digest(&OUTSIDE_WINDOW).await, 1);
+        assert_eq!(
+            dest.digests.lock().unwrap().as_slice(),
+            &[vec!["held1".to_string()]],
+            "a release must not pull the accumulating batch forward"
+        );
+        assert_eq!(
+            engine.read_digest().await.unwrap().len(),
+            1,
+            "the next interval's batch is untouched"
         );
     }
 

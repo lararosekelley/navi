@@ -225,16 +225,24 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
         // interval.
         engine.flush_deferred(&filter_context(&config)).await;
 
-        // Flush the digest on its own cadence, independent of the poll interval.
-        if config.digest.enabled && last_digest.elapsed() >= digest_interval {
-            let flush = engine.flush_digest(&filter_context(&config)).await;
-            // A flush a quiet window held back entirely is retried next pass rather
-            // than burning the interval: at `interval_secs = 86400` the phase is
-            // pinned to the daemon's start time, so a daemon started inside the
-            // window would otherwise retry there for ever and never flush at all.
-            // Anything else, including a partly-held or failed flush, starts the next
-            // interval normally.
-            if flush.starts_next_interval() {
+        if config.digest.enabled {
+            // Two clocks, because the interval answers only one of the two questions.
+            // How often a new batch goes out is the user's setting; when a batch the
+            // quiet window already delayed may finally go out is not, so that is
+            // checked every pass. Sharing one clock meant a daily interval whose
+            // phase lands inside the window delayed the held events another full day
+            // each time, or never released them at all.
+            engine.release_digest(&filter_context(&config)).await;
+
+            if last_digest.elapsed() >= digest_interval {
+                let flush = engine.flush_digest(&filter_context(&config)).await;
+                if flush.failed {
+                    warn!(
+                        sent = flush.sent,
+                        held = flush.held,
+                        "digest flush did not complete cleanly; the batch is kept for the next interval"
+                    );
+                }
                 last_digest = std::time::Instant::now();
             }
         }
