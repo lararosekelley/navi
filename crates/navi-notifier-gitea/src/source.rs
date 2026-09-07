@@ -211,12 +211,6 @@ impl GiteaSource {
         now: OffsetDateTime,
     ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{index}");
-        // Backed off from an earlier failure: report it as unfetched, which holds the
-        // cursor exactly as a fresh failure would, without spending the request.
-        if !self.backoff.ready(&scope, now) {
-            debug!(%scope, "skipping a gitea PR that is backed off after repeated fetch failures");
-            return Ok(PrOutcome::Unfetched);
-        }
         let pr_data = match self.fetch_pr(owner, repo, index).await {
             Ok(d) => {
                 self.backoff.clear(&scope);
@@ -357,10 +351,20 @@ impl GiteaSource {
         viewer: &str,
         poll_start: OffsetDateTime,
         first_sight_backfill: Option<Backfill>,
+        // Whether the listing this batch came from will keep returning a PR
+        // indefinitely. Only the open-PR search will. The closed sweep and the
+        // notifications inbox are bounded by watermarks that advance every poll
+        // regardless, so deferring a retry on those risks the listing moving past
+        // the PR first, turning a delayed event into a lost one.
+        date_unbounded: bool,
     ) -> Result<(), SourceError> {
         for (owner, repo, index, updated_at, repo_url) in prs {
             let scope = format!("{owner}/{repo}#{index}");
             if processed.contains(&scope) {
+                continue;
+            }
+            if date_unbounded && !self.backoff.ready(&scope, poll_start) {
+                debug!(%scope, "skipping a gitea PR that is backed off after repeated fetch failures");
                 continue;
             }
             let seen_key = format!("pr:{scope}");
@@ -472,6 +476,9 @@ impl Source for GiteaSource {
                         &viewer,
                         poll_start,
                         sweep_backfill,
+                        // The open search has no date bound, so a deferred retry is
+                        // guaranteed another chance.
+                        true,
                     )
                     .await?;
                 }
@@ -491,6 +498,10 @@ impl Source for GiteaSource {
                             &viewer,
                             poll_start,
                             None,
+                            // Bounded by `pr_closed_since`, which advances every poll
+                            // whether or not this PR was fetched, so deferring a
+                            // retry here could lose a self-merge rather than delay it.
+                            false,
                         )
                         .await?;
                     }

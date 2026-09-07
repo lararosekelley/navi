@@ -334,12 +334,6 @@ impl GitHubSource {
         now: OffsetDateTime,
     ) -> Result<PrOutcome, SourceError> {
         let scope = format!("{owner}/{repo}#{number}");
-        // Backed off from an earlier failure: report it as unfetched, which holds the
-        // cursor exactly as a fresh failure would, without spending the request.
-        if !self.backoff.ready(&scope, now) {
-            debug!(%scope, "skipping a PR that is backed off after repeated fetch failures");
-            return Ok(PrOutcome::Unfetched);
-        }
         let pr_data = match self.fetch_pr(owner, repo, number).await {
             Ok(d) => {
                 self.backoff.clear(&scope);
@@ -358,7 +352,7 @@ impl GitHubSource {
             }
             Err(e) => {
                 let wait = self.backoff.failed(&scope, now);
-                warn!(%scope, error = %e, retry_in_secs = wait.whole_seconds(), "failed to fetch PR; backing off");
+                warn!(%scope, error = %e, retry_in_secs = wait.whole_seconds(), "failed to fetch PR; will retry");
                 return Ok(PrOutcome::Unfetched);
             }
         };
@@ -422,10 +416,22 @@ impl GitHubSource {
         viewer_teams: &HashSet<String>,
         poll_start: OffsetDateTime,
         first_sight_backfill: Option<Backfill>,
+        // Whether the listing this batch came from will keep returning a PR
+        // indefinitely. Only the open-PR search will: it is `is:open is:pr
+        // involves:{viewer}` with no date bound. The closed sweep and the
+        // notifications inbox are both bounded by a watermark that advances every
+        // poll regardless, so deferring a retry on those risks the listing moving
+        // past the PR before the retry happens, turning a delayed event into a lost
+        // one. The backoff is therefore only consulted here.
+        date_unbounded: bool,
     ) -> Result<(), SourceError> {
         for (owner, repo, number, updated_at) in prs {
             let scope = format!("{owner}/{repo}#{number}");
             if processed.contains(&scope) {
+                continue;
+            }
+            if date_unbounded && !self.backoff.ready(&scope, poll_start) {
+                debug!(%scope, "skipping a PR that is backed off after repeated fetch failures");
                 continue;
             }
             let seen_key = format!("pr:{scope}");
@@ -800,6 +806,9 @@ impl Source for GitHubSource {
                         &viewer_teams,
                         poll_start,
                         sweep_backfill,
+                        // The open search has no date bound, so a deferred retry is
+                        // guaranteed another chance.
+                        true,
                     )
                     .await?;
                 }
@@ -825,6 +834,10 @@ impl Source for GitHubSource {
                             &viewer_teams,
                             poll_start,
                             None,
+                            // Bounded by `pr_closed_since`, which advances every poll
+                            // whether or not this PR was fetched, so deferring a
+                            // retry here could lose a self-merge rather than delay it.
+                            false,
                         )
                         .await?;
                     }
