@@ -308,7 +308,13 @@ async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
     let server = Box::leak(Box::new(MockServer::start().await));
     mock_sweep_hit_with_failing_pr(server, 500).await;
 
+    // The seeded snapshot is the precondition: only a PR navi already has a baseline
+    // for is deferred, since the diff's age watermark applies on first sight alone.
     let state = MemState::default();
+    state
+        .put_snapshot("gitea", "acme/widgets#4", br#"{"initialized":true}"#)
+        .await
+        .unwrap();
     let source = sweeping_source(server);
 
     assert!(source.poll(&state).await.expect("poll").is_empty());
@@ -347,5 +353,108 @@ async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
             .await
             .unwrap(),
         None
+    );
+}
+
+/// The gitea counterpart of the github closed-sweep test. `pr_closed_since` advances
+/// every poll whether or not this PR was fetched, so deferring a retry there would
+/// let the window move past a self-merge and lose the event rather than delay it.
+/// Only the open search, which has no date bound, is safe to defer.
+#[tokio::test]
+async fn a_closed_sweep_pr_is_retried_immediately_after_a_failed_fetch() {
+    let server = Box::leak(Box::new(MockServer::start().await));
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "open"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "number": 5,
+            "updated_at": "2024-02-02T00:00:00Z",
+            "repository": { "full_name": "acme/widgets", "html_url": "https://gitea.test/acme/widgets" }
+        }])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/5"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(server)
+        .await;
+
+    // A snapshot, so the only thing that can stop a retry is the listing flag.
+    let state = MemState::default();
+    state
+        .put_snapshot("gitea", "acme/widgets#5", br#"{"initialized":true}"#)
+        .await
+        .unwrap();
+    state
+        .put_cursor("gitea", "pr_closed_since", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let source = sweeping_source(server);
+
+    async fn fetches(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/5")
+            .count()
+    }
+
+    source.poll(&state).await.expect("poll");
+    let after_first = fetches(server).await;
+    assert!(after_first > 0);
+
+    source.poll(&state).await.expect("poll");
+    assert!(
+        fetches(server).await > after_first,
+        "a bounded listing must keep retrying, or the self-merge is lost not delayed"
+    );
+}
+
+/// The gitea counterpart of `a_first_sight_pr_is_never_deferred`. A PR with no
+/// snapshot has its first-sight watermark computed at the poll that succeeds, so a
+/// deferred fetch would baseline the activity that triggered the sighting.
+#[tokio::test]
+async fn a_first_sight_pr_is_never_deferred() {
+    let server = Box::leak(Box::new(MockServer::start().await));
+    mock_sweep_hit_with_failing_pr(server, 500).await;
+
+    // No snapshot: navi has never successfully diffed this PR.
+    let state = MemState::default();
+    let source = sweeping_source(server);
+
+    async fn fetches(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/4")
+            .count()
+    }
+
+    source.poll(&state).await.expect("poll");
+    let after_first = fetches(server).await;
+    source.poll(&state).await.expect("poll");
+    assert!(
+        fetches(server).await > after_first,
+        "a PR with no baseline must keep being retried at the normal cadence"
     );
 }
