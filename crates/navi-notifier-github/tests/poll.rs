@@ -923,6 +923,10 @@ async fn a_transient_fetch_failure_does_not_advance_the_thread_cursor() {
 /// Asserted as "no further requests after the first poll" rather than an absolute
 /// count, because octocrab retries a 5xx internally, so one `fetch_pr` is already
 /// several requests. That multiplier is the reason this is worth bounding.
+///
+/// The seeded snapshot is the precondition, not scenery: only a PR navi already has
+/// a baseline for is deferred, since the diff's age watermark applies on first sight
+/// alone. `a_first_sight_pr_is_never_deferred` covers the other side.
 #[tokio::test]
 async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
     let server = MockServer::start().await;
@@ -940,6 +944,10 @@ async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
     let server = Box::leak(Box::new(server));
 
     let state = MemState::default();
+    state
+        .put_snapshot("github", "acme/widgets#2", br#"{"initialized":true}"#)
+        .await
+        .unwrap();
     let source = source_with(server, true);
 
     assert!(source.poll(&state).await.expect("poll").is_empty());
@@ -1008,7 +1016,14 @@ async fn a_closed_sweep_pr_is_retried_immediately_after_a_failed_fetch() {
         .mount(server)
         .await;
 
+    // A snapshot, so the only thing that can stop a retry is the listing flag.
+    // Without it the first-sight rule would spare this PR regardless, and the test
+    // would pass whether or not the closed sweep is correctly marked bounded.
     let state = MemState::default();
+    state
+        .put_snapshot("github", "acme/widgets#3", br#"{"initialized":true}"#)
+        .await
+        .unwrap();
     state
         .put_cursor("github", "pr_closed_since", "2024-01-01T00:00:00Z")
         .await
@@ -1034,5 +1049,36 @@ async fn a_closed_sweep_pr_is_retried_immediately_after_a_failed_fetch() {
         fetches(server).await > after_first,
         "a bounded listing must keep retrying at the normal cadence, or the event is \
          lost rather than delayed"
+    );
+}
+
+/// A PR navi has never seen must not be deferred. Its first-sight watermark is
+/// computed at the poll that succeeds, so a delay would baseline the very activity
+/// that put the PR in front of you - lost, not late. Only once there is a snapshot
+/// is a deferred fetch harmless, because the diff filters by age on first sight
+/// alone.
+#[tokio::test]
+async fn a_first_sight_pr_is_never_deferred() {
+    let server = Box::leak(Box::new(MockServer::start().await));
+    mock_search_hit_with_failing_pr(server, 500).await;
+
+    // No snapshot: navi has never successfully diffed this PR.
+    let state = MemState::default();
+    let source = source_with(server, true);
+
+    let fetches = |s: &'static MockServer| async move {
+        s.received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/2")
+            .count()
+    };
+    source.poll(&state).await.expect("poll");
+    let after_first = fetches(server).await;
+    source.poll(&state).await.expect("poll");
+    assert!(
+        fetches(server).await > after_first,
+        "a PR with no baseline must keep being retried at the normal cadence"
     );
 }

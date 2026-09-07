@@ -364,8 +364,18 @@ impl GiteaSource {
                 continue;
             }
             if date_unbounded && !self.backoff.ready(&scope, poll_start) {
-                debug!(%scope, "skipping a gitea PR that is backed off after repeated fetch failures");
-                continue;
+                // Defer only a PR there is already a snapshot for. The diff applies
+                // its age watermark solely on first sight (`!old.initialized`), so
+                // for a snapshot-backed PR a deferred fetch is late and never lossy:
+                // events accumulate and keep their original `occurred_at`. For a PR
+                // navi has never seen, the watermark is computed at the poll that
+                // succeeds, so any delay risks baselining the very activity that
+                // triggered the sighting. Cheap because the state read only happens
+                // for a scope already known to be failing.
+                if state.get_snapshot(SOURCE_ID, &scope).await?.is_some() {
+                    debug!(%scope, "skipping a gitea PR that is backed off after repeated fetch failures");
+                    continue;
+                }
             }
             let seen_key = format!("pr:{scope}");
             if let Some(seen) = state.get_cursor(SOURCE_ID, &seen_key).await? {

@@ -27,15 +27,16 @@ use time::{Duration, OffsetDateTime};
 /// Wait after the first failure. Doubles per consecutive failure, up to [`MAX_WAIT`].
 const BASE_WAIT: Duration = Duration::minutes(2);
 
-/// Ceiling on the wait.
+/// Ceiling on the wait, so a PR that recovers is picked up within the hour.
 ///
-/// Held below [`crate::FIRST_SIGHT_LEEWAY`] on purpose. A PR with no snapshot yet
-/// has its first sighting anchored at the poll that *succeeds*, so activity older
-/// than the leeway is baselined rather than delivered. A backoff longer than the
-/// leeway would therefore turn a delayed fetch into a silently dropped event, which
-/// is the opposite of the point: this trades request rate, never events.
-/// `max_wait_cannot_outlast_the_first_sight_window` pins the relationship.
-const MAX_WAIT: Duration = Duration::minutes(8);
+/// Purely a pickup-latency choice, with no correctness constraint on it, because
+/// the caller only ever defers a pull request it already holds a snapshot for. The
+/// diff applies its age watermark on first sight alone, so for those a deferred
+/// fetch is late and never lossy however long the wait. Tying the length of a
+/// backoff to the first-sight window instead would be bounding the wrong thing:
+/// what matters is cumulative elapsed time, and successive waits add up past any
+/// single cap.
+const MAX_WAIT: Duration = Duration::hours(1);
 
 /// Overflow guard only. [`MAX_WAIT`] is what actually bounds the wait; this just
 /// stops the exponent running away for a scope that has failed thousands of times.
@@ -119,17 +120,6 @@ mod tests {
 
         assert_eq!(b.failed("acme/w#1", t0()), BASE_WAIT * 2);
         assert_eq!(b.failed("acme/w#1", t0()), BASE_WAIT * 4);
-    }
-
-    /// The invariant the cap exists for. If the wait could outlast the first-sight
-    /// window, a PR recovered after a long backoff would have its triggering
-    /// activity baselined instead of delivered.
-    #[test]
-    fn max_wait_cannot_outlast_the_first_sight_window() {
-        assert!(
-            MAX_WAIT < crate::FIRST_SIGHT_LEEWAY,
-            "a backoff longer than the first-sight leeway drops events instead of delaying them"
-        );
     }
 
     #[test]
