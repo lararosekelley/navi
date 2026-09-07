@@ -765,8 +765,12 @@ async fn mock_search_hit_with_failing_pr(server: &MockServer, status: u16) {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
         .mount(server)
         .await;
+    // Only the open sweep returns it. Matching the query matters: an open PR is not
+    // in `is:closed`, and mounting one catch-all would have the closed sweep fetch
+    // the same PR, which cannot happen against a real forge.
     Mock::given(method("GET"))
         .and(path("/search/issues"))
+        .and(query_param("q", "is:open is:pr involves:me"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
             "items": [{
                 "repository_url": format!("{}/repos/acme/widgets", server.uri()),
@@ -774,6 +778,11 @@ async fn mock_search_hit_with_failing_pr(server: &MockServer, status: u16) {
                 "updated_at": "2024-01-02T03:04:05Z"
             }]
         })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
         .mount(server)
         .await;
     // With a GitHub-shaped error body: a bodyless response makes octocrab fail while
@@ -952,4 +961,78 @@ async fn a_repeatedly_failing_fetch_is_not_retried_every_poll() {
         .await
         .unwrap();
     assert_eq!(cursor(&state, "pr:acme/widgets#2").await, None);
+}
+
+/// The backoff must not reach the closed sweep. That listing is bounded by
+/// `pr_closed_since`, which advances to `poll_start - SINCE_OVERLAP` on every poll
+/// whether or not this PR was fetched, so deferring a retry there would let the
+/// window move past the PR and turn a delayed self-merge into a lost one. Only the
+/// open search, which has no date bound, is safe to defer.
+#[tokio::test]
+async fn a_closed_sweep_pr_is_retried_immediately_after_a_failed_fetch() {
+    let server = Box::leak(Box::new(MockServer::start().await));
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .and(query_param("q", "is:open is:pr involves:me"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "items": [] })))
+        .mount(server)
+        .await;
+    // The closed sweep finds a self-merged PR, and its fetch fails every time.
+    Mock::given(method("GET"))
+        .and(path("/search/issues"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "items": [{
+                "repository_url": format!("{}/repos/acme/widgets", server.uri()),
+                "number": 3,
+                "updated_at": "2024-02-02T00:00:00Z"
+            }]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/3"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(json!({
+            "message": "Server Error",
+            "documentation_url": "https://docs.github.com/rest"
+        })))
+        .mount(server)
+        .await;
+
+    let state = MemState::default();
+    state
+        .put_cursor("github", "pr_closed_since", "2024-01-01T00:00:00Z")
+        .await
+        .unwrap();
+    let source = source_with(server, true);
+
+    async fn fetches(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.url.path() == "/repos/acme/widgets/pulls/3")
+            .count()
+    }
+
+    source.poll(&state).await.expect("poll");
+    let after_first = fetches(server).await;
+    assert!(after_first > 0);
+
+    source.poll(&state).await.expect("poll");
+    assert!(
+        fetches(server).await > after_first,
+        "a bounded listing must keep retrying at the normal cadence, or the event is \
+         lost rather than delayed"
+    );
 }

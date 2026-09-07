@@ -16,8 +16,10 @@ published into that release's GitHub notes by `dist`, so the headings must stay
 - **source:** back off a pull request whose fetch keeps failing, instead of
   re-fetching it on every poll. The per-PR cursor is deliberately held for a
   failed fetch, so without this a PR that can never be fetched costs several
-  requests a minute for as long as the daemon runs. The first success clears the
-  backoff, so a flaky PR is never given up on
+  requests a minute for as long as the daemon runs. Only the open-PR search is
+  deferred, since it is the one listing with no date bound, and the wait stays
+  below the first-sight window, so a retry is always still delivered rather than
+  baselined. The first success clears the backoff
 - **core:** release digest events a quiet window held back as soon as the window
   ends, rather than at the next digest interval. With a long `interval_secs` and
   a per-repo quiet-hours override the held part of a batch could otherwise wait
