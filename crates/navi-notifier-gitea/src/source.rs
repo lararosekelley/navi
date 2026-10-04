@@ -269,8 +269,8 @@ impl GiteaSource {
     }
 
     /// Search involved PRs by state, returning `(owner, repo, index, updated_at,
-    /// repo_url)`. The `created`/`assigned`/`mentioned`/`review_requested` flags
-    /// scope results to the authenticated user.
+    /// repo_url)`. Gitea ANDs the `created`/`assigned`/`mentioned`/
+    /// `review_requested` flags, so each is searched on its own and the hits merged.
     async fn search_prs(
         &self,
         state_filter: &str,
@@ -289,43 +289,55 @@ impl GiteaSource {
             #[serde(default)]
             html_url: Option<String>,
         }
-        let mut out = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let mut query = vec![
-                ("type", "pulls".to_string()),
-                ("state", state_filter.to_string()),
-                ("created", "true".to_string()),
-                ("assigned", "true".to_string()),
-                ("mentioned", "true".to_string()),
-                ("review_requested", "true".to_string()),
-                ("page", page.to_string()),
-                ("limit", "50".to_string()),
-            ];
-            if let Some(s) = since {
-                query.push(("since", s.to_string()));
-            }
-            let batch: Vec<SearchIssue> = self.get("/repos/issues/search", &query).await?;
-            let n = batch.len();
-            for it in batch {
-                if let Some((owner, repo)) = it.repository.full_name.split_once('/') {
-                    out.push((
-                        owner.to_string(),
-                        repo.to_string(),
-                        it.number,
-                        it.updated_at.unwrap_or_default(),
-                        it.repository.html_url,
-                    ));
+        let mut out: Vec<(String, String, u64, String, Option<String>)> = Vec::new();
+        for involvement in ["created", "assigned", "mentioned", "review_requested"] {
+            for page in 1..=MAX_PAGES {
+                let mut query = vec![
+                    ("type", "pulls".to_string()),
+                    ("state", state_filter.to_string()),
+                    (involvement, "true".to_string()),
+                    ("page", page.to_string()),
+                    ("limit", "50".to_string()),
+                ];
+                if let Some(s) = since {
+                    query.push(("since", s.to_string()));
                 }
-            }
-            if n < 50 {
-                break;
-            }
-            if page == MAX_PAGES {
-                warn!(
-                    fetched = out.len(),
-                    cap = MAX_PAGES,
-                    "gitea list truncated at the page cap; newer items may be missed this poll"
-                );
+                let batch: Vec<SearchIssue> = self.get("/repos/issues/search", &query).await?;
+                let n = batch.len();
+                for it in batch {
+                    let Some((owner, repo)) = it.repository.full_name.split_once('/') else {
+                        continue;
+                    };
+                    let updated_at = it.updated_at.unwrap_or_default();
+                    match out
+                        .iter_mut()
+                        .find(|(o, r, num, ..)| o == owner && r == repo && *num == it.number)
+                    {
+                        Some(hit) => {
+                            if updated_at > hit.3 {
+                                hit.3 = updated_at;
+                            }
+                        }
+                        None => out.push((
+                            owner.to_string(),
+                            repo.to_string(),
+                            it.number,
+                            updated_at,
+                            it.repository.html_url,
+                        )),
+                    }
+                }
+                if n < 50 {
+                    break;
+                }
+                if page == MAX_PAGES {
+                    warn!(
+                        involvement,
+                        fetched = out.len(),
+                        cap = MAX_PAGES,
+                        "gitea list truncated at the page cap; newer items may be missed this poll"
+                    );
+                }
             }
         }
         Ok(out)

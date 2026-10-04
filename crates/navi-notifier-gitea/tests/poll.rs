@@ -463,6 +463,90 @@ async fn a_first_sight_pr_is_never_deferred() {
     );
 }
 
+/// Gitea ANDs the involvement flags on `/repos/issues/search`, so a PR you
+/// authored and one you're asked to review are only found by separate searches.
+#[tokio::test]
+async fn the_open_sweep_unions_each_involvement_search() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
+    let hit = |number: u64| {
+        json!({
+            "number": number,
+            "updated_at": "2024-02-02T00:00:00Z",
+            "repository": { "full_name": "acme/widgets", "html_url": "https://gitea.test/acme/widgets" }
+        })
+    };
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "open"))
+        .and(query_param("created", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([hit(1)])))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .and(query_param("state", "open"))
+        .and(query_param("review_requested", "true"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([hit(1), hit(2)])))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/issues/search"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let request = json!([{ "id": 1, "user": { "login": "me" }, "state": "REQUEST_REVIEW" }]);
+    for (number, author, reviews) in [(1, "me", json!([])), (2, "octo", request)] {
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/widgets/pulls/{number}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "number": number,
+                "title": "Add gizmo",
+                "html_url": format!("https://gitea.test/acme/widgets/pulls/{number}"),
+                "state": "open",
+                "user": { "login": author }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/repos/acme/widgets/pulls/{number}/reviews")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(reviews))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/repos/acme/widgets/issues/{number}/comments"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+            .mount(&server)
+            .await;
+    }
+
+    let events = sweeping_source(&server)
+        .poll(&MemState::default())
+        .await
+        .expect("poll");
+    assert!(
+        events
+            .iter()
+            .any(|e| e.kind == EventKind::ReviewRequested && e.pull_request.number == 2),
+        "the review_requested search must be swept on its own: {events:?}"
+    );
+}
+
 /// Mount one poll's view of `acme/widgets#7`, authored by octo. Gitea keeps listing
 /// a reviewer in `requested_reviewers` after they review, as it does here.
 async fn mount_reviewed_pr(server: &MockServer, notified_at: &str, reviews: serde_json::Value) {
