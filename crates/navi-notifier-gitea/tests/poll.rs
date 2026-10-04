@@ -46,21 +46,25 @@ async fn poll_emits_outstanding_review_request() {
             "draft": false,
             "merged": false,
             "user": { "login": "octo" },
-            "requested_reviewers": [{ "login": "me" }]
+            "requested_reviewers": null
         })))
         .mount(&server)
         .await;
 
-    for sub in [
-        "/repos/acme/widgets/pulls/3/reviews",
-        "/repos/acme/widgets/issues/3/comments",
-    ] {
-        Mock::given(method("GET"))
-            .and(path(sub))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
-            .mount(&server)
-            .await;
-    }
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/3/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "id": 1,
+            "user": { "login": "me" },
+            "state": "REQUEST_REVIEW"
+        }])))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/issues/3/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(&server)
+        .await;
 
     let source = GiteaSource::new(GiteaSourceConfig {
         token: "test-token".into(),
@@ -456,5 +460,100 @@ async fn a_first_sight_pr_is_never_deferred() {
     assert!(
         fetches(server).await > after_first,
         "a PR with no baseline must keep being retried at the normal cadence"
+    );
+}
+
+/// Mount one poll's view of `acme/widgets#7`, authored by octo. Gitea keeps listing
+/// a reviewer in `requested_reviewers` after they review, as it does here.
+async fn mount_reviewed_pr(server: &MockServer, notified_at: &str, reviews: serde_json::Value) {
+    Mock::given(method("GET"))
+        .and(path("/user"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({ "login": "me" })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/notifications"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([{
+            "updated_at": notified_at,
+            "subject": {
+                "title": "Add gizmo",
+                "url": format!("{}/repos/acme/widgets/issues/7", server.uri()),
+                "type": "Pull"
+            },
+            "repository": { "full_name": "acme/widgets", "html_url": "https://gitea.test/acme/widgets" }
+        }])))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/7"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "number": 7,
+            "title": "Add gizmo",
+            "html_url": "https://gitea.test/acme/widgets/pulls/7",
+            "state": "open",
+            "updated_at": notified_at,
+            "user": { "login": "octo" },
+            "requested_reviewers": [{ "login": "me" }]
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/pulls/7/reviews"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(reviews))
+        .mount(server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/repos/acme/widgets/issues/7/comments"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn a_review_request_after_your_review_is_a_re_review() {
+    let server = MockServer::start().await;
+    let state = MemState::default();
+    state
+        .put_snapshot(
+            "gitea",
+            "acme/widgets#7",
+            br#"{"initialized":true,"viewer_requested":true}"#,
+        )
+        .await
+        .unwrap();
+    let source = GiteaSource::new(GiteaSourceConfig {
+        token: "test-token".into(),
+        api_base: Some(server.uri()),
+        comment_min_age_secs: 0,
+        track_prs: false,
+        backfill: Default::default(),
+    })
+    .expect("build");
+    let your_review = json!({ "id": 3, "user": { "login": "me" }, "state": "REQUEST_CHANGES" });
+
+    // You review; your request is answered.
+    mount_reviewed_pr(&server, "2024-03-01T00:00:00Z", json!([your_review])).await;
+    assert!(source.poll(&state).await.expect("poll").is_empty());
+    source
+        .commit_snapshots(&state, &HashSet::new())
+        .await
+        .unwrap();
+
+    // The author asks you again.
+    server.reset().await;
+    mount_reviewed_pr(
+        &server,
+        "2024-03-02T00:00:00Z",
+        json!([
+            your_review,
+            { "id": 4, "user": { "login": "me" }, "state": "REQUEST_REVIEW" }
+        ]),
+    )
+    .await;
+    let events = source.poll(&state).await.expect("poll");
+    assert_eq!(
+        events.iter().map(|e| &e.kind).collect::<Vec<_>>(),
+        [&EventKind::ReReviewRequested],
+        "unexpected: {events:?}"
     );
 }

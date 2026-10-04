@@ -4,6 +4,16 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.3.6
+
+### Fixed
+
+- **gitea:** take pending review requests from the pull request's
+  `REQUEST_REVIEW` review entries. Gitea keeps listing a reviewer in
+  `requested_reviewers` after they review, so asking them again never registered
+  as a re-review request, and it sends that list as `null` when it's empty, which
+  failed to parse and dropped every event on the PR
+
 ## 0.3.5
 
 ### Fixed
