@@ -1,7 +1,7 @@
 //! Gitea/Forgejo REST payloads, mapped into the shared `navi-notifier-forge` model.
 #![allow(dead_code)]
 
-use navi_notifier_forge::model::{IssueComment, PullRequest, Review, User};
+use navi_notifier_forge::model::{IssueComment, PrData, PullRequest, Review, User};
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -77,8 +77,6 @@ pub struct GiteaPull {
     pub user: Option<GiteaUser>,
     #[serde(default)]
     pub merged_by: Option<GiteaUser>,
-    #[serde(default)]
-    pub requested_reviewers: Vec<GiteaUser>,
 }
 
 impl GiteaPull {
@@ -96,11 +94,8 @@ impl GiteaPull {
             merge_commit_sha: self.merge_commit_sha,
             user: self.user.map(GiteaUser::into_forge),
             merged_by: self.merged_by.map(GiteaUser::into_forge),
-            requested_reviewers: self
-                .requested_reviewers
-                .into_iter()
-                .map(GiteaUser::into_forge)
-                .collect(),
+            // Filled from the reviews list by `into_pr_data`.
+            requested_reviewers: Vec::new(),
             // Gitea team review requests aren't modelled yet.
             requested_teams: Vec::new(),
         }
@@ -111,7 +106,8 @@ impl GiteaPull {
 pub struct GiteaReview {
     pub id: u64,
     pub user: Option<GiteaUser>,
-    /// `APPROVED` | `REQUEST_CHANGES` | `COMMENT` | `PENDING`.
+    /// `APPROVED` | `REQUEST_CHANGES` | `COMMENT` | `PENDING`, or `REQUEST_REVIEW`
+    /// for a review request that hasn't been answered yet.
     #[serde(default)]
     pub state: String,
     #[serde(default)]
@@ -169,9 +165,40 @@ impl GiteaIssueComment {
     }
 }
 
+/// Assemble one PR's fetched payloads into the forge model. Gitea's
+/// `requested_reviewers` keeps listing a reviewer after they review (and is `null`
+/// when empty), so pending requests come from the `REQUEST_REVIEW` entries in the
+/// reviews list instead, and those entries are not passed on as reviews.
+pub fn into_pr_data(
+    pull: GiteaPull,
+    reviews: Vec<GiteaReview>,
+    issue_comments: Vec<GiteaIssueComment>,
+) -> PrData {
+    let (requests, reviews): (Vec<_>, Vec<_>) = reviews
+        .into_iter()
+        .partition(|r| r.state == "REQUEST_REVIEW");
+    let mut pull_request = pull.into_forge();
+    pull_request.requested_reviewers = requests
+        .into_iter()
+        .filter_map(|r| r.user.map(GiteaUser::into_forge))
+        .collect();
+    PrData {
+        pull_request,
+        reviews: reviews.into_iter().map(GiteaReview::into_forge).collect(),
+        // Gitea inline review comments are per-review and lack reply threading;
+        // conversation comments cover mentions and replies for now.
+        review_comments: Vec::new(),
+        issue_comments: issue_comments
+            .into_iter()
+            .map(GiteaIssueComment::into_forge)
+            .collect(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn review(state: &str, dismissed: bool) -> GiteaReview {
         GiteaReview {
@@ -194,5 +221,53 @@ mod tests {
         assert_eq!(review("APPROVED", false).into_forge().state, "APPROVED");
         // The dismissed flag wins over whatever state Gitea reports.
         assert_eq!(review("APPROVED", true).into_forge().state, "DISMISSED");
+    }
+
+    fn reviews(entries: serde_json::Value) -> Vec<GiteaReview> {
+        serde_json::from_value(entries).expect("reviews")
+    }
+
+    fn pull() -> GiteaPull {
+        // Gitea sends `null` rather than `[]` for an empty reviewer list.
+        serde_json::from_value(json!({
+            "number": 5,
+            "user": { "login": "octo" },
+            "requested_reviewers": null
+        }))
+        .expect("pull")
+    }
+
+    #[test]
+    fn pending_requests_come_from_request_review_entries() {
+        let data = into_pr_data(
+            pull(),
+            reviews(json!([
+                { "id": 1, "user": { "login": "me" }, "state": "REQUEST_REVIEW" },
+                { "id": 2, "user": { "login": "sam" }, "state": "APPROVED" }
+            ])),
+            Vec::new(),
+        );
+        let requested: Vec<_> = data
+            .pull_request
+            .requested_reviewers
+            .iter()
+            .map(|u| u.login.as_str())
+            .collect();
+        assert_eq!(requested, ["me"]);
+        // The request itself is not a review, or it would count as you reviewing.
+        let ids: Vec<_> = data.reviews.iter().map(|r| r.id).collect();
+        assert_eq!(ids, [2]);
+    }
+
+    #[test]
+    fn a_reviewer_who_already_reviewed_is_not_pending() {
+        let data = into_pr_data(
+            pull(),
+            reviews(json!([
+                { "id": 3, "user": { "login": "me" }, "state": "REQUEST_CHANGES" }
+            ])),
+            Vec::new(),
+        );
+        assert!(data.pull_request.requested_reviewers.is_empty());
     }
 }

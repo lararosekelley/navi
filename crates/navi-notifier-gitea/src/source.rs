@@ -20,7 +20,9 @@ use time::{Duration, OffsetDateTime};
 use tokio::sync::OnceCell;
 use tracing::{debug, info, warn};
 
-use crate::api::{GiteaIssueComment, GiteaPull, GiteaReview, GiteaUser, Notification};
+use crate::api::{
+    into_pr_data, GiteaIssueComment, GiteaPull, GiteaReview, GiteaUser, Notification,
+};
 
 const SOURCE_ID: &str = "gitea";
 const DEFAULT_API_BASE: &str = "https://gitea.com/api/v1";
@@ -181,17 +183,7 @@ impl GiteaSource {
         let issue_comments: Vec<GiteaIssueComment> = self
             .get_all(&format!("/repos/{owner}/{repo}/issues/{index}/comments"))
             .await?;
-        Ok(PrData {
-            pull_request: pull.into_forge(),
-            reviews: reviews.into_iter().map(GiteaReview::into_forge).collect(),
-            // Gitea inline review comments are per-review and lack reply threading;
-            // conversation comments cover mentions and replies for now.
-            review_comments: Vec::new(),
-            issue_comments: issue_comments
-                .into_iter()
-                .map(GiteaIssueComment::into_forge)
-                .collect(),
-        })
+        Ok(into_pr_data(pull, reviews, issue_comments))
     }
 
     /// Fetch, diff, and stash one PR against its stored snapshot; returns the events.
