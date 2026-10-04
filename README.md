@@ -231,6 +231,7 @@ just test             # workspace test suite (mock-based; no network)
 just lint             # rustfmt --check, clippy -D warnings, markdownlint
 just check            # format + lint + test
 just e2e              # live smoke test (needs NAVI_GITHUB_TOKEN + NAVI_SLACK_TOKEN)
+just demo up          # throwaway Gitea + Mailpit for screenshots; then `just demo run`
 ```
 
 Commits follow [Conventional Commits](https://www.conventionalcommits.org) with a required scope, enforced by
