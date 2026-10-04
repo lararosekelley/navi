@@ -13,6 +13,10 @@ published into that release's GitHub notes by `dist`, so the headings must stay
   `requested_reviewers` after they review, so asking them again never registered
   as a re-review request, and it sends that list as `null` when it's empty, which
   failed to parse and dropped every event on the PR
+- **gitea:** find involved pull requests when `track_prs` is on. Gitea requires
+  every involvement filter on its issue search to match at once, so one query
+  for PRs you created, were assigned, were mentioned in, or were asked to review
+  returned none of them. Each is now searched on its own
 
 ## 0.3.5
 
