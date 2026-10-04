@@ -17,6 +17,8 @@ published into that release's GitHub notes by `dist`, so the headings must stay
   every involvement filter on its issue search to match at once, so one query
   for PRs you created, were assigned, were mentioned in, or were asked to review
   returned none of them. Each is now searched on its own
+- **gitea:** don't report your review as dismissed when your own newer review
+  supersedes it. Gitea flags the superseded review as dismissed too
 
 ## 0.3.5
 

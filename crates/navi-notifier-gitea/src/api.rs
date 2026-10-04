@@ -119,10 +119,12 @@ pub struct GiteaReview {
 }
 
 impl GiteaReview {
-    pub fn into_forge(self) -> Review {
+    /// `superseded` is true when the same reviewer has a later verdict, which makes
+    /// Gitea flag this review `dismissed` although nobody dismissed it.
+    pub fn into_forge(self, superseded: bool) -> Review {
         // Normalize Gitea's review states to the forge (GitHub) vocabulary, and
         // fold Gitea's `dismissed` flag into the DISMISSED state the diff expects.
-        let state = if self.dismissed {
+        let state = if self.dismissed && !superseded {
             "DISMISSED".to_string()
         } else {
             match self.state.as_str() {
@@ -138,6 +140,20 @@ impl GiteaReview {
             submitted_at: self.submitted_at,
             html_url: self.html_url,
         }
+    }
+
+    fn is_verdict(&self) -> bool {
+        matches!(self.state.as_str(), "APPROVED" | "REQUEST_CHANGES")
+    }
+
+    fn is_superseded_in(&self, reviews: &[GiteaReview]) -> bool {
+        let login = |r: &GiteaReview| r.user.as_ref().map(|u| u.login.to_ascii_lowercase());
+        reviews.iter().any(|later| {
+            later.id > self.id
+                && later.is_verdict()
+                && login(later).is_some()
+                && login(later) == login(self)
+        })
     }
 }
 
@@ -184,7 +200,10 @@ pub fn into_pr_data(
         .collect();
     PrData {
         pull_request,
-        reviews: reviews.into_iter().map(GiteaReview::into_forge).collect(),
+        reviews: reviews
+            .iter()
+            .map(|r| r.clone().into_forge(r.is_superseded_in(&reviews)))
+            .collect(),
         // Gitea inline review comments are per-review and lack reply threading;
         // conversation comments cover mentions and replies for now.
         review_comments: Vec::new(),
@@ -214,13 +233,58 @@ mod tests {
     #[test]
     fn into_forge_normalizes_review_state() {
         assert_eq!(
-            review("REQUEST_CHANGES", false).into_forge().state,
+            review("REQUEST_CHANGES", false).into_forge(false).state,
             "CHANGES_REQUESTED"
         );
-        assert_eq!(review("COMMENT", false).into_forge().state, "COMMENTED");
-        assert_eq!(review("APPROVED", false).into_forge().state, "APPROVED");
+        assert_eq!(
+            review("COMMENT", false).into_forge(false).state,
+            "COMMENTED"
+        );
+        assert_eq!(
+            review("APPROVED", false).into_forge(false).state,
+            "APPROVED"
+        );
         // The dismissed flag wins over whatever state Gitea reports.
-        assert_eq!(review("APPROVED", true).into_forge().state, "DISMISSED");
+        assert_eq!(
+            review("APPROVED", true).into_forge(false).state,
+            "DISMISSED"
+        );
+    }
+
+    fn states(entries: serde_json::Value) -> Vec<String> {
+        into_pr_data(pull(), reviews(entries), Vec::new())
+            .reviews
+            .into_iter()
+            .map(|r| r.state)
+            .collect()
+    }
+
+    #[test]
+    fn a_review_replaced_by_a_later_verdict_is_not_dismissed() {
+        // Gitea flags the earlier review dismissed when the same reviewer submits
+        // a new approval or change request.
+        assert_eq!(
+            states(json!([
+                { "id": 1, "user": { "login": "me" }, "state": "REQUEST_CHANGES", "dismissed": true },
+                { "id": 2, "user": { "login": "me" }, "state": "APPROVED" }
+            ])),
+            ["CHANGES_REQUESTED", "APPROVED"]
+        );
+    }
+
+    #[test]
+    fn a_dismissed_review_with_nothing_newer_is_dismissed() {
+        // A reviewer without approval rights carries the same flags as a replaced
+        // review; only the missing later verdict tells a real dismissal apart.
+        // A later comment review, or another reviewer's verdict, doesn't count.
+        assert_eq!(
+            states(json!([
+                { "id": 1, "user": { "login": "me" }, "state": "REQUEST_CHANGES", "dismissed": true },
+                { "id": 2, "user": { "login": "me" }, "state": "COMMENT" },
+                { "id": 3, "user": { "login": "sam" }, "state": "APPROVED" }
+            ])),
+            ["DISMISSED", "COMMENTED", "APPROVED"]
+        );
     }
 
     fn reviews(entries: serde_json::Value) -> Vec<GiteaReview> {
