@@ -31,6 +31,11 @@ test:
 e2e:
     cargo run -p navi-notifier --features e2e --bin navi-e2e
 
+# Drive every alert kind against a throwaway Gitea + Mailpit, for screenshots.
+# See scripts/demo.sh for the subcommands (up, run, dry-run, poll, digest, down).
+demo *args:
+    scripts/demo.sh {{args}}
+
 # Formatting & linting
 # --------------------
 
