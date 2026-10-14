@@ -2,7 +2,8 @@
 //!
 //! Three tables mirror the trait's three jobs: `snapshots` (opaque per-PR bytes for
 //! diffing), `delivered` (the dedup set), and `cursors` (poll bookkeeping like
-//! ETags). rusqlite is synchronous, so every access runs on the blocking pool via
+//! ETags). A fourth, `snoozes`, holds the user's snoozes, which `navi snooze` writes
+//! and the daemon reads. rusqlite is synchronous, so every access runs on the blocking pool via
 //! [`tokio::task::spawn_blocking`] over a shared `Arc<Mutex<Connection>>`. Local
 //! SQLite calls are microsecond-scale, but this keeps them off the async reactor.
 
@@ -11,7 +12,7 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use navi_notifier_core::traits::StateStore;
-use navi_notifier_core::StateError;
+use navi_notifier_core::{Snooze, SnoozeScope, StateError};
 use rusqlite::{params, Connection, OptionalExtension};
 use tokio::task::spawn_blocking;
 use tracing::warn;
@@ -43,6 +44,9 @@ impl SqliteStore {
         // WAL keeps the single-writer daemon snappy alongside any read-only peeks.
         conn.pragma_update(None, "journal_mode", "WAL")
             .map_err(|e| StateError::Backend(e.to_string()))?;
+        // `navi snooze` writes while the daemon may be mid-write.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(|e| StateError::Backend(e.to_string()))?;
         conn.execute_batch(SCHEMA)
             .map_err(|e| StateError::Backend(format!("migrations: {e}")))?;
         migrate_delivered_to_per_sink(&conn)?;
@@ -73,6 +77,13 @@ CREATE TABLE IF NOT EXISTS cursors (
     key       TEXT NOT NULL,
     value     TEXT NOT NULL,
     PRIMARY KEY (source_id, key)
+);
+
+CREATE TABLE IF NOT EXISTS snoozes (
+    scope_key     TEXT PRIMARY KEY,
+    scope         TEXT NOT NULL,
+    duration      TEXT NOT NULL,
+    snoozed_until INTEGER NOT NULL
 );
 "#;
 
@@ -275,6 +286,137 @@ impl SqliteStore {
                 }
             }
             Ok(pruned)
+        })
+        .await
+        .map_err(join)?
+    }
+}
+
+impl SqliteStore {
+    /// Snoozes that have not ended by `now`, soonest-ending first.
+    pub async fn active_snoozes(
+        &self,
+        now: time::OffsetDateTime,
+    ) -> Result<Vec<Snooze>, StateError> {
+        let conn = self.conn.clone();
+        spawn_blocking(move || {
+            let c = lock(&conn)?;
+            let mut stmt = c
+                .prepare(
+                    "SELECT scope, duration, snoozed_until FROM snoozes
+                     WHERE snoozed_until > ?1 ORDER BY snoozed_until, scope_key",
+                )
+                .map_err(backend)?;
+            let rows = stmt
+                .query_map(params![now.unix_timestamp()], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .map_err(backend)?;
+            let mut snoozes = Vec::new();
+            for row in rows {
+                let (scope, duration, until) = row.map_err(backend)?;
+                // An error rather than a skip: ignoring a snooze would notify
+                // during it.
+                let parsed = serde_json::from_str::<SnoozeScope>(&scope)
+                    .ok()
+                    .zip(duration.parse().ok())
+                    .zip(time::OffsetDateTime::from_unix_timestamp(until).ok());
+                let Some(((scope, duration), until)) = parsed else {
+                    return Err(StateError::Serde(format!(
+                        "unreadable snooze row (scope {scope}, duration {duration})"
+                    )));
+                };
+                snoozes.push(Snooze {
+                    scope,
+                    duration,
+                    until,
+                });
+            }
+            Ok(snoozes)
+        })
+        .await
+        .map_err(join)?
+    }
+
+    /// Set a snooze, replacing any existing one on the same scope. Returns whether
+    /// an active one was replaced.
+    pub async fn put_snooze(
+        &self,
+        snooze: &Snooze,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, StateError> {
+        let conn = self.conn.clone();
+        let now = now.unix_timestamp();
+        let key = snooze.scope.key();
+        let scope = serde_json::to_string(&snooze.scope).map_err(backend)?;
+        let duration = snooze.duration.to_string();
+        let until = snooze.until.unix_timestamp();
+        spawn_blocking(move || {
+            let c = lock(&conn)?;
+            let replaced = c
+                .query_row(
+                    "SELECT 1 FROM snoozes WHERE scope_key = ?1 AND snoozed_until > ?2",
+                    params![key, now],
+                    |_| Ok(()),
+                )
+                .optional()
+                .map_err(backend)?
+                .is_some();
+            c.execute(
+                "INSERT INTO snoozes (scope_key, scope, duration, snoozed_until)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(scope_key) DO UPDATE SET scope = excluded.scope,
+                     duration = excluded.duration, snoozed_until = excluded.snoozed_until",
+                params![key, scope, duration, until],
+            )
+            .map_err(backend)?;
+            Ok(replaced)
+        })
+        .await
+        .map_err(join)?
+    }
+
+    /// End the snooze on `scope`, if there is one. Returns whether an active one
+    /// was removed.
+    pub async fn remove_snooze(
+        &self,
+        scope: &SnoozeScope,
+        now: time::OffsetDateTime,
+    ) -> Result<bool, StateError> {
+        let conn = self.conn.clone();
+        let now = now.unix_timestamp();
+        let key = scope.key();
+        spawn_blocking(move || {
+            let c = lock(&conn)?;
+            let active = c
+                .execute(
+                    "DELETE FROM snoozes WHERE scope_key = ?1 AND snoozed_until > ?2",
+                    params![key, now],
+                )
+                .map_err(backend)?;
+            c.execute("DELETE FROM snoozes WHERE scope_key = ?1", params![key])
+                .map_err(backend)?;
+            Ok(active > 0)
+        })
+        .await
+        .map_err(join)?
+    }
+
+    /// Drop snoozes that ended before `now`.
+    pub async fn clear_expired_snoozes(&self, now: time::OffsetDateTime) -> Result<(), StateError> {
+        let conn = self.conn.clone();
+        spawn_blocking(move || {
+            let c = lock(&conn)?;
+            c.execute(
+                "DELETE FROM snoozes WHERE snoozed_until <= ?1",
+                params![now.unix_timestamp()],
+            )
+            .map(|_| ())
+            .map_err(backend)
         })
         .await
         .map_err(join)?
@@ -897,5 +1039,92 @@ mod tests {
             store.get_cursor("github", "etag").await.unwrap(),
             Some("def".to_string())
         );
+    }
+
+    mod snoozes {
+        use super::*;
+        use navi_notifier_core::{Snooze, SnoozeScope};
+        use time::{Duration, OffsetDateTime};
+
+        fn snooze(scope: SnoozeScope, d: &str, until: OffsetDateTime) -> Snooze {
+            Snooze {
+                scope,
+                duration: d.parse().unwrap(),
+                until,
+            }
+        }
+
+        fn repo(name: &str) -> SnoozeScope {
+            SnoozeScope::Repo {
+                provider: "github".into(),
+                repo: name.into(),
+            }
+        }
+
+        #[tokio::test]
+        async fn round_trip_replace_and_remove() {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+            let global = snooze(SnoozeScope::Global, "4h", now + Duration::hours(4));
+            assert!(!store.put_snooze(&global, now).await.unwrap());
+            let widgets = snooze(repo("acme/widgets"), "1h", now + Duration::hours(1));
+            store.put_snooze(&widgets, now).await.unwrap();
+            assert_eq!(
+                store.active_snoozes(now).await.unwrap(),
+                vec![widgets.clone(), global.clone()]
+            );
+
+            // Same scope, any case: replaces rather than adds.
+            let longer = snooze(repo("Acme/Widgets"), "1d", now + Duration::days(1));
+            assert!(store.put_snooze(&longer, now).await.unwrap());
+            assert_eq!(
+                store.active_snoozes(now).await.unwrap(),
+                vec![global.clone(), longer]
+            );
+
+            assert!(store
+                .remove_snooze(&repo("acme/widgets"), now)
+                .await
+                .unwrap());
+            assert!(!store
+                .remove_snooze(&repo("acme/widgets"), now)
+                .await
+                .unwrap());
+            assert_eq!(store.active_snoozes(now).await.unwrap(), vec![global]);
+        }
+
+        /// Skipping a row it can't read would notify during that snooze.
+        #[tokio::test]
+        async fn an_unreadable_row_is_an_error() {
+            let store = SqliteStore::open_in_memory().unwrap();
+            {
+                let c = store.conn.lock().unwrap();
+                c.execute(
+                    "INSERT INTO snoozes (scope_key, scope, duration, snoozed_until)
+                     VALUES ('x', '{\"kind\":\"team\"}', '4h', 9999999999)",
+                    [],
+                )
+                .unwrap();
+            }
+            let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+            assert!(store.active_snoozes(now).await.is_err());
+        }
+
+        #[tokio::test]
+        async fn expired_snoozes_are_inactive_and_cleared() {
+            let store = SqliteStore::open_in_memory().unwrap();
+            let now = OffsetDateTime::from_unix_timestamp(1_000_000).unwrap();
+            let s = snooze(SnoozeScope::Global, "1h", now + Duration::hours(1));
+            store.put_snooze(&s, now).await.unwrap();
+            let later = now + Duration::hours(2);
+            assert!(store.active_snoozes(later).await.unwrap().is_empty());
+            // Replacing an expired snooze is not reported as replacing one.
+            assert!(!store.put_snooze(&s, later).await.unwrap());
+            store
+                .clear_expired_snoozes(later + Duration::hours(2))
+                .await
+                .unwrap();
+            assert!(store.active_snoozes(now).await.unwrap().is_empty());
+        }
     }
 }
