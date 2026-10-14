@@ -11,7 +11,7 @@ use lettre::{AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor};
 use navi_notifier_core::html_escape;
 use navi_notifier_core::model::Event;
 use navi_notifier_core::traits::{Destination, StateStore};
-use navi_notifier_core::DestinationError;
+use navi_notifier_core::{DestinationError, SnoozeRelease};
 use tracing::debug;
 
 /// How to secure the SMTP connection.
@@ -117,6 +117,21 @@ impl Destination for EmailDestination {
         debug!(count = events.len(), "delivered email digest");
         Ok(())
     }
+
+    async fn send_snoozed(
+        &self,
+        events: &[Event],
+        release: &SnoozeRelease,
+        _state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
+        let message = build_snoozed_message(&self.from, &self.to, events, release)?;
+        self.mailer
+            .send(message)
+            .await
+            .map_err(|e| DestinationError::Delivery(format!("smtp send: {e}")))?;
+        debug!(count = events.len(), duration = %release.duration, "delivered snoozed email batch");
+        Ok(())
+    }
 }
 
 /// Build one email summarizing a batch of events. Assumes `events` is non-empty.
@@ -125,12 +140,63 @@ fn build_digest_message(
     to: &Mailbox,
     events: &[Event],
 ) -> Result<Message, DestinationError> {
-    let n = events.len();
-    let plural = if n == 1 { "" } else { "s" };
-    let subject = format!("navi digest: {n} update{plural}");
+    let updates = updates(events);
+    build_batch_message(
+        from,
+        to,
+        events,
+        format!("navi digest: {updates}"),
+        format!("navi digest — {updates}"),
+        None,
+    )
+}
 
-    let mut text = format!("navi digest — {n} update{plural}\n\n");
-    let mut html = format!("<p><strong>navi digest — {n} update{plural}</strong></p>\n<ul>\n");
+/// Build one email for the events a snooze held, saying how long it was and how
+/// many older ones were dropped. Assumes `events` is non-empty.
+fn build_snoozed_message(
+    from: &Mailbox,
+    to: &Mailbox,
+    events: &[Event],
+    release: &SnoozeRelease,
+) -> Result<Message, DestinationError> {
+    let updates = updates(events);
+    let duration = release.duration;
+    build_batch_message(
+        from,
+        to,
+        events,
+        format!("💤 Snoozed for {duration}: {updates}"),
+        format!("💤 Snoozed for {duration} — {updates}"),
+        dropped_note(release.dropped),
+    )
+}
+
+/// The line saying how many older updates the snooze buffer dropped, if any.
+fn dropped_note(dropped: usize) -> Option<String> {
+    match dropped {
+        0 => None,
+        1 => Some("1 older update was dropped; the snooze held more than navi keeps.".into()),
+        n => Some(format!(
+            "{n} older updates were dropped; the snooze held more than navi keeps."
+        )),
+    }
+}
+
+fn updates(events: &[Event]) -> String {
+    let n = events.len();
+    format!("{n} update{}", if n == 1 { "" } else { "s" })
+}
+
+fn build_batch_message(
+    from: &Mailbox,
+    to: &Mailbox,
+    events: &[Event],
+    subject: String,
+    heading: String,
+    note: Option<String>,
+) -> Result<Message, DestinationError> {
+    let mut text = format!("{heading}\n\n");
+    let mut html = format!("<p><strong>{}</strong></p>\n<ul>\n", html_escape(&heading));
     for e in events {
         let pr = &e.pull_request;
         let repo_ref = format!("{}#{}", pr.repo.full_name(), pr.number);
@@ -144,9 +210,14 @@ fn build_digest_message(
             html_escape(&repo_ref)
         ));
     }
+    html.push_str("</ul>\n");
+    if let Some(note) = note {
+        text.push_str(&format!("\n{note}\n"));
+        html.push_str(&format!("<p><em>{}</em></p>\n", html_escape(&note)));
+    }
     text.push_str(&format!("\n-- \nsent by navi ({NAVI_URL})\n"));
     html.push_str(&format!(
-        "</ul>\n<p style=\"color:#888\">sent by <a href=\"{NAVI_URL}\">navi</a></p>\n"
+        "<p style=\"color:#888\">sent by <a href=\"{NAVI_URL}\">navi</a></p>\n"
     ));
 
     Message::builder()
@@ -154,7 +225,7 @@ fn build_digest_message(
         .to(to.clone())
         .subject(subject)
         .multipart(MultiPart::alternative_plain_html(text, html))
-        .map_err(|e| DestinationError::Delivery(format!("building digest email: {e}")))
+        .map_err(|e| DestinationError::Delivery(format!("building batch email: {e}")))
 }
 
 /// Build the SMTP message for an event. Pure, so it is unit-testable via
@@ -332,5 +403,27 @@ mod tests {
         let mut own = event(EventKind::Merged, "k");
         own.actor = Actor::new("octo"); // same as the PR author
         assert!(headline(&own).contains("merged their own PR"));
+    }
+
+    #[test]
+    fn snoozed_batch_names_the_snooze() {
+        let from: Mailbox = "navi <navi@example.test>".parse().unwrap();
+        let to: Mailbox = "me@example.test".parse().unwrap();
+        let msg = build_snoozed_message(
+            &from,
+            &to,
+            &[event(EventKind::Merged, "k")],
+            &SnoozeRelease {
+                duration: "3d".parse().unwrap(),
+                dropped: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            msg.headers().get_raw("Subject"),
+            Some("💤 Snoozed for 3d: 1 update")
+        );
+        let raw = String::from_utf8(msg.formatted()).unwrap();
+        assert!(raw.contains("2 older updates were dropped"), "{raw}");
     }
 }

@@ -5,6 +5,7 @@
 // core `html_escape` is reused verbatim rather than duplicated here.
 use navi_notifier_core::html_escape;
 use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
+use navi_notifier_core::SnoozeRelease;
 use serde_json::{json, Value};
 
 /// A rendered message: `text` is the notification/fallback string, `blocks` is the
@@ -56,12 +57,46 @@ pub fn render(event: &Event) -> Rendered {
 /// Render a batch of events as a single digest message: a header plus one line
 /// per event. Assumes `events` is non-empty.
 pub fn render_digest(events: &[Event]) -> Rendered {
+    let updates = updates(events);
+    render_batch(
+        events,
+        format!(":inbox_tray: *navi digest* · {updates}"),
+        format!("navi digest: {updates}"),
+        None,
+    )
+}
+
+/// Render the events a snooze held as a single message saying how long it was,
+/// and how many older ones were dropped. Assumes `events` is non-empty.
+pub fn render_snoozed(events: &[Event], release: &SnoozeRelease) -> Rendered {
+    let updates = updates(events);
+    let duration = release.duration;
+    render_batch(
+        events,
+        format!(":zzz: *Snoozed for {duration}* · {updates}"),
+        format!("💤 Snoozed for {duration}: {updates}"),
+        dropped_note(release.dropped).map(|n| format!("_{n}_")),
+    )
+}
+
+/// The line saying how many older updates the snooze buffer dropped, if any.
+fn dropped_note(dropped: usize) -> Option<String> {
+    match dropped {
+        0 => None,
+        1 => Some("1 older update was dropped; the snooze held more than navi keeps.".into()),
+        n => Some(format!(
+            "{n} older updates were dropped; the snooze held more than navi keeps."
+        )),
+    }
+}
+
+fn updates(events: &[Event]) -> String {
     let n = events.len();
-    let header = format!(
-        ":inbox_tray: *navi digest* · {n} update{}",
-        if n == 1 { "" } else { "s" }
-    );
-    let lines: Vec<String> = events
+    format!("{n} update{}", if n == 1 { "" } else { "s" })
+}
+
+fn render_batch(events: &[Event], header: String, text: String, note: Option<String>) -> Rendered {
+    let mut lines: Vec<String> = events
         .iter()
         .map(|e| {
             let pr = &e.pull_request;
@@ -74,8 +109,9 @@ pub fn render_digest(events: &[Event]) -> Rendered {
             )
         })
         .collect();
+    lines.extend(note);
     Rendered {
-        text: format!("navi digest: {n} update{}", if n == 1 { "" } else { "s" }),
+        text,
         blocks: vec![json!({
             "type": "section",
             "text": { "type": "mrkdwn", "text": format!("{header}\n{}", lines.join("\n")) }
@@ -215,5 +251,36 @@ mod tests {
         assert!(body.contains("navi digest* · 2 updates"));
         assert!(body.contains("merged octo's PR"));
         assert!(body.contains("mentioned you"));
+    }
+
+    #[test]
+    fn snoozed_batch_names_the_snooze() {
+        let events = [event(EventKind::Merged)];
+        let r = render_snoozed(
+            &events,
+            &SnoozeRelease {
+                duration: "4h".parse().unwrap(),
+                dropped: 0,
+            },
+        );
+        assert_eq!(r.text, "💤 Snoozed for 4h: 1 update");
+        let body = r.blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(body.starts_with(":zzz: *Snoozed for 4h* · 1 update\n"));
+        assert!(body.contains("merged octo's PR"));
+        assert!(!body.contains("dropped"));
+    }
+
+    #[test]
+    fn snoozed_batch_reports_dropped_updates() {
+        let r = render_snoozed(
+            &[event(EventKind::Merged)],
+            &SnoozeRelease {
+                duration: "1y".parse().unwrap(),
+                dropped: 12,
+            },
+        );
+        let body = r.blocks[0]["text"]["text"].as_str().unwrap();
+        assert!(body
+            .ends_with("\n_12 older updates were dropped; the snooze held more than navi keeps._"));
     }
 }

@@ -15,13 +15,13 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use navi_notifier_core::traits::{Destination, StateStore};
-use navi_notifier_core::{DestinationError, Event};
+use navi_notifier_core::{DestinationError, Event, SnoozeRelease};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::OnceCell;
 use tracing::{debug, warn};
 
-pub use render::{render, render_digest, Rendered};
+pub use render::{render, render_digest, render_snoozed, Rendered};
 
 const DEFAULT_API_BASE: &str = "https://discord.com/api/v10";
 const MAX_ATTEMPTS: u32 = 3;
@@ -212,6 +212,17 @@ impl Destination for DiscordDestination {
     ) -> Result<(), DestinationError> {
         // A digest spans many PRs, so it posts at the top level, not in any thread.
         self.post(&render_digest(events), "digest", None).await?;
+        Ok(())
+    }
+
+    async fn send_snoozed(
+        &self,
+        events: &[Event],
+        release: &SnoozeRelease,
+        _state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
+        self.post(&render_snoozed(events, release), "snoozed", None)
+            .await?;
         Ok(())
     }
 }
