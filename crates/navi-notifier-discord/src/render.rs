@@ -1,6 +1,7 @@
 //! Render a navi Event into a Discord message (content + one embed).
 
 use navi_notifier_core::model::{Event, EventKind, MergeQueueRemoval, ReviewState};
+use navi_notifier_core::SnoozeRelease;
 use serde_json::{json, Value};
 
 pub struct Rendered {
@@ -41,8 +42,50 @@ pub fn render(event: &Event) -> Rendered {
 
 /// Render a batch of events as a single digest embed. Assumes `events` is non-empty.
 pub fn render_digest(events: &[Event]) -> Rendered {
+    let updates = updates(events);
+    render_batch(
+        events,
+        format!("navi digest — {updates}"),
+        format!("navi digest: {updates}"),
+        None,
+    )
+}
+
+/// Render the events a snooze held as a single embed saying how long it was,
+/// and how many older ones were dropped. Assumes `events` is non-empty.
+pub fn render_snoozed(events: &[Event], release: &SnoozeRelease) -> Rendered {
+    let updates = updates(events);
+    let duration = release.duration;
+    render_batch(
+        events,
+        format!("💤 Snoozed for {duration} — {updates}"),
+        format!("💤 Snoozed for {duration}: {updates}"),
+        dropped_note(release.dropped),
+    )
+}
+
+/// The line saying how many older updates the snooze buffer dropped, if any.
+fn dropped_note(dropped: usize) -> Option<String> {
+    match dropped {
+        0 => None,
+        1 => Some("1 older update was dropped; the snooze held more than navi keeps.".into()),
+        n => Some(format!(
+            "{n} older updates were dropped; the snooze held more than navi keeps."
+        )),
+    }
+}
+
+fn updates(events: &[Event]) -> String {
     let n = events.len();
-    let plural = if n == 1 { "" } else { "s" };
+    format!("{n} update{}", if n == 1 { "" } else { "s" })
+}
+
+fn render_batch(
+    events: &[Event],
+    title: String,
+    content: String,
+    note: Option<String>,
+) -> Rendered {
     let lines: Vec<String> = events
         .iter()
         .map(|e| {
@@ -52,15 +95,16 @@ pub fn render_digest(events: &[Event]) -> Rendered {
         })
         .collect();
     let embed = json!({
-        "title": format!("navi digest — {n} update{plural}"),
-        "description": truncate(&lines.join("\n"), 4000),
+        "title": title,
+        // The note goes after truncation so a long batch can't cut it off.
+        "description": match note {
+            Some(note) => format!("{}\n\n{note}", truncate(&lines.join("\n"), 3800)),
+            None => truncate(&lines.join("\n"), 4000),
+        },
         "color": 0x5865f2u32,
         "footer": { "text": "navi" },
     });
-    Rendered {
-        content: format!("navi digest: {n} update{plural}"),
-        embed,
-    }
+    Rendered { content, embed }
 }
 
 /// One-line headline plus an embed color for the event kind.
@@ -191,6 +235,38 @@ mod tests {
         let desc = r.embed["description"].as_str().unwrap();
         assert!(desc.contains("merged octo's PR"));
         assert!(desc.contains("mentioned you"));
+    }
+
+    #[test]
+    fn snoozed_batch_names_the_snooze() {
+        let r = render_snoozed(
+            &[event(EventKind::Merged)],
+            &SnoozeRelease {
+                duration: "2mo".parse().unwrap(),
+                dropped: 0,
+            },
+        );
+        assert_eq!(r.content, "💤 Snoozed for 2mo: 1 update");
+        assert_eq!(r.embed["title"], "💤 Snoozed for 2mo — 1 update");
+        assert!(r.embed["description"]
+            .as_str()
+            .unwrap()
+            .contains("merged octo's PR"));
+    }
+
+    #[test]
+    fn snoozed_batch_reports_dropped_updates() {
+        let r = render_snoozed(
+            &[event(EventKind::Merged)],
+            &SnoozeRelease {
+                duration: "1y".parse().unwrap(),
+                dropped: 1,
+            },
+        );
+        assert!(r.embed["description"]
+            .as_str()
+            .unwrap()
+            .ends_with("\n\n1 older update was dropped; the snooze held more than navi keeps."));
     }
 
     #[test]
