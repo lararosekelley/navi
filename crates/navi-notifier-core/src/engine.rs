@@ -8,12 +8,15 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, error, info, warn};
 
 use crate::config::pattern_matches;
 use crate::error::{SourceError, StateError};
 use crate::model::Event;
 use crate::rules::{Decision, DeferReason, DropReason, FilterContext, RuleEngine};
+use crate::snooze::{SnoozeDuration, SnoozeRelease};
 use crate::traits::{Destination, Source, StateStore};
 
 /// Connects a source to a destination, optionally scoped to certain repos. If a
@@ -47,9 +50,9 @@ pub enum EventOutcome {
     AlreadyDelivered,
     /// Buffered into the periodic digest instead of delivered now.
     Digested,
-    /// Held back by a deferring rule (quiet hours) and buffered for release once
-    /// that rule stops applying. Unlike [`EventOutcome::Suppressed`], the event is
-    /// not lost.
+    /// Held back by a deferring rule (quiet hours or a snooze) and buffered for
+    /// release once that rule stops applying. Unlike [`EventOutcome::Suppressed`],
+    /// the event is not lost.
     Deferred(DeferReason),
     DeliveryFailed {
         errors: Vec<String>,
@@ -106,12 +109,87 @@ const DIGEST_HELD_SCOPE: &str = "held";
 const DEFERRED_SOURCE: &str = "__deferred__";
 const DEFERRED_SCOPE: &str = "pending";
 
+/// State-store keys under which snoozed events are buffered. Separate from the
+/// quiet-hours bucket because they are released as one batch, not one by one.
+const SNOOZED_SOURCE: &str = "__snoozed__";
+const SNOOZED_SCOPE: &str = "pending";
+/// How many older snoozed events the cap dropped since the last release, so the
+/// release can say so. A snooze can outlast the cap where a quiet window can't.
+const SNOOZED_DROPPED_SCOPE: &str = "dropped";
+
 /// Dedup sinks standing for "accepted into a buffer" rather than "sent to a
 /// destination". Taking an event into a buffer is recorded so a re-derived copy is
 /// not buffered twice; the real per-destination sinks are recorded later, when the
 /// flush actually sends it. Both are `__`-wrapped, which no destination id can be.
 const DIGEST_SINK: &str = "__digest__";
 const DEFERRED_SINK: &str = "__deferred__";
+const SNOOZED_SINK: &str = "__snoozed__";
+
+/// One buffer `take_into_buffer` can hand an event to: its state row, the sink
+/// that records the event was taken, and a label for logs.
+struct BufferSpec {
+    source: &'static str,
+    scope: &'static str,
+    sink: &'static str,
+    label: &'static str,
+    /// Keep a count of events the cap drops, under `(source, "dropped")`.
+    counts_drops: bool,
+}
+
+const DIGEST_BUFFER: BufferSpec = BufferSpec {
+    source: DIGEST_SOURCE,
+    scope: DIGEST_SCOPE,
+    sink: DIGEST_SINK,
+    label: "digest",
+    counts_drops: false,
+};
+
+const DEFERRED_BUFFER: BufferSpec = BufferSpec {
+    source: DEFERRED_SOURCE,
+    scope: DEFERRED_SCOPE,
+    sink: DEFERRED_SINK,
+    label: "deferred",
+    counts_drops: false,
+};
+
+const SNOOZED_BUFFER: BufferSpec = BufferSpec {
+    source: SNOOZED_SOURCE,
+    scope: SNOOZED_SCOPE,
+    sink: SNOOZED_SINK,
+    label: "snoozed",
+    counts_drops: true,
+};
+
+/// A buffered event, keyed for dedup within its buffer.
+trait Buffered: Serialize + DeserializeOwned {
+    fn dedup_key(&self) -> &str;
+}
+
+impl Buffered for Event {
+    fn dedup_key(&self) -> &str {
+        &self.dedup_key
+    }
+}
+
+/// An event a snooze held, with the length of that snooze for the release header.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnoozedEvent {
+    event: Event,
+    duration: SnoozeDuration,
+}
+
+impl Buffered for SnoozedEvent {
+    fn dedup_key(&self) -> &str {
+        &self.event.dedup_key
+    }
+}
+
+/// Which batched message a flush sends.
+#[derive(Debug, Clone, Copy)]
+enum Batch {
+    Digest,
+    Snoozed(SnoozeRelease),
+}
 
 /// What one digest flush did, so the caller can tell an attempt that had nothing
 /// to send from one a quiet window prevented from sending.
@@ -202,7 +280,7 @@ impl Engine {
     ///
     /// `dry_run` reports what would happen without sending, marking delivery, or
     /// advancing provider cursors, so the user can preview their config safely.
-    pub async fn run_once(&self, ctx: FilterContext, dry_run: bool) -> RunReport {
+    pub async fn run_once(&self, ctx: FilterContext<'_>, dry_run: bool) -> RunReport {
         let mut report = RunReport::default();
 
         for source in &self.sources {
@@ -263,7 +341,7 @@ impl Engine {
         source: &dyn Source,
         targets: &[Arc<dyn Destination>],
         event: Event,
-        ctx: &FilterContext,
+        ctx: &FilterContext<'_>,
         dry_run: bool,
     ) -> EventRecord {
         // 1. Rule filter. A Defer is carried past the routing checks rather than
@@ -291,11 +369,14 @@ impl Engine {
             // live database reports the whole backlog as outgoing.
             //
             // Which sink depends on where the live path would put it, so this mirrors
-            // the branch order below: a digest kind goes to the digest buffer, an
-            // event a rule defers goes to the deferred buffer, and anything else is
-            // checked per destination.
-            let digested = self.digest_kinds.contains(event.kind.tag());
-            let buffer_sink = if digested {
+            // the branch order below: a snoozed event goes to the snoozed buffer, a
+            // digest kind to the digest buffer, an event quiet hours defers to the
+            // deferred buffer, and anything else is checked per destination.
+            let snoozed = matches!(deferred, Some(DeferReason::Snoozed(_)));
+            let digested = !snoozed && self.digest_kinds.contains(event.kind.tag());
+            let buffer_sink = if snoozed {
+                Some(SNOOZED_SINK)
+            } else if digested {
                 Some(DIGEST_SINK)
             } else {
                 deferred.as_ref().map(|_| DEFERRED_SINK)
@@ -362,23 +443,29 @@ impl Engine {
             };
         }
 
-        // 2. Buffered paths. Both hand the event to a flush that will route it
-        // later, so neither delivers here.
+        // 2. Buffered paths. Each hands the event to a flush that will route it
+        // later, so none delivers here.
         //
-        // Digest is checked first: a kind the user chose to batch is already
+        // A snooze comes first, so everything it held, digest kinds included, is
+        // released together in the one batch that says it was snoozed.
+        if let Some(DeferReason::Snoozed(duration)) = deferred {
+            return self
+                .take_into_buffer(
+                    event,
+                    |event| SnoozedEvent { event, duration },
+                    &SNOOZED_BUFFER,
+                    move |_| EventOutcome::Deferred(DeferReason::Snoozed(duration)),
+                )
+                .await;
+        }
+
+        // Digest is checked next: a kind the user chose to batch is already
         // deferred by their own choice, so it keeps the digest's cadence rather than
         // being double-handled. The window is still honoured, by `flush_digest`
         // re-deciding each event before it sends.
         if self.digest_kinds.contains(event.kind.tag()) {
             return self
-                .take_into_buffer(
-                    event,
-                    DIGEST_SINK,
-                    DIGEST_SOURCE,
-                    DIGEST_SCOPE,
-                    "digest",
-                    |_| EventOutcome::Digested,
-                )
+                .take_into_buffer(event, |e| e, &DIGEST_BUFFER, |_| EventOutcome::Digested)
                 .await;
         }
 
@@ -388,10 +475,8 @@ impl Engine {
             return self
                 .take_into_buffer(
                     event,
-                    DEFERRED_SINK,
-                    DEFERRED_SOURCE,
-                    DEFERRED_SCOPE,
-                    "deferred",
+                    |e| e,
+                    &DEFERRED_BUFFER,
                     move |_| EventOutcome::Deferred(reason.clone()),
                 )
                 .await;
@@ -504,15 +589,20 @@ impl Engine {
     /// Hand an event to one of the buffers, recording it against that buffer's sink
     /// so a re-derived copy is not buffered twice. Buffering before marking means a
     /// write failure leaves the event to be re-derived next pass rather than lost.
-    async fn take_into_buffer(
+    async fn take_into_buffer<T: Buffered>(
         &self,
         event: Event,
-        sink: &str,
-        source: &str,
-        scope: &str,
-        label: &str,
+        wrap: impl FnOnce(Event) -> T,
+        buffer: &BufferSpec,
         outcome: impl FnOnce(&Event) -> EventOutcome,
     ) -> EventRecord {
+        let BufferSpec {
+            source,
+            scope,
+            sink,
+            label,
+            counts_drops,
+        } = *buffer;
         match self.state.was_delivered(&event.dedup_key, sink).await {
             Ok(true) => {
                 return EventRecord {
@@ -531,14 +621,26 @@ impl Engine {
                 };
             }
         }
-        if let Err(err) = self.enqueue(source, scope, label, &event).await {
-            warn!(dedup_key = %event.dedup_key, buffer = label, %err, "failed to buffer event");
-            return EventRecord {
-                event,
-                outcome: EventOutcome::DeliveryFailed {
-                    errors: vec![format!("{label} buffer: {err}")],
-                },
-            };
+        let dropped = match self
+            .enqueue(source, scope, label, wrap(event.clone()))
+            .await
+        {
+            Ok(dropped) => dropped,
+            Err(err) => {
+                warn!(dedup_key = %event.dedup_key, buffer = label, %err, "failed to buffer event");
+                return EventRecord {
+                    event,
+                    outcome: EventOutcome::DeliveryFailed {
+                        errors: vec![format!("{label} buffer: {err}")],
+                    },
+                };
+            }
+        };
+        if counts_drops && dropped > 0 {
+            let total = self.dropped_count(source).await + dropped;
+            if let Err(err) = self.set_dropped_count(source, total).await {
+                warn!(buffer = label, %err, "could not record how many events the cap dropped");
+            }
         }
         if let Err(err) = self.state.mark_delivered(&event.dedup_key, sink).await {
             warn!(dedup_key = %event.dedup_key, %err, "failed to persist dedup key");
@@ -548,6 +650,22 @@ impl Engine {
         EventRecord { event, outcome }
     }
 
+    /// How many events the cap has dropped from `source`'s buffer since the count
+    /// was last reset. Unreadable counts as zero: it only feeds a notice.
+    async fn dropped_count(&self, source: &str) -> usize {
+        match self.state.get_snapshot(source, SNOOZED_DROPPED_SCOPE).await {
+            Ok(Some(bytes)) => serde_json::from_slice(&bytes).unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    async fn set_dropped_count(&self, source: &str, count: usize) -> Result<(), StateError> {
+        let bytes = serde_json::to_vec(&count).map_err(|e| StateError::Serde(e.to_string()))?;
+        self.state
+            .put_snapshot(source, SNOOZED_DROPPED_SCOPE, &bytes)
+            .await
+    }
+
     /// The events currently sitting in one of the persisted buffers.
     ///
     /// A payload that can't be parsed is treated as empty, since nothing can be
@@ -555,12 +673,12 @@ impl Engine {
     /// interchangeable, because `enqueue` reads, appends and writes back, so
     /// answering "empty" to a transient read error would overwrite the whole buffer
     /// with the one event being added.
-    async fn read_buffer(
+    async fn read_buffer<T: Buffered>(
         &self,
         source: &str,
         scope: &str,
         label: &str,
-    ) -> Result<Vec<Event>, StateError> {
+    ) -> Result<Vec<T>, StateError> {
         match self.state.get_snapshot(source, scope).await? {
             Some(bytes) => Ok(serde_json::from_slice(&bytes).unwrap_or_else(|err| {
                 error!(%err, buffer = label, "buffer is unreadable; discarding it");
@@ -581,37 +699,41 @@ impl Engine {
     /// append. Over a long window with a wedged destination it would otherwise grow
     /// without bound, and quadratically in write cost. At the cap the oldest event
     /// is dropped, which is a loss, but a bounded one that is loudly logged.
-    async fn enqueue(
+    /// Returns how many were dropped.
+    async fn enqueue<T: Buffered>(
         &self,
         source: &str,
         scope: &str,
         label: &str,
-        event: &Event,
-    ) -> Result<(), StateError> {
-        let mut pending = self.read_buffer(source, scope, label).await?;
-        if pending.iter().any(|e| e.dedup_key == event.dedup_key) {
-            debug!(dedup_key = %event.dedup_key, buffer = label, "already buffered");
-            return Ok(());
+        item: T,
+    ) -> Result<usize, StateError> {
+        let mut pending: Vec<T> = self.read_buffer(source, scope, label).await?;
+        if pending.iter().any(|e| e.dedup_key() == item.dedup_key()) {
+            debug!(dedup_key = %item.dedup_key(), buffer = label, "already buffered");
+            return Ok(0);
         }
-        pending.push(event.clone());
+        pending.push(item);
+        let mut dropped = 0;
         while pending.len() > MAX_BUFFERED {
-            let dropped = pending.remove(0);
+            dropped += 1;
+            let oldest = pending.remove(0);
             error!(
-                dedup_key = %dropped.dedup_key,
+                dedup_key = %oldest.dedup_key(),
                 buffer = label,
                 cap = MAX_BUFFERED,
                 "buffer is full; dropping the oldest held event"
             );
         }
-        self.write_buffer(source, scope, &pending).await
+        self.write_buffer(source, scope, &pending).await?;
+        Ok(dropped)
     }
 
     /// Overwrite one of the persisted buffers with `events`.
-    async fn write_buffer(
+    async fn write_buffer<T: Buffered>(
         &self,
         source: &str,
         scope: &str,
-        events: &[Event],
+        events: &[T],
     ) -> Result<(), StateError> {
         let bytes = serde_json::to_vec(events).map_err(|e| StateError::Serde(e.to_string()))?;
         self.state.put_snapshot(source, scope, &bytes).await
@@ -637,7 +759,7 @@ impl Engine {
     /// digest never breaks a quiet window. Without that, batching a kind would opt
     /// it out of quiet hours: the flush runs on its own interval and would happily
     /// fire at 02:00.
-    pub async fn flush_digest(&self, ctx: &FilterContext) -> DigestFlush {
+    pub async fn flush_digest(&self, ctx: &FilterContext<'_>) -> DigestFlush {
         let buffered = match self.read_digest().await {
             Ok(p) => p,
             Err(err) => {
@@ -688,7 +810,10 @@ impl Engine {
                     failed: true,
                 };
             }
-            if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
+            if let Err(err) = self
+                .write_buffer::<Event>(DIGEST_SOURCE, DIGEST_SCOPE, &[])
+                .await
+            {
                 warn!(%err, "held digest events were parked but the buffer could not be cleared; they may be parked again");
                 return DigestFlush {
                     sent: 0,
@@ -703,7 +828,7 @@ impl Engine {
             };
         }
 
-        let (sent, all_ok) = self.send_digest_batches_checked(&pending).await;
+        let (sent, all_ok) = self.send_batches_checked(&pending, Batch::Digest).await;
 
         // Park before the failure check. The held events were not part of the send,
         // so a failed destination is no reason to keep them on the interval clock:
@@ -739,7 +864,10 @@ impl Engine {
         // If the buffer can't be rewritten, don't report success: the events are
         // still buffered and would re-send next flush, so surface it as a non-clean
         // flush. What was held back for quiet hours stays.
-        if let Err(err) = self.write_buffer(DIGEST_SOURCE, DIGEST_SCOPE, &[]).await {
+        if let Err(err) = self
+            .write_buffer::<Event>(DIGEST_SOURCE, DIGEST_SCOPE, &[])
+            .await
+        {
             warn!(%err, "digest sent but the buffer could not be cleared; it may re-send next flush");
             return DigestFlush {
                 sent: sent.len(),
@@ -763,12 +891,13 @@ impl Engine {
         }
     }
 
-    /// Batch `events` per destination and send. Shared by the interval flush and the
-    /// held-event release so both route, dedup and record identically.
+    /// Batch `events` per destination and send. Shared by the interval flush, the
+    /// held-event release and the snooze release so all three route, dedup and
+    /// record identically.
     ///
     /// Returns the keys that reached at least one destination, and whether every
     /// attempt succeeded.
-    async fn send_digest_batches_checked(&self, events: &[Event]) -> (HashSet<String>, bool) {
+    async fn send_batches_checked(&self, events: &[Event], kind: Batch) -> (HashSet<String>, bool) {
         let mut all_ok = true;
         // Keys that reached at least one destination, so callers count what was
         // actually sent rather than what happened to be in the buffer.
@@ -811,7 +940,14 @@ impl Engine {
             if batch.is_empty() {
                 continue;
             }
-            match dest.send_digest(&batch, self.state.as_ref()).await {
+            let result = match kind {
+                Batch::Digest => dest.send_digest(&batch, self.state.as_ref()).await,
+                Batch::Snoozed(release) => {
+                    dest.send_snoozed(&batch, &release, self.state.as_ref())
+                        .await
+                }
+            };
+            match result {
                 Ok(()) => {
                     // Recorded per destination as the live path does, so a retry
                     // after another destination fails doesn't re-send this batch.
@@ -861,7 +997,7 @@ impl Engine {
     /// that depends on the send having succeeded, so it lives at the call sites.
     async fn park_held(&self, hold: &[Event]) -> Result<(), StateError> {
         if !hold.is_empty() {
-            let mut parked = self
+            let mut parked: Vec<Event> = self
                 .read_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, "digest-held")
                 .await?;
             let known: HashSet<&str> = parked.iter().map(|e| e.dedup_key.as_str()).collect();
@@ -903,7 +1039,7 @@ impl Engine {
     /// left the held events waiting a further day each time, or indefinitely.
     ///
     /// Returns how many events were released.
-    pub async fn release_digest(&self, ctx: &FilterContext) -> usize {
+    pub async fn release_digest(&self, ctx: &FilterContext<'_>) -> usize {
         let parked = match self
             .read_buffer(DIGEST_SOURCE, DIGEST_HELD_SCOPE, "digest-held")
             .await
@@ -941,7 +1077,7 @@ impl Engine {
             return 0;
         }
 
-        let (sent, _) = self.send_digest_batches_checked(&ready).await;
+        let (sent, _) = self.send_batches_checked(&ready, Batch::Digest).await;
 
         // "Reached at least one destination" is not done. An event stays on the row
         // until every destination it routes to has it, so a partial failure retries
@@ -992,6 +1128,109 @@ impl Engine {
         released
     }
 
+    /// Release what a snooze held once nothing holds it any more, as one batch per
+    /// destination headed with the snooze's length. Called by the daemon each pass;
+    /// cheap when the buffer is empty.
+    ///
+    /// Events are re-decided like [`Engine::flush_deferred`] does, so an event that
+    /// quiet hours now covers stays in this buffer and still goes out in the
+    /// snooze's batch when the window ends. Events held by snoozes of different
+    /// lengths go out as separate batches. Delivery is tracked per destination, as
+    /// [`Engine::release_digest`] does.
+    ///
+    /// Returns how many events were released.
+    pub async fn flush_snoozed(&self, ctx: &FilterContext<'_>) -> usize {
+        let held: Vec<SnoozedEvent> = match self
+            .read_buffer(SNOOZED_SOURCE, SNOOZED_SCOPE, "snoozed")
+            .await
+        {
+            Ok(h) => h,
+            Err(err) => {
+                warn!(%err, "could not read the snoozed events; leaving them in place");
+                return 0;
+            }
+        };
+        if held.is_empty() {
+            return 0;
+        }
+        let before = held.len();
+        let mut keep = Vec::new();
+        let mut ready: Vec<SnoozedEvent> = Vec::new();
+        for item in held {
+            match self.rules.decide(&item.event, ctx) {
+                Decision::Deliver => ready.push(item),
+                Decision::Defer(_) => keep.push(item),
+                Decision::Drop(reason) => {
+                    debug!(dedup_key = %item.event.dedup_key, ?reason, "snoozed event dropped on release")
+                }
+            }
+        }
+
+        let mut sent = HashSet::new();
+        let mut durations: Vec<SnoozeDuration> = Vec::new();
+        for item in &ready {
+            if !durations.contains(&item.duration) {
+                durations.push(item.duration);
+            }
+        }
+        // Events the cap dropped are reported once, in the first batch, and the
+        // count is kept until a batch carrying it goes out everywhere.
+        let mut dropped = self.dropped_count(SNOOZED_SOURCE).await;
+        for duration in durations {
+            let batch: Vec<Event> = ready
+                .iter()
+                .filter(|i| i.duration == duration)
+                .map(|i| i.event.clone())
+                .collect();
+            let release = SnoozeRelease { duration, dropped };
+            let (batch_sent, all_ok) = self
+                .send_batches_checked(&batch, Batch::Snoozed(release))
+                .await;
+            sent.extend(batch_sent);
+            if dropped > 0 && all_ok {
+                if let Err(err) = self.set_dropped_count(SNOOZED_SOURCE, 0).await {
+                    warn!(%err, "could not reset the dropped snoozed event count");
+                }
+                dropped = 0;
+            }
+        }
+
+        // Same bookkeeping as `release_digest`: an event leaves the buffer only once
+        // every destination routed to it has it.
+        let mut released = 0usize;
+        let mut cleared = 0usize;
+        for item in ready {
+            match self.outstanding_destinations(&item.event).await {
+                Ok(0) if sent.contains(&item.event.dedup_key) => released += 1,
+                Ok(0) => cleared += 1,
+                Ok(_) => keep.push(item),
+                Err(err) => {
+                    warn!(dedup_key = %item.event.dedup_key, %err, "dedup check failed on release; keeping it held");
+                    keep.push(item);
+                }
+            }
+        }
+
+        if keep.len() != before {
+            if let Err(err) = self
+                .write_buffer(SNOOZED_SOURCE, SNOOZED_SCOPE, &keep)
+                .await
+            {
+                error!(%err, "released snoozed events but could not rewrite the buffer; they may re-send");
+                return 0;
+            }
+        }
+        if released > 0 || cleared > 0 {
+            info!(
+                released,
+                cleared,
+                still_snoozed = keep.len(),
+                "released snoozed events"
+            );
+        }
+        released
+    }
+
     /// Release events held by a deferring rule (quiet hours) now that the rule may
     /// no longer apply. Called by the daemon each pass; cheap when the buffer is
     /// empty.
@@ -1009,7 +1248,7 @@ impl Engine {
     /// `github.mark_read = true` a deferred notification's thread is not marked read
     /// on the forge. The digest path has always behaved the same way. Deliberate,
     /// not an oversight: `commit` needs the `Source`, which a flush does not have.
-    pub async fn flush_deferred(&self, ctx: &FilterContext) -> usize {
+    pub async fn flush_deferred(&self, ctx: &FilterContext<'_>) -> usize {
         let pending = match self
             .read_buffer(DEFERRED_SOURCE, DEFERRED_SCOPE, "deferred")
             .await
@@ -1303,6 +1542,10 @@ mod tests {
         sent: Mutex<Vec<String>>,
         /// Batches received via `send_digest` (each is the dedup keys in the batch).
         digests: Mutex<Vec<Vec<String>>>,
+        /// Batches received via `send_snoozed`, with the snooze length.
+        snoozed: Mutex<Vec<(String, Vec<String>)>>,
+        /// The `dropped` count each `send_snoozed` call reported.
+        snoozed_dropped: Mutex<Vec<usize>>,
         /// Whether `send` errors. Settable mid-test so a destination can recover and
         /// the retry behaviour after a partial failure can be observed.
         fail: AtomicBool,
@@ -1341,6 +1584,22 @@ mod tests {
                 .push(events.iter().map(|e| e.dedup_key.clone()).collect());
             Ok(())
         }
+        async fn send_snoozed(
+            &self,
+            events: &[Event],
+            release: &SnoozeRelease,
+            _state: &dyn StateStore,
+        ) -> Result<(), DestinationError> {
+            if self.fail.load(Ordering::Relaxed) {
+                return Err(DestinationError::Delivery("boom".into()));
+            }
+            self.snoozed.lock().unwrap().push((
+                release.duration.to_string(),
+                events.iter().map(|e| e.dedup_key.clone()).collect(),
+            ));
+            self.snoozed_dropped.lock().unwrap().push(release.dropped);
+            Ok(())
+        }
     }
 
     fn ev(kind: EventKind, key: &str) -> Event {
@@ -1371,7 +1630,7 @@ mod tests {
             .await
             .unwrap()
             .into_iter()
-            .map(|e| e.dedup_key)
+            .map(|e: Event| e.dedup_key)
             .collect()
     }
 
@@ -1513,7 +1772,7 @@ mod tests {
         serde_json::from_slice::<Vec<Event>>(&bytes)
             .unwrap()
             .into_iter()
-            .map(|e| e.dedup_key)
+            .map(|e: Event| e.dedup_key)
             .collect()
     }
 
@@ -1528,11 +1787,15 @@ mod tests {
             ..Default::default()
         }
     }
-    const INSIDE_WINDOW: FilterContext = FilterContext {
+    const INSIDE_WINDOW: FilterContext<'static> = FilterContext {
         local_minutes: Some(23 * 60),
+        now: None,
+        snoozes: &[],
     };
-    const OUTSIDE_WINDOW: FilterContext = FilterContext {
+    const OUTSIDE_WINDOW: FilterContext<'static> = FilterContext {
         local_minutes: Some(12 * 60),
+        now: None,
+        snoozes: &[],
     };
 
     #[tokio::test]
@@ -1899,7 +2162,7 @@ mod tests {
                     DEFERRED_SOURCE,
                     DEFERRED_SCOPE,
                     "deferred",
-                    &ev(EventKind::ReviewRequested, "k1"),
+                    ev(EventKind::ReviewRequested, "k1"),
                 )
                 .await
                 .unwrap();
@@ -1931,7 +2194,7 @@ mod tests {
                     DEFERRED_SOURCE,
                     DEFERRED_SCOPE,
                     "deferred",
-                    &ev(EventKind::Mentioned, &format!("k{i}")),
+                    ev(EventKind::Mentioned, &format!("k{i}")),
                 )
                 .await
                 .unwrap();
@@ -3175,5 +3438,243 @@ mod tests {
         ));
         // Must remain undelivered so the next pass retries.
         assert!(!state.was_delivered("k1", "mock-notify").await.unwrap());
+    }
+
+    mod snooze {
+        use super::*;
+        use crate::config::QuietHours;
+        use crate::snooze::{Snooze, SnoozeScope};
+
+        fn t(hours: i64) -> OffsetDateTime {
+            OffsetDateTime::UNIX_EPOCH + time::Duration::hours(hours)
+        }
+
+        fn snooze(scope: SnoozeScope, duration: &str, until_hour: i64) -> Snooze {
+            Snooze {
+                scope,
+                duration: duration.parse().unwrap(),
+                until: t(until_hour),
+            }
+        }
+
+        fn repo(name: &str) -> SnoozeScope {
+            SnoozeScope::Repo {
+                provider: "mock".into(),
+                repo: name.into(),
+            }
+        }
+
+        fn at(hour: i64, snoozes: &[Snooze]) -> FilterContext<'_> {
+            FilterContext {
+                local_minutes: None,
+                now: Some(t(hour)),
+                snoozes,
+            }
+        }
+
+        #[tokio::test]
+        async fn holds_then_releases_one_batch_with_the_duration() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![
+                    ev(EventKind::Mentioned, "k1"),
+                    ev(EventKind::ReviewRequested, "k2"),
+                ],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [snooze(SnoozeScope::Global, "4h", 4)];
+
+            let r = engine.run_once(at(1, &snoozes), false).await;
+            assert!(r
+                .records
+                .iter()
+                .all(|r| matches!(r.outcome, EventOutcome::Deferred(DeferReason::Snoozed(_)))));
+            assert_eq!(engine.flush_snoozed(&at(2, &snoozes)).await, 0);
+            assert!(dest.sent.lock().unwrap().is_empty());
+
+            assert_eq!(engine.flush_snoozed(&at(5, &snoozes)).await, 2);
+            assert_eq!(
+                dest.snoozed.lock().unwrap().as_slice(),
+                &[("4h".to_string(), vec!["k1".to_string(), "k2".to_string()])]
+            );
+            assert!(dest.sent.lock().unwrap().is_empty());
+            // Released once, not again.
+            assert_eq!(engine.flush_snoozed(&at(6, &snoozes)).await, 0);
+            let r = engine.run_once(at(6, &snoozes), false).await;
+            assert_eq!(r.delivered_count(), 0);
+            assert_eq!(dest.snoozed.lock().unwrap().len(), 1);
+        }
+
+        #[tokio::test]
+        async fn snooze_off_releases_on_the_next_flush() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![ev(EventKind::Mentioned, "k1")],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [snooze(SnoozeScope::Global, "1w", 168)];
+            engine.run_once(at(1, &snoozes), false).await;
+            assert_eq!(engine.flush_snoozed(&at(2, &[])).await, 1);
+            assert_eq!(dest.snoozed.lock().unwrap()[0].0, "1w");
+        }
+
+        #[tokio::test]
+        async fn only_the_snoozed_repo_is_held() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![
+                    ev_in(EventKind::Mentioned, "acme", "widgets", "k1"),
+                    ev_in(EventKind::Mentioned, "acme", "gadgets", "k2"),
+                ],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [snooze(repo("acme/widgets"), "1h", 2)];
+            let r = engine.run_once(at(1, &snoozes), false).await;
+            assert_eq!(r.delivered_count(), 1);
+            assert_eq!(dest.sent.lock().unwrap().as_slice(), &["k2".to_string()]);
+        }
+
+        #[tokio::test]
+        async fn different_lengths_go_out_as_separate_batches() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![
+                    ev_in(EventKind::Mentioned, "acme", "widgets", "k1"),
+                    ev_in(EventKind::Mentioned, "acme", "gadgets", "k2"),
+                ],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [
+                snooze(repo("acme/widgets"), "1h", 2),
+                snooze(repo("acme/gadgets"), "3h", 4),
+            ];
+            engine.run_once(at(1, &snoozes), false).await;
+            assert_eq!(engine.flush_snoozed(&at(5, &snoozes)).await, 2);
+            let mut batches = dest.snoozed.lock().unwrap().clone();
+            batches.sort();
+            assert_eq!(
+                batches,
+                vec![
+                    ("1h".to_string(), vec!["k1".to_string()]),
+                    ("3h".to_string(), vec!["k2".to_string()]),
+                ]
+            );
+        }
+
+        #[tokio::test]
+        async fn quiet_hours_keep_holding_the_snoozed_batch() {
+            let dest = Arc::new(MockDestination::default());
+            let rules = RuleConfig {
+                quiet_hours: QuietHours {
+                    enabled: true,
+                    start: "22:00".into(),
+                    end: "08:00".into(),
+                },
+                ..Default::default()
+            };
+            let (engine, _s) =
+                engine_with(vec![ev(EventKind::Mentioned, "k1")], rules, dest.clone());
+            let snoozes = [snooze(SnoozeScope::Global, "2h", 2)];
+            let ctx = |hour, local| FilterContext {
+                local_minutes: Some(local),
+                ..at(hour, &snoozes)
+            };
+
+            engine.run_once(ctx(1, 12 * 60), false).await;
+            // The snooze is over, but quiet hours have begun.
+            assert_eq!(engine.flush_snoozed(&ctx(3, 23 * 60)).await, 0);
+            assert_eq!(engine.flush_deferred(&ctx(3, 23 * 60)).await, 0);
+            assert!(dest.snoozed.lock().unwrap().is_empty());
+            // The window ends and the batch still says it was snoozed.
+            assert_eq!(engine.flush_snoozed(&ctx(4, 9 * 60)).await, 1);
+            assert_eq!(dest.snoozed.lock().unwrap()[0].0, "2h");
+        }
+
+        #[tokio::test]
+        async fn digest_kinds_join_the_snoozed_batch() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![ev(EventKind::Mentioned, "k1")],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let engine = engine.with_digest_kinds(HashSet::from(["mentioned".to_string()]));
+            let snoozes = [snooze(SnoozeScope::Global, "1h", 2)];
+            engine.run_once(at(1, &snoozes), false).await;
+            assert_eq!(engine.flush_digest(&at(3, &snoozes)).await.sent, 0);
+            assert_eq!(engine.flush_snoozed(&at(3, &snoozes)).await, 1);
+            assert!(dest.digests.lock().unwrap().is_empty());
+        }
+
+        #[tokio::test]
+        async fn failed_release_stays_buffered() {
+            let dest = Arc::new(MockDestination {
+                fail: AtomicBool::new(true),
+                ..Default::default()
+            });
+            let (engine, _s) = engine_with(
+                vec![ev(EventKind::Mentioned, "k1")],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [snooze(SnoozeScope::Global, "1h", 2)];
+            engine.run_once(at(1, &snoozes), false).await;
+            assert_eq!(engine.flush_snoozed(&at(3, &snoozes)).await, 0);
+            dest.fail.store(false, Ordering::Relaxed);
+            assert_eq!(engine.flush_snoozed(&at(4, &snoozes)).await, 1);
+        }
+
+        /// A long snooze can outgrow the buffer. What the cap drops is reported in
+        /// the release instead of vanishing.
+        #[tokio::test]
+        async fn the_cap_reports_what_it_dropped() {
+            let dest = Arc::new(MockDestination::default());
+            let events: Vec<Event> = (0..3)
+                .map(|i| ev(EventKind::Mentioned, &format!("new{i}")))
+                .collect();
+            let (engine, _s) = engine_with(events, RuleConfig::default(), dest.clone());
+            let duration: SnoozeDuration = "1y".parse().unwrap();
+            let seed: Vec<SnoozedEvent> = (0..MAX_BUFFERED)
+                .map(|i| SnoozedEvent {
+                    event: ev(EventKind::Mentioned, &format!("old{i}")),
+                    duration,
+                })
+                .collect();
+            engine
+                .write_buffer(SNOOZED_SOURCE, SNOOZED_SCOPE, &seed)
+                .await
+                .unwrap();
+            let snoozes = [snooze(SnoozeScope::Global, "1y", 2)];
+            engine.run_once(at(1, &snoozes), false).await;
+
+            assert_eq!(engine.flush_snoozed(&at(3, &snoozes)).await, MAX_BUFFERED);
+            assert_eq!(dest.snoozed_dropped.lock().unwrap().as_slice(), &[3]);
+            let keys = dest.snoozed.lock().unwrap()[0].1.clone();
+            assert_eq!(keys.first().unwrap(), "old3");
+            assert_eq!(keys.last().unwrap(), "new2");
+            // Reported once.
+            assert_eq!(engine.dropped_count(SNOOZED_SOURCE).await, 0);
+        }
+
+        #[tokio::test]
+        async fn dry_run_reports_the_snooze_without_buffering() {
+            let dest = Arc::new(MockDestination::default());
+            let (engine, _s) = engine_with(
+                vec![ev(EventKind::Mentioned, "k1")],
+                RuleConfig::default(),
+                dest.clone(),
+            );
+            let snoozes = [snooze(SnoozeScope::Global, "1h", 2)];
+            let r = engine.run_once(at(1, &snoozes), true).await;
+            assert!(matches!(
+                r.records[0].outcome,
+                EventOutcome::WouldDefer(DeferReason::Snoozed(_))
+            ));
+            assert_eq!(engine.flush_snoozed(&at(3, &snoozes)).await, 0);
+        }
     }
 }

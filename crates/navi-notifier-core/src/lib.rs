@@ -12,6 +12,7 @@ pub mod engine;
 pub mod error;
 pub mod model;
 pub mod rules;
+pub mod snooze;
 pub mod traits;
 
 pub use config::RuleConfig;
@@ -21,5 +22,6 @@ pub use model::{
     html_escape, Actor, Backfill, Event, EventKind, MergeQueueRemoval, PullRequest, Repo,
     ReviewState, ViewerRelationship,
 };
-pub use rules::{Decision, DropReason, FilterContext, RuleEngine};
+pub use rules::{Decision, DeferReason, DropReason, FilterContext, RuleEngine};
+pub use snooze::{Snooze, SnoozeDuration, SnoozeRelease, SnoozeScope};
 pub use traits::{Destination, Source, StateStore};

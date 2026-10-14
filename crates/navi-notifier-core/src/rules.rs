@@ -7,13 +7,18 @@
 
 use crate::config::{pattern_matches, MuteField, MuteRule, RuleConfig, RuleOverride};
 use crate::model::{Event, EventKind};
+use crate::snooze::{self, Snooze, SnoozeDuration};
 
 /// Ambient inputs the filter needs but that don't belong to the event itself.
 #[derive(Debug, Clone, Copy, Default)]
-pub struct FilterContext {
+pub struct FilterContext<'a> {
     /// Current local time as minutes since midnight (0..1440), used for quiet hours.
     /// `None` disables quiet-hours evaluation (the caller couldn't determine local time).
     pub local_minutes: Option<u16>,
+    /// Current time, used for snoozes. `None` disables snooze evaluation.
+    pub now: Option<time::OffsetDateTime>,
+    /// Snoozes the user has set. Expired ones are ignored.
+    pub snoozes: &'a [Snooze],
 }
 
 /// Why an event was dropped. Surfaced in logs and `--dry-run` output so the user
@@ -35,8 +40,8 @@ pub enum Decision {
     Deliver,
     Drop(DropReason),
     /// Hold the event back for now and re-decide later, rather than discarding it.
-    /// Quiet hours is the only rule that defers: the user wants silence for a
-    /// window, not to lose what happened during it.
+    /// Quiet hours and snoozes defer: the user wants silence for a while, not to
+    /// lose what happened during it.
     Defer(DeferReason),
 }
 
@@ -46,6 +51,9 @@ pub enum Decision {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DeferReason {
     QuietHours,
+    /// Held by the snooze of this length that ends last among those covering the
+    /// event.
+    Snoozed(SnoozeDuration),
 }
 
 /// A mute rule compiled once when the engine is built: one or more conditions, all
@@ -271,9 +279,16 @@ impl RuleEngine {
         }
 
         // Deliberately last: an event that any other rule would drop is dropped, not
-        // deferred, so the quiet-hours buffer only ever holds events the user
-        // actually wants. It is re-decided on flush, so a rule change made during
-        // the window still applies when it comes back out.
+        // deferred, so the buffers only ever hold events the user actually wants.
+        // It is re-decided on flush, so a rule change made during the window still
+        // applies when it comes back out. A snooze is checked before quiet hours so
+        // an event both cover is released with the snooze's batch.
+        if let Some(s) = ctx
+            .now
+            .and_then(|now| snooze::covering(ctx.snoozes, event, now))
+        {
+            return Decision::Defer(DeferReason::Snoozed(s.duration));
+        }
         if self.in_quiet_hours(ovr, ctx) {
             return Decision::Defer(DeferReason::QuietHours);
         }
@@ -624,6 +639,7 @@ mod tests {
         // 23:00 is inside the quiet window.
         let ctx = FilterContext {
             local_minutes: Some(23 * 60),
+            ..Default::default()
         };
         assert_eq!(
             engine.decide(&e, &ctx),
@@ -632,6 +648,7 @@ mod tests {
         // 12:00 is outside it.
         let ctx = FilterContext {
             local_minutes: Some(12 * 60),
+            ..Default::default()
         };
         assert_eq!(engine.decide(&e, &ctx), Decision::Deliver);
     }
@@ -779,6 +796,7 @@ mod tests {
         let engine = RuleEngine::new(cfg).unwrap();
         let ctx = FilterContext {
             local_minutes: Some(600), // 10:00, inside the global quiet window
+            ..Default::default()
         };
         // acme: quiet hours disabled by the override → delivered.
         assert_eq!(
@@ -788,6 +806,51 @@ mod tests {
         // Elsewhere the global quiet window defers it.
         assert_eq!(
             engine.decide(&event_in(EventKind::Mentioned, "other", "thing"), &ctx),
+            Decision::Defer(DeferReason::QuietHours)
+        );
+    }
+
+    #[test]
+    fn snooze_defers_ahead_of_quiet_hours_but_behind_drops() {
+        use crate::snooze::{Snooze, SnoozeScope};
+        let now = OffsetDateTime::UNIX_EPOCH;
+        let snoozes = [Snooze {
+            scope: SnoozeScope::Global,
+            duration: "4h".parse().unwrap(),
+            until: now + time::Duration::hours(4),
+        }];
+        let mut cfg = RuleConfig {
+            quiet_hours: QuietHours {
+                enabled: true,
+                start: "22:00".into(),
+                end: "08:00".into(),
+            },
+            ..Default::default()
+        };
+        cfg.mute_authors.insert("muted".into());
+        let engine = RuleEngine::new(cfg).unwrap();
+        let ctx = FilterContext {
+            local_minutes: Some(23 * 60),
+            now: Some(now),
+            snoozes: &snoozes,
+        };
+        assert_eq!(
+            engine.decide(&event(EventKind::Mentioned), &ctx),
+            Decision::Defer(DeferReason::Snoozed("4h".parse().unwrap()))
+        );
+        let mut muted = event(EventKind::Mentioned);
+        muted.actor = Actor::new("muted");
+        assert_eq!(
+            engine.decide(&muted, &ctx),
+            Decision::Drop(DropReason::AuthorMuted)
+        );
+        // Expired: quiet hours applies on its own.
+        let later = FilterContext {
+            now: Some(now + time::Duration::hours(5)),
+            ..ctx
+        };
+        assert_eq!(
+            engine.decide(&event(EventKind::Mentioned), &later),
             Decision::Defer(DeferReason::QuietHours)
         );
     }
