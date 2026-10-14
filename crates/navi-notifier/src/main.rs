@@ -15,6 +15,7 @@ mod prompt;
 mod providers;
 mod service;
 mod setup;
+mod snooze_cmd;
 mod state;
 mod test_cmd;
 mod upgrade;
@@ -25,12 +26,12 @@ use std::sync::Arc;
 
 use anyhow::{bail, Context, Result};
 use clap::{CommandFactory, Parser};
-use navi_notifier_core::{Engine, EventOutcome, FilterContext, RunReport};
+use navi_notifier_core::{DeferReason, Engine, EventOutcome, FilterContext, RunReport, Snooze};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use tracing_subscriber::EnvFilter;
 
-use crate::cli::{Cli, Command, ConfigAction, ProvidersAction, ServiceAction};
+use crate::cli::{Cli, Command, ConfigAction, ProvidersAction, ServiceAction, SnoozeAction};
 use crate::config::{resolve_config_path, resolve_state_path, Config};
 use crate::state::SqliteStore;
 
@@ -85,7 +86,22 @@ fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             ServiceAction::Install { yes } => service::install(&config_path, yes),
             ServiceAction::Uninstall { yes } => service::uninstall(yes),
             ServiceAction::Restart => service::restart(),
-            ServiceAction::Status => service::status(),
+            ServiceAction::Status => {
+                service::status()?;
+                on_runtime(snooze_cmd::service_status(&config_path))
+            }
+        },
+        Command::Snooze {
+            action,
+            duration,
+            target,
+        } => match (action, duration) {
+            (Some(SnoozeAction::Status), _) => on_runtime(snooze_cmd::status(&config_path)),
+            (Some(SnoozeAction::Off { target }), _) => {
+                on_runtime(snooze_cmd::off(&config_path, &target))
+            }
+            (None, Some(duration)) => on_runtime(snooze_cmd::set(&config_path, &duration, &target)),
+            (None, None) => unreachable!("clap requires a duration without a subcommand"),
         },
         Command::Uninstall { dry_run, yes } => setup::uninstall(dry_run, yes),
         Command::Upgrade {
@@ -130,12 +146,8 @@ fn load_and_init_logging(config_path: &Path) -> Result<Config> {
     Ok(config)
 }
 
-async fn open_engine(config: &Config) -> Result<Engine> {
-    Ok(open_engine_with_store(config)?.0)
-}
-
-/// The engine plus the concrete store behind it. `run` needs the latter to prune;
-/// everything else only wants the engine.
+/// The engine plus the concrete store behind it, which `once` and `run` also read
+/// snoozes from and `run` prunes.
 fn open_engine_with_store(config: &Config) -> Result<(Engine, Arc<SqliteStore>)> {
     let state_path = resolve_state_path()?;
     let store = Arc::new(SqliteStore::open(&state_path).context("opening state store")?);
@@ -143,28 +155,45 @@ fn open_engine_with_store(config: &Config) -> Result<(Engine, Arc<SqliteStore>)>
     Ok((engine, store))
 }
 
-/// Compute the current local time-of-day (minutes since midnight) for quiet hours.
-fn filter_context(config: &Config) -> FilterContext<'static> {
+/// The current time, local time-of-day (minutes since midnight) for quiet hours,
+/// and the given snoozes.
+fn filter_context<'a>(config: &Config, snoozes: &'a [Snooze]) -> FilterContext<'a> {
     let now = OffsetDateTime::now_utc();
     let utc_minutes = now.hour() as i32 * 60 + now.minute() as i32;
     let local = (utc_minutes + config.general.utc_offset_minutes).rem_euclid(1440);
     FilterContext {
         local_minutes: Some(local as u16),
-        ..Default::default()
+        now: Some(now),
+        snoozes,
     }
+}
+
+/// Active snoozes, with expired ones cleared. Failing to read them is an error,
+/// not "no snoozes", so a broken read never notifies during a snooze.
+async fn load_snoozes(store: &SqliteStore) -> Result<Vec<Snooze>> {
+    let now = OffsetDateTime::now_utc();
+    if let Err(err) = store.clear_expired_snoozes(now).await {
+        warn!(%err, "could not clear expired snoozes");
+    }
+    store.active_snoozes(now).await.context("reading snoozes")
 }
 
 async fn cmd_once(config_path: &Path, dry_run: bool) -> Result<()> {
     let config = load_and_init_logging(config_path)?;
-    let engine = open_engine(&config).await?;
-    let ctx = filter_context(&config);
+    let (engine, store) = open_engine_with_store(&config)?;
+    let snoozes = load_snoozes(&store).await?;
+    let ctx = filter_context(&config, &snoozes);
     let report = engine.run_once(ctx, dry_run).await;
     print_report(&report, dry_run);
-    // A dry run advances nothing, so it must not release the buffer either.
+    // A dry run advances nothing, so it must not release the buffers either.
     if !dry_run {
         let released = engine.flush_deferred(&ctx).await;
         if released > 0 {
             println!("  released {released} event(s) held by quiet hours");
+        }
+        let released = engine.flush_snoozed(&ctx).await;
+        if released > 0 {
+            println!("  released {released} event(s) held by a snooze");
         }
     }
     Ok(())
@@ -184,7 +213,6 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     );
     upgrade::maybe_hint_update();
 
-    let digest_interval = std::time::Duration::from_secs(config.digest.interval_secs.max(1));
     let mut last_digest = std::time::Instant::now();
 
     // Housekeeping, not polling: daily is ample for a horizon measured in months,
@@ -197,55 +225,15 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
     tokio::pin!(shutdown);
 
     loop {
-        // Abandoning a pass mid-flight can re-derive events next pass; the dedup
-        // set stops anything already sent from sending twice.
-        match tokio::time::timeout(
-            pass_timeout,
-            engine.run_once(filter_context(&config), false),
-        )
-        .await
-        {
-            Ok(report) => {
-                if report.delivered_count() > 0 || !report.source_errors.is_empty() {
-                    info!(
-                        delivered = report.delivered_count(),
-                        errors = report.source_errors.len(),
-                        "poll pass complete"
-                    );
-                }
+        // Re-read every pass, so `navi snooze` takes effect without a restart.
+        match load_snoozes(&store).await {
+            Ok(snoozes) => {
+                let ctx = filter_context(&config, &snoozes);
+                poll_pass(&engine, &config, ctx, pass_timeout, &mut last_digest).await;
             }
-            Err(_) => error!(
-                timeout_secs = pass_timeout.as_secs(),
-                "poll pass timed out; abandoning it and retrying next interval"
-            ),
-        }
-
-        // Release anything quiet hours held once the window has passed. Checked
-        // every pass rather than on a cadence of its own: the buffer read is cheap
-        // when empty, and this bounds the delay after the window ends to one poll
-        // interval.
-        engine.flush_deferred(&filter_context(&config)).await;
-
-        if config.digest.enabled {
-            // Two clocks, because the interval answers only one of the two questions.
-            // How often a new batch goes out is the user's setting; when a batch the
-            // quiet window already delayed may finally go out is not, so that is
-            // checked every pass. Sharing one clock meant a daily interval whose
-            // phase lands inside the window delayed the held events another full day
-            // each time, or never released them at all.
-            engine.release_digest(&filter_context(&config)).await;
-
-            if last_digest.elapsed() >= digest_interval {
-                let flush = engine.flush_digest(&filter_context(&config)).await;
-                if flush.failed {
-                    warn!(
-                        sent = flush.sent,
-                        held = flush.held,
-                        "digest flush did not complete cleanly; the batch is kept for the next interval"
-                    );
-                }
-                last_digest = std::time::Instant::now();
-            }
+            // Skipping a pass loses nothing: snapshots don't advance, so its events
+            // re-derive next pass.
+            Err(err) => error!(%err, "could not read snoozes; skipping this pass"),
         }
 
         if last_prune.is_none_or(|t| t.elapsed() >= PRUNE_INTERVAL) {
@@ -271,6 +259,64 @@ async fn cmd_run(config_path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// One poll pass of the daemon: deliver, then release whatever quiet hours, a
+/// snooze, or the digest has been holding.
+async fn poll_pass(
+    engine: &Engine,
+    config: &Config,
+    ctx: FilterContext<'_>,
+    pass_timeout: std::time::Duration,
+    last_digest: &mut std::time::Instant,
+) {
+    // Abandoning a pass mid-flight can re-derive events next pass; the dedup
+    // set stops anything already sent from sending twice.
+    match tokio::time::timeout(pass_timeout, engine.run_once(ctx, false)).await {
+        Ok(report) => {
+            if report.delivered_count() > 0 || !report.source_errors.is_empty() {
+                info!(
+                    delivered = report.delivered_count(),
+                    errors = report.source_errors.len(),
+                    "poll pass complete"
+                );
+            }
+        }
+        Err(_) => error!(
+            timeout_secs = pass_timeout.as_secs(),
+            "poll pass timed out; abandoning it and retrying next interval"
+        ),
+    }
+
+    // Release anything quiet hours held once the window has passed. Checked
+    // every pass rather than on a cadence of its own: the buffer read is cheap
+    // when empty, and this bounds the delay after the window ends to one poll
+    // interval.
+    engine.flush_deferred(&ctx).await;
+    engine.flush_snoozed(&ctx).await;
+
+    if config.digest.enabled {
+        // Two clocks, because the interval answers only one of the two questions.
+        // How often a new batch goes out is the user's setting; when a batch the
+        // quiet window already delayed may finally go out is not, so that is
+        // checked every pass. Sharing one clock meant a daily interval whose
+        // phase lands inside the window delayed the held events another full day
+        // each time, or never released them at all.
+        engine.release_digest(&ctx).await;
+
+        let digest_interval = std::time::Duration::from_secs(config.digest.interval_secs.max(1));
+        if last_digest.elapsed() >= digest_interval {
+            let flush = engine.flush_digest(&ctx).await;
+            if flush.failed {
+                warn!(
+                    sent = flush.sent,
+                    held = flush.held,
+                    "digest flush did not complete cleanly; the batch is kept for the next interval"
+                );
+            }
+            *last_digest = std::time::Instant::now();
+        }
+    }
 }
 
 async fn cmd_test(
@@ -306,10 +352,16 @@ fn print_report(report: &RunReport, dry_run: bool) {
             EventOutcome::Suppressed(reason) => format!("suppressed ({reason:?})"),
             EventOutcome::AlreadyDelivered => "already delivered".to_string(),
             EventOutcome::Digested => "digested (batched for the next flush)".to_string(),
-            EventOutcome::Deferred(reason) => {
-                format!("deferred ({reason:?}); will send when the window ends")
+            EventOutcome::Deferred(DeferReason::QuietHours) => {
+                "deferred (quiet hours); will send when the window ends".to_string()
             }
-            EventOutcome::WouldDefer(reason) => format!("WOULD defer ({reason:?})"),
+            EventOutcome::Deferred(DeferReason::Snoozed(d)) => {
+                format!("snoozed ({d}); will send when the snooze ends")
+            }
+            EventOutcome::WouldDefer(DeferReason::QuietHours) => {
+                "WOULD defer (quiet hours)".to_string()
+            }
+            EventOutcome::WouldDefer(DeferReason::Snoozed(d)) => format!("WOULD snooze ({d})"),
             EventOutcome::DeliveryFailed { errors } => format!("FAILED: {}", errors.join("; ")),
         };
         println!("  {head:<40} {outcome}");

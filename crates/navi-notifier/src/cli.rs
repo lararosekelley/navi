@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -103,6 +103,19 @@ pub enum Command {
         refresh: bool,
     },
 
+    /// Hold notifications for a while, then get them as one batch. Snoozes one
+    /// repo by default (the current directory's), or an org or everything.
+    #[command(args_conflicts_with_subcommands = true)]
+    Snooze {
+        #[command(subcommand)]
+        action: Option<SnoozeAction>,
+        /// How long: a number and a unit (s, m, h, d, w, mo, y), e.g. 45s, 4h, 2mo.
+        #[arg(value_name = "DURATION", required = true)]
+        duration: Option<String>,
+        #[command(flatten)]
+        target: SnoozeTarget,
+    },
+
     /// Install, remove, or check the background service (systemd/launchd/Task Scheduler).
     Service {
         #[command(subcommand)]
@@ -158,6 +171,36 @@ pub enum ProvidersAction {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum SnoozeAction {
+    /// List active snoozes and the time left on each.
+    Status,
+    /// End a snooze early. Held notifications go out on the next poll.
+    Off {
+        #[command(flatten)]
+        target: SnoozeTarget,
+    },
+}
+
+/// What a snooze covers. With none of `--repo`, `--org` or `--global`, it covers
+/// the repo of the current directory's git remote.
+#[derive(Debug, Args)]
+pub struct SnoozeTarget {
+    /// A repo, as `owner/name`.
+    #[arg(long, value_name = "OWNER/NAME", conflicts_with_all = ["org", "global"])]
+    pub repo: Option<String>,
+    /// Every repo in an org (on GitLab, a group and its subgroups).
+    #[arg(long, value_name = "ORG", conflicts_with = "global")]
+    pub org: Option<String>,
+    /// Everything.
+    #[arg(long)]
+    pub global: bool,
+    /// The provider the repo or org is on (github, gitlab, gitea). Needed when it
+    /// can't be told from the git remote or the one enabled source.
+    #[arg(long, value_name = "NAME", conflicts_with = "global")]
+    pub provider: Option<String>,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ServiceAction {
     /// Generate and enable a service that runs `navi run` on login.
     Install {
@@ -196,4 +239,67 @@ pub enum ConfigAction {
     },
     /// Open the config file in $VISUAL/$EDITOR.
     Edit,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(args: &[&str]) -> Result<Command, clap::Error> {
+        Cli::try_parse_from(std::iter::once("navi").chain(args.iter().copied())).map(|c| c.command)
+    }
+
+    /// `main` treats a snooze with neither a subcommand nor a duration as
+    /// unreachable, which holds only while clap enforces it.
+    #[test]
+    fn snooze_forms() {
+        match parse(&["snooze", "4h"]).unwrap() {
+            Command::Snooze {
+                action: None,
+                duration: Some(d),
+                target,
+            } => {
+                assert_eq!(d, "4h");
+                assert!(!target.global && target.repo.is_none() && target.org.is_none());
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            parse(&["snooze", "4h", "--global"]).unwrap(),
+            Command::Snooze {
+                action: None,
+                duration: Some(_),
+                target: SnoozeTarget { global: true, .. },
+            }
+        ));
+        assert!(matches!(
+            parse(&["snooze", "status"]).unwrap(),
+            Command::Snooze {
+                action: Some(SnoozeAction::Status),
+                duration: None,
+                ..
+            }
+        ));
+        match parse(&["snooze", "off", "--repo", "a/b", "--provider", "github"]).unwrap() {
+            Command::Snooze {
+                action: Some(SnoozeAction::Off { target }),
+                duration: None,
+                ..
+            } => {
+                assert_eq!(target.repo.as_deref(), Some("a/b"));
+                assert_eq!(target.provider.as_deref(), Some("github"));
+            }
+            other => panic!("{other:?}"),
+        }
+
+        for bad in [
+            &["snooze"][..],
+            &["snooze", "4h", "status"],
+            &["snooze", "4h", "--repo", "a/b", "--global"],
+            &["snooze", "4h", "--org", "acme", "--global"],
+            &["snooze", "4h", "--global", "--provider", "github"],
+        ] {
+            assert!(parse(bad).is_err(), "{bad:?}");
+        }
+    }
 }
