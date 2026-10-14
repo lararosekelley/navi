@@ -129,13 +129,31 @@ navi config edit                       # open config.toml in $VISUAL/$EDITOR
 navi env                               # open navi.env (the token file) in $VISUAL/$EDITOR
 ```
 
+### Snoozing
+
+```sh
+navi snooze 4h                          # hold notifications for the current directory's repo
+navi snooze 2d --repo acme/widgets      # a named repo
+navi snooze 1w --org acme               # every repo in an org (or GitLab group)
+navi snooze 45m --global                # everything
+navi snooze status                      # list active snoozes and the time left
+navi snooze off --org acme              # end one early; takes the same flags
+```
+
+Durations need a unit: `s`, `m` (minutes), `h`, `d`, `w`, `mo` (30 days), or `y` (365 days). Events that arrive during
+a snooze are held and delivered as one batch, noting the snooze length, once it ends. Quiet hours still apply to that
+batch. Snoozes are kept in the state database, so they survive restarts and can be set while the daemon is stopped.
+
+A repo or org is snoozed on one provider. navi works it out from the git remote's host or, when only one source is
+enabled, from that; otherwise pass `--provider github|gitlab|gitea`. Snoozing a scope again replaces its snooze.
+
 ### As a background service
 
 `navi init` offers to set this up for you; you can also do it any time:
 
 ```sh
 navi service install     # generate + enable a login service for your OS
-navi service status      # is it installed and running?
+navi service status      # is it installed and running? lists active snoozes too
 navi service restart     # re-read config and navi.env
 navi service uninstall   # stop and remove it
 navi logs -f             # tail the service's logs (journald on Linux, a log file on macOS/Windows)
