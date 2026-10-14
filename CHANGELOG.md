@@ -4,6 +4,20 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.4.0
+
+### Added
+
+- **cli:** `navi snooze <duration>` holds notifications for a repo (the current
+  directory's by default), an org with `--org`, or everything with `--global`,
+  then delivers what arrived as one batch when it ends. Durations take a unit:
+  `s`, `m`, `h`, `d`, `w`, `mo`, `y`. `navi snooze status` lists active
+  snoozes, `navi snooze off` ends one early, and `navi service status` shows
+  them too. Snoozes are stored in the state database, so they survive restarts
+- **core:** a batch held by a snooze is labelled with the snooze length in
+  Slack, Discord, and email, still waits out quiet hours, and says how many
+  older updates were dropped if the snooze outgrew the buffer
+
 ## 0.3.6
 
 ### Fixed
