@@ -144,12 +144,13 @@ fn open_engine_with_store(config: &Config) -> Result<(Engine, Arc<SqliteStore>)>
 }
 
 /// Compute the current local time-of-day (minutes since midnight) for quiet hours.
-fn filter_context(config: &Config) -> FilterContext {
+fn filter_context(config: &Config) -> FilterContext<'static> {
     let now = OffsetDateTime::now_utc();
     let utc_minutes = now.hour() as i32 * 60 + now.minute() as i32;
     let local = (utc_minutes + config.general.utc_offset_minutes).rem_euclid(1440);
     FilterContext {
         local_minutes: Some(local as u16),
+        ..Default::default()
     }
 }
 

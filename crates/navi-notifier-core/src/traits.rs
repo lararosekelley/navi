@@ -11,6 +11,7 @@ use async_trait::async_trait;
 
 use crate::error::{DestinationError, SourceError, StateError};
 use crate::model::Event;
+use crate::snooze::SnoozeRelease;
 
 /// Durable, provider-agnostic storage the engine and sources rely on.
 ///
@@ -128,5 +129,17 @@ pub trait Destination: Send + Sync {
             self.send(event, state).await?;
         }
         Ok(())
+    }
+
+    /// Deliver the events a snooze held back, as one message that says so and
+    /// reports `release.dropped` if it is non-zero. The default sends them as an
+    /// ordinary digest. `events` is non-empty.
+    async fn send_snoozed(
+        &self,
+        events: &[Event],
+        _release: &SnoozeRelease,
+        state: &dyn StateStore,
+    ) -> Result<(), DestinationError> {
+        self.send_digest(events, state).await
     }
 }
