@@ -4,6 +4,12 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.4.1
+
+### Added
+
+- **cli:** `navi donate` opens navi's Ko-fi page in your browser
+
 ## 0.4.0
 
 ### Added

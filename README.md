@@ -181,6 +181,7 @@ navi completions zsh       # or print the script yourself (bash/zsh/fish/powersh
 navi upgrade               # update an installer-managed copy to the latest release
 navi downgrade --to 0.1.4  # step back to an earlier release (or bare `downgrade` for the previous one)
 navi uninstall             # reverse setup + the installer (completions, man page, config); reports how to remove the binary
+navi donate                # support navi on Ko-fi
 ```
 
 `upgrade`/`downgrade` re-run the release installer, so they apply to copies installed via the shell/PowerShell
