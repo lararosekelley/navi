@@ -2,6 +2,7 @@
 //! Gitea) and destinations (Slack, Discord, email) are provider crates wired
 //! together here through the registry in `wiring`.
 
+mod browser;
 mod cli;
 mod completions;
 mod config;
@@ -114,7 +115,19 @@ fn dispatch(command: Command, config_path: PathBuf) -> Result<()> {
             yes,
             no_restart,
         } => upgrade::downgrade(to, yes, no_restart),
+        Command::Donate => donate(),
     }
+}
+
+const DONATE_URL: &str = "https://ko-fi.com/sayonara_lara";
+
+/// Open navi's Ko-fi page, or print it when no browser opens.
+fn donate() -> Result<()> {
+    println!("thank you for supporting navi! opening {DONATE_URL}");
+    if let Err(error) = browser::open(DONATE_URL) {
+        eprintln!("could not open a browser ({error:#}); open the address above instead");
+    }
+    Ok(())
 }
 
 /// Run an async command body on a fresh multi-thread Tokio runtime.

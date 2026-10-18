@@ -157,6 +157,9 @@ pub enum Command {
         #[arg(long)]
         no_restart: bool,
     },
+
+    /// Support navi's development on Ko-fi (opens your browser).
+    Donate,
 }
 
 #[derive(Debug, Subcommand)]
