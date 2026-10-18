@@ -26,7 +26,7 @@ jobs:
           persist-credentials: false
 
       - name: Setup Rust
-        uses: dtolnay/rust-toolchain@1.96.1
+        uses: dtolnay/rust-toolchain@1.99.1
 
       # --no-verify: the release matrix already built and validated this commit.
       # Order matters: libs before the bin that depends on them.
