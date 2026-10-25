@@ -110,6 +110,21 @@ navi test --destination slack    # send a sample; --source github polls and prin
 With more than one of each, use `routes` to wire which sources feed which destinations; omit `routes` to send every
 source to every destination.
 
+To deliver to a second Slack workspace, Discord target, or mailbox, add a named section such as `[slack.work]`. It takes
+the same keys as `[slack]`, has the id `slack.work` in routes and `navi test --destination`, and reads its secret from
+`NAVI_SLACK_TOKEN_WORK` unless you set `token_env`:
+
+```toml
+[slack.work]
+enabled = true
+dm_to = "self"
+
+[[routes]]
+source = "github"
+destination = "slack.work"
+repos = ["acme/*"]
+```
+
 ## Usage
 
 ```sh
@@ -213,6 +228,7 @@ knowing about:
 | `slack`              | `broadcast`              | Event tags that surface at top level, not just in the PR thread.      |
 | `discord`            | `enabled` / `dm_to`      | Destination. Webhook URL or user id.                                  |
 | `email`              | `smtp_host` / `to`       | Destination. SMTP delivery, threaded per PR.                          |
+| `slack.<name>` etc.  |                          | Another destination of the same kind, with the id `slack.<name>`.     |
 | `digest`             | `enabled` / `kinds`      | Batch low-signal kinds into a periodic summary instead of alerting.   |
 | `rules.events.*`     |                          | Per-event-kind on/off toggles.                                        |
 | `rules.repos`        | `allow` / `deny`         | `owner/name` or `owner/*` patterns; `deny` wins.                      |

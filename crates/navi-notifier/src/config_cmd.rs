@@ -519,6 +519,18 @@ source = \"github\"
     }
 
     #[test]
+    fn named_destination_keys_are_settable() {
+        let mut d = doc();
+        set_value(&mut d, "slack.work.enabled", "true").unwrap();
+        set_value(&mut d, "slack.work.dm_to", "U123").unwrap();
+        let parsed: Config = toml::from_str(&d.to_string()).unwrap();
+        assert!(parsed.slack.named["work"].enabled);
+        assert_eq!(parsed.slack.named["work"].dm_to, "U123");
+        // A misspelled key in a named section is still refused.
+        assert!(set_value(&mut d, "slack.work.enabeld", "true").is_err());
+    }
+
+    #[test]
     fn creating_a_nested_section_leaves_no_bare_parent_header() {
         let mut d: DocumentMut = "".parse().unwrap();
         set_value(&mut d, "rules.events.mentioned", "false").unwrap();

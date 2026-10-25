@@ -3,24 +3,33 @@
 
 use anyhow::{bail, Result};
 
-use crate::config::{self, Config, DESTINATION_IDS, SOURCE_IDS};
+use crate::config::{self, Config, SOURCE_IDS};
 
 /// Print each source and destination with its on/off state and whether its
 /// credentials resolve from config/env. Config-level only; no network (use
 /// `navi doctor` for a live check).
 pub fn list(config: &Config) {
+    let destinations = config::destination_ids(config);
+    let width = SOURCE_IDS
+        .iter()
+        .map(|id| id.len())
+        .chain(destinations.iter().map(String::len))
+        .max()
+        .unwrap_or(0);
     println!("sources:");
     for id in SOURCE_IDS {
         row(
             id,
+            width,
             config::source_enabled(config, id),
             config::source_creds(config, id),
         );
     }
     println!("\ndestinations:");
-    for id in DESTINATION_IDS {
+    for id in &destinations {
         row(
             id,
+            width,
             config::dest_enabled(config, id),
             config::dest_creds(config, id),
         );
@@ -28,14 +37,14 @@ pub fn list(config: &Config) {
     println!("\nrun `navi providers setup <name>` for setup steps.");
 }
 
-fn row(name: &str, enabled: bool, creds: bool) {
+fn row(name: &str, width: usize, enabled: bool, creds: bool) {
     let state = if enabled { "on" } else { "off" };
     let creds = if creds {
         "credentials found"
     } else {
         "no credentials"
     };
-    println!("  {name:<8} {state:<3}  {creds}");
+    println!("  {name:<width$} {state:<3}  {creds}");
 }
 
 /// Print setup steps for a provider.
@@ -129,6 +138,7 @@ pub fn setup_text(name: &str) -> Option<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::DESTINATION_IDS;
 
     #[test]
     fn setup_text_covers_every_provider() {

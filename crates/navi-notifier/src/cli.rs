@@ -49,7 +49,7 @@ pub enum Command {
         /// Poll this source once and print the derived events, e.g. `github`.
         #[arg(long)]
         source: Option<String>,
-        /// Send a sample message to this destination, e.g. `slack`.
+        /// Send a sample message to this destination, e.g. `slack` or `slack.work`.
         #[arg(long)]
         destination: Option<String>,
     },
