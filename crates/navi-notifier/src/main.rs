@@ -616,6 +616,17 @@ destination = "slack"
 # source = "github"
 # destination = "email"
 # repos = ["me/*"]
+# A named section such as [slack.work] adds a second Slack destination (e.g. another
+# workspace) with the id "slack.work". It takes the same keys as [slack] and reads
+# its token from NAVI_SLACK_TOKEN_WORK unless token_env says otherwise:
+# [slack.work]
+# enabled = true
+# dm_to = "self"
+#
+# [[routes]]
+# source = "github"
+# destination = "slack.work"
+# repos = ["acme/*"]
 # Set `fallback = true` on a route to catch only events no other route claimed,
 # "everything else". e.g. acme/* to Slack above, and the remainder to email:
 # [[routes]]

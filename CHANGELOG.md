@@ -4,6 +4,19 @@ Notable changes per release. The section matching the version being tagged is
 published into that release's GitHub notes by `dist`, so the headings must stay
 `## <version>`.
 
+## 0.5.0
+
+### Added
+
+- **config:** named destinations. A section such as `[slack.work]` adds another
+  Slack destination alongside `[slack]`, for example a second workspace, with
+  the id `slack.work` for routes, `navi test --destination`, and `navi config
+  set`. Discord and email take `[discord.<name>]` and `[email.<name>]` the same
+  way. A named destination reads its secret from the base variable plus its
+  name (`NAVI_SLACK_TOKEN_WORK`) unless `token_env` or `password_env` is set,
+  and keeps its own delivery history and threads. Existing configs need no
+  changes
+
 ## 0.4.1
 
 ### Added

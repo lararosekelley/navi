@@ -5,11 +5,13 @@
 //! environment variables by default (`*_env` fields) so tokens never need to sit in
 //! the config file.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use navi_notifier_core::{Backfill, RuleConfig};
-use serde::{Deserialize, Serialize};
+use serde::de::{DeserializeOwned, Error as _};
+use serde::{Deserialize, Deserializer, Serialize};
 
 /// The full configuration tree.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -190,6 +192,13 @@ pub struct SlackConfig {
     /// thread but also surface at the top level (`reply_broadcast`), so high-signal
     /// events aren't buried. Empty = pure threading, nothing broadcasts.
     pub broadcast: Vec<String>,
+    /// Further Slack destinations, `[slack.<name>]`, each with the id `slack.<name>`.
+    #[serde(
+        flatten,
+        deserialize_with = "named_instances",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub named: BTreeMap<String, SlackConfig>,
 }
 
 impl Default for SlackConfig {
@@ -206,6 +215,7 @@ impl Default for SlackConfig {
                 "review_approved".into(),
                 "review_changes_requested".into(),
             ],
+            named: BTreeMap::new(),
         }
     }
 }
@@ -220,6 +230,14 @@ pub struct DiscordConfig {
     pub token: Option<String>,
     /// A webhook URL (`https://discord.com/api/webhooks/...`) or a user id to DM.
     pub dm_to: String,
+    /// Further Discord destinations, `[discord.<name>]`, each with the id
+    /// `discord.<name>`.
+    #[serde(
+        flatten,
+        deserialize_with = "named_instances",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub named: BTreeMap<String, DiscordConfig>,
 }
 
 impl Default for DiscordConfig {
@@ -229,6 +247,7 @@ impl Default for DiscordConfig {
             token_env: "NAVI_DISCORD_TOKEN".into(),
             token: None,
             dm_to: String::new(),
+            named: BTreeMap::new(),
         }
     }
 }
@@ -250,6 +269,13 @@ pub struct EmailConfig {
     pub from: String,
     /// Recipient, e.g. `you <you@example.com>`.
     pub to: String,
+    /// Further email destinations, `[email.<name>]`, each with the id `email.<name>`.
+    #[serde(
+        flatten,
+        deserialize_with = "named_instances",
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    pub named: BTreeMap<String, EmailConfig>,
 }
 
 impl Default for EmailConfig {
@@ -264,6 +290,7 @@ impl Default for EmailConfig {
             password: None,
             from: String::new(),
             to: String::new(),
+            named: BTreeMap::new(),
         }
     }
 }
@@ -348,6 +375,148 @@ fn resolve_secret(what: &str, inline: Option<&str>, env_var: &str) -> Result<Str
     Ok(val)
 }
 
+/// A destination section that can hold named instances of itself.
+trait NamedDestination: DeserializeOwned {
+    const KIND: &'static str;
+    /// The secret env var field and its default. A named instance defaults it to
+    /// `<default>_<NAME>`, so it never silently reuses the bare section's secret.
+    const SECRET_ENV: (&'static str, &'static str);
+    fn named(&self) -> &BTreeMap<String, Self>;
+}
+
+impl NamedDestination for SlackConfig {
+    const KIND: &'static str = "slack";
+    const SECRET_ENV: (&'static str, &'static str) = ("token_env", "NAVI_SLACK_TOKEN");
+    fn named(&self) -> &BTreeMap<String, Self> {
+        &self.named
+    }
+}
+
+impl NamedDestination for DiscordConfig {
+    const KIND: &'static str = "discord";
+    const SECRET_ENV: (&'static str, &'static str) = ("token_env", "NAVI_DISCORD_TOKEN");
+    fn named(&self) -> &BTreeMap<String, Self> {
+        &self.named
+    }
+}
+
+impl NamedDestination for EmailConfig {
+    const KIND: &'static str = "email";
+    const SECRET_ENV: (&'static str, &'static str) = ("password_env", "NAVI_EMAIL_PASSWORD");
+    fn named(&self) -> &BTreeMap<String, Self> {
+        &self.named
+    }
+}
+
+/// Collect a destination section's sub-tables as named instances. Unknown scalar
+/// keys are ignored, as they are everywhere else in the config.
+fn named_instances<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: NamedDestination,
+{
+    let raw = BTreeMap::<String, toml::Value>::deserialize(deserializer)?;
+    let (env_field, env_default) = T::SECRET_ENV;
+    let mut out = BTreeMap::new();
+    for (name, value) in raw {
+        let toml::Value::Table(mut table) = value else {
+            continue;
+        };
+        let id = format!("{}.{name}", T::KIND);
+        // The name becomes part of a destination id and an env var name.
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        {
+            return Err(D::Error::custom(format!(
+                "`{id}`: destination names may only use letters, digits, `-` and `_`"
+            )));
+        }
+        table.entry(env_field).or_insert_with(|| {
+            toml::Value::String(format!(
+                "{env_default}_{}",
+                name.to_ascii_uppercase().replace('-', "_")
+            ))
+        });
+        let instance = T::deserialize(toml::Value::Table(table))
+            .map_err(|e| D::Error::custom(format!("`{id}`: {e}")))?;
+        if let Some(nested) = instance.named().keys().next() {
+            return Err(D::Error::custom(format!(
+                "`{id}.{nested}`: named destinations can't be nested"
+            )));
+        }
+        out.insert(name, instance);
+    }
+    Ok(out)
+}
+
+/// One destination's config section: a bare `[slack]` etc. or a named instance.
+#[derive(Debug, Clone, Copy)]
+pub enum DestinationConfig<'a> {
+    Slack(&'a SlackConfig),
+    Discord(&'a DiscordConfig),
+    Email(&'a EmailConfig),
+}
+
+impl DestinationConfig<'_> {
+    pub fn enabled(&self) -> bool {
+        match self {
+            Self::Slack(c) => c.enabled,
+            Self::Discord(c) => c.enabled,
+            Self::Email(c) => c.enabled,
+        }
+    }
+
+    /// Whether the credentials resolve from config/env (no network).
+    pub fn creds(&self) -> bool {
+        match self {
+            Self::Slack(c) => c.resolve_token().is_ok(),
+            // Webhook mode (a URL in dm_to) needs no token; DM mode does.
+            Self::Discord(c) => c.dm_to.contains("://") || c.resolve_token().is_some(),
+            Self::Email(c) => c.resolve_password().is_some(),
+        }
+    }
+}
+
+/// Look up a destination by id: a kind from [`DESTINATION_IDS`], or `kind.name`
+/// for a named instance.
+pub fn destination<'a>(config: &'a Config, id: &str) -> Option<DestinationConfig<'a>> {
+    fn pick<'a, T: NamedDestination>(base: &'a T, name: Option<&str>) -> Option<&'a T> {
+        match name {
+            None => Some(base),
+            Some(name) => base.named().get(name),
+        }
+    }
+    let (kind, name) = match id.split_once('.') {
+        Some((kind, name)) => (kind, Some(name)),
+        None => (id, None),
+    };
+    match kind {
+        "slack" => pick(&config.slack, name).map(DestinationConfig::Slack),
+        "discord" => pick(&config.discord, name).map(DestinationConfig::Discord),
+        "email" => pick(&config.email, name).map(DestinationConfig::Email),
+        _ => None,
+    }
+}
+
+/// Every destination id in the config, enabled or not: each kind, followed by its
+/// named instances.
+pub fn destination_ids(config: &Config) -> Vec<String> {
+    let mut ids = Vec::new();
+    for kind in DESTINATION_IDS {
+        let names: Vec<&String> = match kind {
+            "slack" => config.slack.named.keys().collect(),
+            "discord" => config.discord.named.keys().collect(),
+            "email" => config.email.named.keys().collect(),
+            _ => unreachable!("destination kind `{kind}` has no config section"),
+        };
+        ids.push(kind.to_string());
+        ids.extend(names.into_iter().map(|name| format!("{kind}.{name}")));
+    }
+    ids
+}
+
 impl Config {
     /// Load and parse the config file at `path`.
     pub fn load(path: &Path) -> Result<Self> {
@@ -406,7 +575,8 @@ impl Finding {
 /// The known source ids, in display order. Single source of truth for the provider
 /// loops in `providers`, `wiring`, and `doctor`.
 pub const SOURCE_IDS: [&str; 3] = ["github", "gitlab", "gitea"];
-/// The known destination ids, in display order.
+/// The destination kinds, in display order. Each is also the id of its bare
+/// section; named instances are `kind.name` (see [`destination_ids`]).
 pub const DESTINATION_IDS: [&str; 3] = ["slack", "discord", "email"];
 /// Event tags accepted in `slack.broadcast` and `digest.kinds`: the `EventKind`
 /// tags plus the per-state review shorthands. Kept in sync with the model by the
@@ -446,9 +616,9 @@ pub fn validate(config: &Config) -> Vec<Finding> {
                 r.source
             )));
         }
-        if !DESTINATION_IDS.contains(&r.destination.as_str()) {
+        if destination(config, &r.destination).is_none() {
             out.push(Finding::error(format!(
-                "route destination `{}` is not a known destination (slack|discord|email)",
+                "route destination `{}` is not a known destination (slack|discord|email, or a named one like slack.<name>)",
                 r.destination
             )));
         } else if !dest_enabled(config, &r.destination) {
@@ -478,29 +648,33 @@ pub fn validate(config: &Config) -> Vec<Finding> {
     }
 
     // Required fields for enabled providers.
-    if config.email.enabled {
-        for (field, val) in [
-            ("smtp_host", &config.email.smtp_host),
-            ("from", &config.email.from),
-            ("to", &config.email.to),
-        ] {
-            if val.trim().is_empty() {
+    for id in destination_ids(config) {
+        match destination(config, &id) {
+            Some(DestinationConfig::Email(c)) if c.enabled => {
+                for (field, val) in [
+                    ("smtp_host", &c.smtp_host),
+                    ("from", &c.from),
+                    ("to", &c.to),
+                ] {
+                    if val.trim().is_empty() {
+                        out.push(Finding::error(format!(
+                            "{id} is enabled but {id}.{field} is empty"
+                        )));
+                    }
+                }
+            }
+            Some(DestinationConfig::Slack(c)) if c.enabled && c.dm_to.trim().is_empty() => {
                 out.push(Finding::error(format!(
-                    "email is enabled but email.{field} is empty"
+                    "{id} is enabled but {id}.dm_to is empty"
                 )));
             }
+            Some(DestinationConfig::Discord(c)) if c.enabled && c.dm_to.trim().is_empty() => {
+                out.push(Finding::error(format!(
+                    "{id} is enabled but {id}.dm_to is empty (set a webhook URL or user id)"
+                )));
+            }
+            _ => {}
         }
-    }
-    if config.slack.enabled && config.slack.dm_to.trim().is_empty() {
-        out.push(Finding::error(
-            "slack is enabled but slack.dm_to is empty".to_string(),
-        ));
-    }
-    if config.discord.enabled && config.discord.dm_to.trim().is_empty() {
-        out.push(Finding::error(
-            "discord is enabled but discord.dm_to is empty (set a webhook URL or user id)"
-                .to_string(),
-        ));
     }
     if config.gitea.enabled
         && config
@@ -546,11 +720,16 @@ pub fn validate(config: &Config) -> Vec<Finding> {
     }
 
     // Broadcast / digest event tags.
-    for tag in &config.slack.broadcast {
-        if !KNOWN_TAGS.contains(&tag.as_str()) {
-            out.push(Finding::warning(format!(
-                "slack.broadcast has unknown tag `{tag}`; it will never match"
-            )));
+    for id in destination_ids(config) {
+        let Some(DestinationConfig::Slack(c)) = destination(config, &id) else {
+            continue;
+        };
+        for tag in &c.broadcast {
+            if !KNOWN_TAGS.contains(&tag.as_str()) {
+                out.push(Finding::warning(format!(
+                    "{id}.broadcast has unknown tag `{tag}`; it will never match"
+                )));
+            }
         }
     }
     if config.digest.enabled {
@@ -578,15 +757,9 @@ pub fn source_enabled(config: &Config, id: &str) -> bool {
     }
 }
 
-/// Whether the destination with this id is enabled. Only ever called with an id
-/// from [`DESTINATION_IDS`], so an unknown id is a wiring bug, not a runtime input.
+/// Whether the destination with this id exists and is enabled.
 pub fn dest_enabled(config: &Config, id: &str) -> bool {
-    match id {
-        "slack" => config.slack.enabled,
-        "discord" => config.discord.enabled,
-        "email" => config.email.enabled,
-        _ => unreachable!("dest_enabled called with unknown id `{id}`"),
-    }
+    destination(config, id).is_some_and(|d| d.enabled())
 }
 
 /// Whether a source's credentials resolve from config/env (no network).
@@ -601,15 +774,7 @@ pub fn source_creds(config: &Config, id: &str) -> bool {
 
 /// Whether a destination's credentials resolve from config/env (no network).
 pub fn dest_creds(config: &Config, id: &str) -> bool {
-    match id {
-        "slack" => config.slack.resolve_token().is_ok(),
-        // Webhook mode (a URL in dm_to) needs no token; DM mode does.
-        "discord" => {
-            config.discord.dm_to.contains("://") || config.discord.resolve_token().is_some()
-        }
-        "email" => config.email.resolve_password().is_some(),
-        _ => false,
-    }
+    destination(config, id).is_some_and(|d| d.creds())
 }
 
 /// An `owner/name` glob: one `/`, both sides non-empty (either may be/contain `*`).
@@ -740,6 +905,130 @@ mod tests {
             .iter()
             .any(|x| x.severity == Severity::Error && x.message.contains("quiet_hours.start")));
         assert!(!f.iter().any(|x| x.message.contains("quiet_hours.end")));
+    }
+
+    #[test]
+    fn configs_without_named_destinations_parse_as_before() {
+        // A stray scalar under a destination section was ignored before named
+        // instances existed and must stay ignored, not become an instance.
+        let c: Config = toml::from_str(
+            r#"
+[slack]
+enabled = true
+dm_to = "U1"
+retired_key = "x"
+
+[[routes]]
+source = "github"
+destination = "slack"
+"#,
+        )
+        .unwrap();
+        assert!(c.slack.named.is_empty());
+        assert_eq!(c.slack.token_env, "NAVI_SLACK_TOKEN");
+        assert_eq!(destination_ids(&c), ["slack", "discord", "email"]);
+        // And nothing new appears when it is written back.
+        let v = toml::Value::try_from(&c).unwrap();
+        assert!(v["slack"]
+            .as_table()
+            .unwrap()
+            .values()
+            .all(|v| !v.is_table()));
+    }
+
+    #[test]
+    fn named_destinations_parse_with_their_own_secret_env() {
+        let c: Config = toml::from_str(
+            r#"
+[slack]
+enabled = true
+
+[slack.grey-lock]
+enabled = true
+dm_to = "U2"
+
+[slack.other]
+token_env = "MY_TOKEN"
+
+[email.work]
+smtp_host = "smtp.example.com"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            destination_ids(&c),
+            [
+                "slack",
+                "slack.grey-lock",
+                "slack.other",
+                "discord",
+                "email",
+                "email.work"
+            ]
+        );
+        let named = &c.slack.named["grey-lock"];
+        assert_eq!(named.token_env, "NAVI_SLACK_TOKEN_GREY_LOCK");
+        assert_eq!(named.dm_to, "U2");
+        // Unset fields take the usual defaults, not the bare section's values.
+        assert_eq!(named.broadcast, SlackConfig::default().broadcast);
+        assert_eq!(c.slack.named["other"].token_env, "MY_TOKEN");
+        assert_eq!(
+            c.email.named["work"].password_env,
+            "NAVI_EMAIL_PASSWORD_WORK"
+        );
+
+        assert!(dest_enabled(&c, "slack.grey-lock"));
+        assert!(!dest_enabled(&c, "slack.other"));
+        assert!(destination(&c, "slack.missing").is_none());
+        assert!(destination(&c, "nope").is_none());
+        // Written back, the named table survives a round trip.
+        let back: Config = toml::from_str(&toml::to_string(&c).unwrap()).unwrap();
+        assert_eq!(back.slack.named["grey-lock"].dm_to, "U2");
+    }
+
+    #[test]
+    fn rejects_bad_and_nested_destination_names() {
+        let err = toml::from_str::<Config>("[slack.\"a.b\"]\nenabled = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("slack.a.b"), "{err}");
+        let err = toml::from_str::<Config>("[discord.a.b]\nenabled = true\n")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("can't be nested"), "{err}");
+    }
+
+    #[test]
+    fn validates_named_destinations_and_routes_to_them() {
+        let mut c: Config = toml::from_str(
+            r#"
+[github]
+enabled = true
+
+[slack.work]
+enabled = true
+dm_to = ""
+broadcast = ["nope"]
+"#,
+        )
+        .unwrap();
+        c.routes = vec![
+            route("github", "slack.work", vec!["acme/*".into()]),
+            route("github", "slack.missing", vec![]),
+        ];
+        let f = validate(&c);
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("slack.work.dm_to")));
+        assert!(
+            f.iter()
+                .any(|x| x.severity == Severity::Warning
+                    && x.message.contains("slack.work.broadcast"))
+        );
+        assert!(f
+            .iter()
+            .any(|x| x.severity == Severity::Error && x.message.contains("slack.missing")));
+        assert!(!f.iter().any(|x| x.message.contains("`slack.work` is not")));
     }
 
     #[test]

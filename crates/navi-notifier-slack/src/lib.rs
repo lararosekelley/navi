@@ -36,6 +36,7 @@ pub struct SlackDestinationConfig {
 }
 
 pub struct SlackDestination {
+    id: String,
     client: reqwest::Client,
     token: String,
     dm_to: String,
@@ -57,6 +58,7 @@ impl SlackDestination {
             .build()
             .map_err(|e| DestinationError::Delivery(format!("building HTTP client: {e}")))?;
         Ok(Self {
+            id: "slack".into(),
             client,
             token: config.token,
             dm_to: config.dm_to,
@@ -66,6 +68,13 @@ impl SlackDestination {
             channel: OnceCell::new(),
             broadcast: config.broadcast.into_iter().collect(),
         })
+    }
+
+    /// Replace the default `"slack"` id, so several Slack destinations can run side
+    /// by side. The id also namespaces this destination's thread cursors.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Verify credentials and return the authenticated identity string.
@@ -155,7 +164,7 @@ impl SlackDestination {
 #[async_trait]
 impl Destination for SlackDestination {
     fn id(&self) -> &str {
-        "slack"
+        &self.id
     }
 
     async fn send(&self, event: &Event, state: &dyn StateStore) -> Result<(), DestinationError> {
@@ -163,7 +172,7 @@ impl Destination for SlackDestination {
         // PR becomes the parent; later ones reply under it. Threading is best-effort,
         // so a state read/write failure just falls back to a top-level message.
         let key = event.thread_key();
-        let parent = state.get_cursor(SLACK_NS, &key).await.ok().flatten();
+        let parent = state.get_cursor(&self.id, &key).await.ok().flatten();
         // High-signal kinds break out of the thread so they aren't buried. Only
         // meaningful for a reply (a thread-opening message is already top-level).
         // A review *submission* (approved/changes-requested/commented) on a PR you
@@ -189,7 +198,7 @@ impl Destination for SlackDestination {
             .await?;
         if parent.is_none() {
             if let Some(ts) = posted_ts {
-                let _ = state.put_cursor(SLACK_NS, &key, &ts).await;
+                let _ = state.put_cursor(&self.id, &key, &ts).await;
             }
         }
         Ok(())
@@ -217,9 +226,6 @@ impl Destination for SlackDestination {
             .map(|_| ())
     }
 }
-
-/// Namespace for the Slack destination's own cursors in the shared state store.
-const SLACK_NS: &str = "slack";
 
 impl SlackDestination {
     /// Post a rendered message to the resolved channel, retrying transient

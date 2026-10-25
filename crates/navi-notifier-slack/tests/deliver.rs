@@ -188,6 +188,44 @@ async fn second_event_on_a_pr_replies_in_the_first_ones_thread() {
 }
 
 #[tokio::test]
+async fn named_destinations_keep_separate_threads() {
+    let server = MockServer::start().await;
+    mount_ok(
+        &server,
+        "chat.postMessage",
+        json!({ "ok": true, "ts": "111.222" }),
+    )
+    .await;
+
+    let state = MemState::default();
+    let default = destination(&server, "C0123456789");
+    let named = destination(&server, "C0123456789").with_id("slack.work");
+    assert_eq!(default.id(), "slack");
+    assert_eq!(named.id(), "slack.work");
+    default
+        .send(&sample_event(), &state)
+        .await
+        .expect("default");
+    named.send(&sample_event(), &state).await.expect("named");
+
+    let posts: Vec<Value> = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/chat.postMessage")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect();
+    // Another workspace can't reply under the first one's thread.
+    assert!(posts[1].get("thread_ts").is_none(), "{:?}", posts[1]);
+    // The bare destination keeps its original cursor namespace, so existing threads
+    // carry over.
+    let cursors = state.cursors.lock().unwrap();
+    assert!(cursors.keys().any(|k| k.starts_with("slack:")));
+    assert!(cursors.keys().any(|k| k.starts_with("slack.work:")));
+}
+
+#[tokio::test]
 async fn terminal_events_broadcast_out_of_the_thread() {
     let server = MockServer::start().await;
     mount_ok(

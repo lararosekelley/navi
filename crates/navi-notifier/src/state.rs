@@ -91,9 +91,10 @@ CREATE TABLE IF NOT EXISTS snoozes (
 /// every lookup, so an upgraded database treats its history as "delivered
 /// everywhere" and does not re-notify.
 ///
-/// Safe as a sentinel because real sinks are a closed set of fixed literals: the
-/// destination ids in [`crate::config::DESTINATION_IDS`], plus the engine's
-/// `__`-wrapped buffer sinks. `sentinel_cannot_be_a_destination_id` pins that.
+/// Safe as a sentinel because no real sink can be `*`: sinks are the destination
+/// kinds in [`crate::config::DESTINATION_IDS`], named instances `kind.name` (names
+/// are limited to letters, digits, `-` and `_`), and the engine's `__`-wrapped
+/// buffer sinks. `sentinel_cannot_be_a_destination_id` pins the kinds.
 const ANY_SINK: &str = "*";
 
 /// Widen `delivered` from one row per event to one row per (event, sink).

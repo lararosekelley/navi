@@ -41,12 +41,12 @@ pub async fn doctor(config: &Config, offline: bool) -> Result<()> {
     );
 
     println!("\ndestinations:");
-    for id in config::DESTINATION_IDS {
+    for id in config::destination_ids(config) {
         // Webhook-mode Discord is self-authenticating; the shared `dest_creds` knows.
         report(
-            id,
-            config::dest_enabled(config, id),
-            config::dest_creds(config, id),
+            &id,
+            config::dest_enabled(config, &id),
+            config::dest_creds(config, &id),
         );
     }
 

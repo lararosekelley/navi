@@ -43,6 +43,7 @@ enum Mode {
 }
 
 pub struct DiscordDestination {
+    id: String,
     client: reqwest::Client,
     token: Option<String>,
     api_base: String,
@@ -73,6 +74,7 @@ impl DiscordDestination {
             .build()
             .map_err(|e| DestinationError::Delivery(format!("building HTTP client: {e}")))?;
         Ok(Self {
+            id: "discord".into(),
             client,
             token: config.token,
             api_base: config
@@ -81,6 +83,13 @@ impl DiscordDestination {
             mode,
             channel: OnceCell::new(),
         })
+    }
+
+    /// Replace the default `"discord"` id, so several Discord destinations can run
+    /// side by side. The id also namespaces this destination's reply cursors.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Confirm the bot token (or report webhook mode).
@@ -181,7 +190,7 @@ impl DiscordDestination {
 #[async_trait]
 impl Destination for DiscordDestination {
     fn id(&self) -> &str {
-        "discord"
+        &self.id
     }
 
     async fn send(&self, event: &Event, state: &dyn StateStore) -> Result<(), DestinationError> {
@@ -191,7 +200,7 @@ impl Destination for DiscordDestination {
         // standalone message.
         let key = event.thread_key();
         let parent = match self.mode {
-            Mode::Dm(_) => state.get_cursor(DISCORD_NS, &key).await.ok().flatten(),
+            Mode::Dm(_) => state.get_cursor(&self.id, &key).await.ok().flatten(),
             Mode::Webhook(_) => None,
         };
         let posted = self
@@ -199,7 +208,7 @@ impl Destination for DiscordDestination {
             .await?;
         if parent.is_none() {
             if let Some(id) = posted {
-                let _ = state.put_cursor(DISCORD_NS, &key, &id).await;
+                let _ = state.put_cursor(&self.id, &key, &id).await;
             }
         }
         Ok(())
@@ -226,9 +235,6 @@ impl Destination for DiscordDestination {
         Ok(())
     }
 }
-
-/// Namespace for the Discord destination's own cursors in the shared state store.
-const DISCORD_NS: &str = "discord";
 
 impl DiscordDestination {
     /// Post a rendered message to the resolved endpoint, retrying transient

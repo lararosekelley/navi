@@ -1,13 +1,13 @@
 //! Config-driven construction of the engine's sources and destinations, the "plugin
 //! registry" seam. Adding a provider means: its id in `config::SOURCE_IDS` /
-//! `DESTINATION_IDS`, its arms in `config`'s `*_enabled`/`*_creds`, its arm in
-//! `build_source`/`build_destination` here, and - for a source - a line in
-//! `doctor.rs`'s sources section (destinations there loop over `DESTINATION_IDS`,
-//! but sources can't: GitHub takes an async live-check branch, so gitlab/gitea are
-//! listed by hand). Keep all four in sync. The catch-all arms here `bail!`, so a
-//! half-done wiring fails at runtime rather than compile time; the `*_enabled` arms
-//! in `config` instead `unreachable!()`, since they're only ever called with a known
-//! id (`*_creds` returns `false` for the same reason - a missing arm can't be hit).
+//! `DESTINATION_IDS`, its arms in `config`'s `source_*` functions or
+//! `DestinationConfig`, its arm in `build_source`/`build_destination` here, and -
+//! for a source - a line in `doctor.rs`'s sources section (destinations there loop
+//! over `config::destination_ids`, but sources can't: GitHub takes an async
+//! live-check branch, so gitlab/gitea are listed by hand). Keep all four in sync.
+//! The catch-all arms here `bail!`, so a half-done wiring fails at runtime rather
+//! than compile time; `source_enabled` instead `unreachable!()`s, since it's only
+//! ever called with a known id.
 
 use std::sync::Arc;
 
@@ -22,7 +22,7 @@ use navi_notifier_github::{GitHubSource, GitHubSourceConfig};
 use navi_notifier_gitlab::{GitLabSource, GitLabSourceConfig};
 use navi_notifier_slack::{SlackDestination, SlackDestinationConfig};
 
-use crate::config::{self, Config, SlackConfig, DESTINATION_IDS, SOURCE_IDS};
+use crate::config::{self, Config, DestinationConfig, SlackConfig, SOURCE_IDS};
 
 /// Build the fully-wired engine from config and a state store.
 pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engine> {
@@ -34,9 +34,9 @@ pub fn build_engine(config: &Config, state: Arc<dyn StateStore>) -> Result<Engin
     }
 
     let mut destinations: Vec<Arc<dyn Destination>> = Vec::new();
-    for id in DESTINATION_IDS {
-        if config::dest_enabled(config, id) {
-            destinations.push(build_destination(config, id)?);
+    for id in config::destination_ids(config) {
+        if config::dest_enabled(config, &id) {
+            destinations.push(build_destination(config, &id)?);
         }
     }
 
@@ -96,20 +96,25 @@ pub fn build_source(config: &Config, id: &str) -> Result<Arc<dyn Source>> {
     }
 }
 
-/// Build a single destination by id, regardless of its `enabled` flag.
+/// Build a single destination by id (`slack`, `slack.<name>`, ...), regardless of
+/// its `enabled` flag.
 pub fn build_destination(config: &Config, id: &str) -> Result<Arc<dyn Destination>> {
-    match id {
-        "slack" => Ok(Arc::new(build_slack(&config.slack)?)),
-        "discord" => Ok(Arc::new(
+    let Some(dest) = config::destination(config, id) else {
+        bail!("unknown destination `{id}` (slack | discord | email, or a named one like slack.<name>)");
+    };
+    match dest {
+        DestinationConfig::Slack(c) => Ok(Arc::new(build_slack(c)?.with_id(id))),
+        DestinationConfig::Discord(c) => Ok(Arc::new(
             DiscordDestination::new(DiscordDestinationConfig {
-                token: config.discord.resolve_token(),
-                dm_to: config.discord.dm_to.clone(),
+                token: c.resolve_token(),
+                dm_to: c.dm_to.clone(),
                 api_base: None,
             })
-            .context("initializing Discord destination")?,
+            .with_context(|| format!("initializing Discord destination `{id}`"))?
+            .with_id(id),
         )),
-        "email" => {
-            let tls = match config.email.tls.as_str() {
+        DestinationConfig::Email(c) => {
+            let tls = match c.tls.as_str() {
                 "none" => EmailTls::None,
                 "starttls" => EmailTls::StartTls,
                 "implicit" => EmailTls::Implicit,
@@ -117,18 +122,18 @@ pub fn build_destination(config: &Config, id: &str) -> Result<Arc<dyn Destinatio
             };
             Ok(Arc::new(
                 EmailDestination::new(EmailDestinationConfig {
-                    smtp_host: config.email.smtp_host.clone(),
-                    smtp_port: config.email.smtp_port,
+                    smtp_host: c.smtp_host.clone(),
+                    smtp_port: c.smtp_port,
                     tls,
-                    username: config.email.username.clone(),
-                    password: config.email.resolve_password(),
-                    from: config.email.from.clone(),
-                    to: config.email.to.clone(),
+                    username: c.username.clone(),
+                    password: c.resolve_password(),
+                    from: c.from.clone(),
+                    to: c.to.clone(),
                 })
-                .context("initializing email destination")?,
+                .with_context(|| format!("initializing email destination `{id}`"))?
+                .with_id(id),
             ))
         }
-        other => bail!("unknown destination `{other}` (slack | discord | email)"),
     }
 }
 

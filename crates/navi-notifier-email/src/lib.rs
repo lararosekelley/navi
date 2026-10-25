@@ -38,6 +38,7 @@ pub struct EmailDestinationConfig {
 }
 
 pub struct EmailDestination {
+    id: String,
     mailer: AsyncSmtpTransport<Tokio1Executor>,
     from: Mailbox,
     to: Mailbox,
@@ -72,10 +73,18 @@ impl EmailDestination {
         }
 
         Ok(Self {
+            id: "email".into(),
             mailer: builder.build(),
             from,
             to,
         })
+    }
+
+    /// Replace the default `"email"` id, so several email destinations can run side
+    /// by side.
+    pub fn with_id(mut self, id: impl Into<String>) -> Self {
+        self.id = id.into();
+        self
     }
 
     /// Check that the SMTP server is reachable (for `test-*` style checks).
@@ -91,7 +100,7 @@ impl EmailDestination {
 #[async_trait]
 impl Destination for EmailDestination {
     fn id(&self) -> &str {
-        "email"
+        &self.id
     }
 
     async fn send(&self, event: &Event, _state: &dyn StateStore) -> Result<(), DestinationError> {
